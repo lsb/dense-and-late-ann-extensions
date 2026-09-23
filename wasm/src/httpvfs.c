@@ -70,10 +70,20 @@ struct HvBackend {
 
 #ifdef __EMSCRIPTEN__
 
+#ifdef HV_SYNC_JS
+/* Synchronous backend (no Asyncify/JSPI): Module.httpvfsFetchSync must
+** block until the batch is in memory, e.g. a worker doing parallel fetches
+** while this thread waits on a SharedArrayBuffer with Atomics.wait. */
+EM_JS(int, hv_js_fetch, (int h, int n, const double *off, const int *len,
+      unsigned char **dest, double *t0, double *t1, double *pSize), {
+  return Module.httpvfsFetchSync(h, n, off, len, dest, t0, t1, pSize);
+});
+#else
 EM_ASYNC_JS(int, hv_js_fetch, (int h, int n, const double *off, const int *len,
             unsigned char **dest, double *t0, double *t1, double *pSize), {
   return await Module.httpvfsFetch(h, n, off, len, dest, t0, t1, pSize);
 });
+#endif
 EM_JS(int, hv_js_open, (const char *zName), {
   return Module.httpvfsOpen(UTF8ToString(zName));
 });

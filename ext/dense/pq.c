@@ -27,15 +27,29 @@ void pq_round_f16(PQ *pq) {
 
 /* ------------------------------------------------------------ k-means */
 
-/* Index of the nearest of k centroids c[k*d] to point p[d]. */
-static int nearest(const float *p, const float *c, int k, int d, float *dist_out) {
-  int best = 0; float bd = FLT_MAX;
-  for (int j = 0; j < k; j++) {
-    float s = dn_l2sq(p, c + (size_t)j * d, d);
-    if (s < bd) { bd = s; best = j; }
+/* Nearest-centroid search for short subvectors. Centroids are passed
+** transposed, cT[t*k + j] = c_j[t], with squared norms cn[j], so the inner
+** loop runs over centroids and vectorises well even for d = 6:
+**   argmin_j ||x - c_j||^2 = argmin_j (||c_j||^2 - 2 <x, c_j>). */
+static int nearest_t(const float *x, const float *cT, const float *cn, int k, int d, float *acc) {
+  for (int j = 0; j < k; j++) acc[j] = cn[j];
+  for (int t = 0; t < d; t++) {
+    float xt = -2.0f * x[t];
+    const float *row = cT + (size_t)t * k;
+    for (int j = 0; j < k; j++) acc[j] += xt * row[j];
   }
-  if (dist_out) *dist_out = bd;
+  int best = 0; float bd = acc[0];
+  for (int j = 1; j < k; j++) if (acc[j] < bd) { bd = acc[j]; best = j; }
   return best;
+}
+
+/* Build the transposed copy and norms used by nearest_t. */
+static void transpose_centroids(const float *c, int k, int d, float *cT, float *cn) {
+  for (int j = 0; j < k; j++) {
+    float s = 0;
+    for (int t = 0; t < d; t++) { float v = c[(size_t)j * d + t]; cT[(size_t)t * k + j] = v; s += v * v; }
+    cn[j] = s;
+  }
 }
 
 /* Lloyd's k-means for one subspace: data x[n*d] -> centroids c[k*d].
@@ -51,6 +65,8 @@ static void kmeans(const float *x, int64_t n, int d, int k, int iters, uint64_t 
   int *assign = (int *)malloc(sizeof(int) * n);
   int64_t *cnt = (int64_t *)malloc(sizeof(int64_t) * k);
   double *sum = (double *)malloc(sizeof(double) * (size_t)k * d);
+  float *cT = (float *)malloc(sizeof(float) * (size_t)k * d);
+  float *cn = (float *)malloc(sizeof(float) * k), *acc = (float *)malloc(sizeof(float) * k);
 
   /* k-means++ seeding. */
   int64_t first = (int64_t)(dn_rng_uniform(&rng) * n);
@@ -73,8 +89,9 @@ static void kmeans(const float *x, int64_t n, int d, int k, int iters, uint64_t 
     memset(cnt, 0, sizeof(int64_t) * k);
     memset(sum, 0, sizeof(double) * (size_t)k * d);
     int64_t changed = 0;
+    transpose_centroids(c, k, d, cT, cn);
     for (int64_t i = 0; i < n; i++) {
-      int a = nearest(x + i * d, c, k, d, NULL);
+      int a = nearest_t(x + i * d, cT, cn, k, d, acc);
       if (it == 0 || a != assign[i]) changed++;
       assign[i] = a;
       cnt[a]++;
@@ -98,7 +115,7 @@ static void kmeans(const float *x, int64_t n, int d, int k, int iters, uint64_t 
     }
     if (it > 0 && changed == 0) break;
   }
-  free(mind); free(assign); free(cnt); free(sum);
+  free(mind); free(assign); free(cnt); free(sum); free(cT); free(cn); free(acc);
 }
 
 typedef struct {
@@ -137,22 +154,44 @@ int pq_train(PQ *pq, const float *x, int64_t n, int dim, int m,
 
 /* ------------------------------------------------- encode / decode */
 
-void pq_encode(const PQ *pq, const float *x, uint8_t *code) {
+/* Encoding uses transposed centroids; they are built on the fly per call
+** for single vectors and once per batch in pq_encode_many. */
+static void encode_t(const PQ *pq, const float *cT, const float *cn, const float *x, uint8_t *code) {
+  float acc[PQ_KSUB];
   for (int j = 0; j < pq->m; j++)
-    code[j] = (uint8_t)nearest(x + j * pq->dsub, pq->cent + (size_t)j * PQ_KSUB * pq->dsub,
-                               PQ_KSUB, pq->dsub, NULL);
+    code[j] = (uint8_t)nearest_t(x + j * pq->dsub, cT + (size_t)j * PQ_KSUB * pq->dsub,
+                                 cn + (size_t)j * PQ_KSUB, PQ_KSUB, pq->dsub, acc);
 }
 
-typedef struct { const PQ *pq; const float *x; uint8_t *codes; } EncCtx;
+static void make_transposed(const PQ *pq, float **pcT, float **pcn) {
+  float *cT = (float *)malloc(sizeof(float) * (size_t)pq->m * PQ_KSUB * pq->dsub);
+  float *cn = (float *)malloc(sizeof(float) * (size_t)pq->m * PQ_KSUB);
+  for (int j = 0; j < pq->m; j++)
+    transpose_centroids(pq->cent + (size_t)j * PQ_KSUB * pq->dsub, PQ_KSUB, pq->dsub,
+                        cT + (size_t)j * PQ_KSUB * pq->dsub, cn + (size_t)j * PQ_KSUB);
+  *pcT = cT; *pcn = cn;
+}
+
+void pq_encode(const PQ *pq, const float *x, uint8_t *code) {
+  float *cT, *cn;
+  make_transposed(pq, &cT, &cn);
+  encode_t(pq, cT, cn, x, code);
+  free(cT); free(cn);
+}
+
+typedef struct { const PQ *pq; const float *x; uint8_t *codes; const float *cT, *cn; } EncCtx;
 
 static void encode_one(void *vctx, int64_t i, int thread) {
   EncCtx *e = (EncCtx *)vctx; (void)thread;
-  pq_encode(e->pq, e->x + i * e->pq->dim, e->codes + i * e->pq->m);
+  encode_t(e->pq, e->cT, e->cn, e->x + i * e->pq->dim, e->codes + i * e->pq->m);
 }
 
 void pq_encode_many(const PQ *pq, const float *x, int64_t n, uint8_t *codes, int nthreads) {
-  EncCtx e = { pq, x, codes };
+  float *cT, *cn;
+  make_transposed(pq, &cT, &cn);
+  EncCtx e = { pq, x, codes, cT, cn };
   dn_parallel_for(n, nthreads, 256, encode_one, &e);
+  free(cT); free(cn);
 }
 
 void pq_decode(const PQ *pq, const uint8_t *code, float *out) {

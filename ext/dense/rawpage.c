@@ -48,8 +48,9 @@ int pr_open(PageReader *pr, sqlite3 *db, const char *zDb) {
   uint32_t ps = get2(hdr + 16);
   pr->pgsz = ps == 1 ? 65536 : (int)ps;
   pr->usable = pr->pgsz - hdr[20];
+  pr->wal = (hdr[18] == 2 || hdr[19] == 2);
   pr->fd = fd;
-  pr->ok = pr->pgsz >= 512;
+  pr->ok = pr->pgsz >= 512 && !pr->wal;
   return pr->ok ? 0 : 1;
 }
 

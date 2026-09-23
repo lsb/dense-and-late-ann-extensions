@@ -25,11 +25,21 @@ const modules = new Map();   // variant -> Promise<Module>
 
 /**
  * Load (once) the WebAssembly module. variant: 'asyncify' (default, every
- * browser and Node) or 'jspi' (Chromium 137+, not Node 22).
+ * browser and Node), 'jspi' (Chromium 137+, not Node 22) or 'sync' (blocking
+ * fetches through a worker and Atomics.wait: Node, or a browser Worker in a
+ * cross-origin-isolated page).
  */
+const FILES = {
+  asyncify: './dist/sqlite-httpvfs.mjs',
+  jspi: './dist/sqlite-httpvfs-jspi.mjs',
+  sync: './dist/sqlite-httpvfs-sync.mjs',
+};
+let defaultSyncFetcher = null;
+
 export function loadModule(variant = 'asyncify', moduleArgs = {}) {
   if (!modules.has(variant)) {
-    const file = variant === 'jspi' ? './dist/sqlite-httpvfs-jspi.mjs' : './dist/sqlite-httpvfs.mjs';
+    const file = FILES[variant];
+    if (!file) throw new Error(`unknown variant ${variant}`);
     modules.set(variant, import(file).then(async (m) => {
       const M = await m.default(moduleArgs);
       M.queue = Promise.resolve();
@@ -77,10 +87,20 @@ export class SqliteError extends Error {
  *   headers         extra request headers
  *   fetch           fetch implementation (default globalThis.fetch)
  *   sqliteCacheKiB  SQLite's own page cache (PRAGMA cache_size), default 2048
- *   variant         'asyncify' | 'jspi'
+ *   variant         'asyncify' | 'jspi' | 'sync'
+ *   fetchSync       sync variant: (url, offsets, lengths) => [{buf, total}]
+ *                   (default: a worker from sync-fetch.mjs)
  */
 export async function open(url, opts = {}) {
-  const M = await loadModule(opts.variant || 'asyncify', opts.moduleArgs || {});
+  const variant = opts.variant || 'asyncify';
+  const M = await loadModule(variant, opts.moduleArgs || {});
+  let fetchSync = opts.fetchSync;
+  if (variant === 'sync' && !fetchSync) {
+    if (!defaultSyncFetcher) {
+      defaultSyncFetcher = import('./sync-fetch.mjs').then((m) => m.createSyncFetcher({ fetchHeaders: opts.headers }));
+    }
+    fetchSync = await defaultSyncFetcher;
+  }
   return serial(M, async () => {
     const name = `/httpvfs/${M.nextFile++}`;
     M.httpvfsRegister(name, {
@@ -89,6 +109,7 @@ export async function open(url, opts = {}) {
       headers: opts.headers,
       maxParallel: opts.maxParallel,
       cache: opts.httpCache,
+      fetchSync,
     });
     const params = new URLSearchParams({
       cache_kb: String(Math.max(1, Math.round((opts.pageCacheBytes ?? 4 << 20) / 1024))),

@@ -8,6 +8,7 @@
 #ifndef DENSE_HNSW_H
 #define DENSE_HNSW_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 typedef struct Hnsw {

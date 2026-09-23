@@ -54,6 +54,7 @@ typedef struct PageReader {
   int pgsz;       /* page size */
   int usable;     /* page size minus reserved bytes */
   int ok;         /* direct reads possible */
+  int wal;        /* database header says WAL mode: the file may be stale */
 } PageReader;
 
 /* Set up direct reads of database zDb. Returns 0 if possible. */
@@ -66,7 +67,7 @@ int pr_read(PageReader *pr, uint32_t pgno, uint8_t *buf);
 void pr_prefetch(PageReader *pr, const uint32_t *pgnos, int n);
 
 /* In table-leaf page `page` (number pgno), find the cell with the given rowid.
-** On success sets *payload/*plen to the record and returns 1. Returns 0 if
+** On success sets *payload and *plen to the record and returns 1. Returns 0 if
 ** the page is not a table leaf, the rowid is absent, or the payload spills
 ** to overflow pages. */
 int pr_leaf_find(const PageReader *pr, const uint8_t *page, uint32_t pgno, int64_t rowid,

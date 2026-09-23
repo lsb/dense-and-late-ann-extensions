@@ -8,7 +8,7 @@
     ".": "./index.mjs",
     "./dist/*": "./dist/*"
   },
-  "files": ["index.mjs", "dist/"],
+  "files": ["index.mjs", "sync-fetch.mjs", "sync-fetch-worker.mjs", "dist/"],
   "engines": { "node": ">=22" },
   "license": "AGPL-3.0-only"
 }

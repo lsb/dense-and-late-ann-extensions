@@ -52,3 +52,36 @@ Quality: known-item queries are solved perfectly (recall@10 = MRR = 1). Word que
 Presets are taken from Chrome DevTools (`4g` = "Fast 4G": 165 ms, 8.1 Mbps; `slow-4g`: 562.5 ms, 1.44 Mbps; `slow-3g`: 2,000 ms, 400 kbps; latency and throughput already include DevTools' calibration multipliers) and from WebPageTest (`lte`: 70 ms, 12 Mbps; `3g`: 300 ms, 1.6 Mbps; and others). Both sets were checked against their source files. The `wifi`, `5g`, `starlink` and `lte-poor` presets are illustrative, and modifiers such as `h1` (6 connections) and `h2` (100 streams) set concurrency.
 
 Validation: for seven traces, from latency-bound to bandwidth-bound to concurrency-limited, the real server is 0.2–1 % slower than the simulator and never faster (for example 1,675 ms simulated against 1,682–1,686 ms measured for a mixed trace on `4g,h1,cold`). Without shaping the server handles about 3,650 requests/s for 4 KB ranges on one connection, far above the fastest preset, so it is not the bottleneck. Known simplifications: only HTTP/1.1 is spoken (HTTP/2 is represented only by a higher concurrency limit), slow start restarts for every request, packet loss is not modelled, and CORS preflights are not simulated.
+
+## 2026-09-23 — Encoders (`enc/`) and the LateOn-Code-edge configuration
+
+**LateOn-Code-edge settings, pinned exactly.** The model's `onnx_config.json` could not be downloaded, so the candidate configurations the next-plaid exporter would write were generated and hashed. The GitHub project oimiragieo/tensor-grep (`src/tensor_grep/core/retrieval_late.py`) lists SHA-256 digests for Hugging Face revision `07ef20f4` of LateOn-Code-edge. Our `model_int8.onnx` matches its digest (`eac35bda…`), and exactly one candidate configuration matches its `onnx_config.json` digest (`fa4fef89…`). That file is now `models/lateon-code-edge/onnx_config.json`. It says:
+- queries are prefixed with `[Q] ` and documents with `[D] `, inserted right after `[CLS]`;
+- `query_length` is 256 and `document_length` 2048;
+- **no** `[MASK]` query expansion;
+- punctuation tokens are skipped on the document side;
+- text is lower-cased.
+
+The ONNX graph already includes both projection layers (256 → 512 → 48) and per-token L2 normalisation.
+
+**Dynamic quantisation makes batching change the output.** Both ONNX models use dynamic int8 quantisation: activation scales are computed over the whole batch tensor, so a document's vectors depend on which other documents share its batch (per-token cosine similarity as low as 0.48 for LateOn). All corpora are therefore encoded one document at a time, which is deterministic and matches what a browser computes for a single query.
+
+**MiniLM qint8 compared with fp32** (fp32 model from the same npm package as the tokenizer), over 2,152 texts:
+- mean cosine similarity 0.988 (minimum 0.960);
+- the top-1 neighbour agrees 95.2 % of the time;
+- on the LLM paragraphs, recall@1 of the paragraph written about the query word is 0.855 for qint8 and 0.862 for fp32.
+
+**Throughput and sizes** (2 threads, shared CPU):
+
+| Model | Speed, one document at a time | Size |
+|---|---|---|
+| MiniLM | ≈130 docs/s | 768 bytes per document (fp16) |
+| LateOn | 150–190 docs/s on random-word docs; ≈490 docs/s on LLM docs | 96 bytes per token vector (fp16) |
+
+A 50-word random-word document yields 111.4 LateOn token vectors; an LLM paragraph truncated to 50 words yields 65.3 tokens, 58.7 after the punctuation skiplist. Encoding the 1M random-word corpus is estimated at about 2 h per model and about 10.7 GB of fp16 token vectors for LateOn.
+
+## 2026-09-23 — PLAID study (`docs/plaid.md`)
+
+`docs/plaid.md` specifies fast-plaid's algorithm with source references: centroid count K = 2^⌊log₂(16√T)⌋ for T token vectors, k-means, the residual codec (bucket cutoffs at quantiles i/2ⁿ, bucket weights at quantiles (i+0.5)/2ⁿ), the IVF, and the search stages with their defaults (`n_ivf_probe` 8 per query token, `n_full_scores` 4096). At dimension 48 a residual costs 6, 12 or 24 bytes at 1, 2 or 4 bits. With bit-packed centroid ids and IVF entries, the total is about 10.6, 16.6 or 28.6 bytes per token, against 96 bytes for fp16. That projects to about 1.2, 1.9 or 3.2 GB for the 1M random-word corpus.
+
+**Finding: default PLAID probing touches too much of the corpus for httpvfs.** A NumPy simulation on words-10k with `n_ivf_probe` = 8 probes about 69 centroid cells per query and gathers about 2,800 candidate documents (28 % of the corpus), whose codes all have to be fetched for approximate scoring. PLAID's centroid-score pruning threshold (0.4 in next-plaid) removes almost nothing for this model. Omar Khattab's measurements in the Hugging Face blog (1-bit residuals, bit-packed ids, document-side pruning) point towards small indexes. A centroid-major layout in the style of WARP, where each centroid's posting list stores document ids together with residuals, lets a query finish in one parallel round after choosing centroids, and is the main candidate for the SQLite design.

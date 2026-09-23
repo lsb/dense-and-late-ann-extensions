@@ -115,3 +115,38 @@ Module.httpvfsFetch = async function (h, n, offPtr, lenPtr, destPtr, t0Ptr, t1Pt
   if (cfg.onRound) cfg.onRound({ n, offs, lens, t0, t1 });
   return 0;
 };
+
+// Synchronous variant (build "sync", no Asyncify): cfg.fetchSync(offs, lens)
+// must return [{buf, total}] for the whole batch before returning, e.g. by
+// waiting with Atomics.wait while a worker fetches the ranges in parallel.
+// Returns 0 (SQLITE_OK) or 10 (SQLITE_IOERR).
+Module.httpvfsFetchSync = function (h, n, offPtr, lenPtr, destPtr, t0Ptr, t1Ptr, sizePtr) {
+  const cfg = Module.httpvfsHandles[h];
+  if (!cfg || !cfg.fetchSync) return 10;
+  const offs = [], lens = [];
+  for (let i = 0; i < n; i++) {
+    offs.push(HEAPF64[(offPtr >> 3) + i]);
+    lens.push(HEAP32[(lenPtr >> 2) + i]);
+  }
+  let results;
+  const t0 = performance.now();
+  try {
+    results = cfg.fetchSync(cfg.url, offs, lens);
+  } catch (e) {
+    console.error(e);
+    return 10;
+  }
+  const t1 = performance.now();
+  for (let i = 0; i < n; i++) {
+    const { buf, total } = results[i];
+    const dest = HEAPU32[(destPtr >> 2) + i];
+    const expect = total >= 0 ? Math.min(lens[i], total - offs[i]) : lens[i];
+    if (buf.length !== expect) return 10;
+    HEAPU8.set(buf, dest);
+    if (buf.length < lens[i]) HEAPU8.fill(0, dest + buf.length, dest + lens[i]);
+    HEAPF64[(t0Ptr >> 3) + i] = results[i].t0 ?? t0;
+    HEAPF64[(t1Ptr >> 3) + i] = results[i].t1 ?? t1;
+    if (total >= 0) HEAPF64[sizePtr >> 3] = total;
+  }
+  return 0;
+};
