@@ -410,6 +410,13 @@ class FluidLink:
         self._notify()
         return flow
 
+    def remove(self, flow: Flow, t: float) -> None:
+        """Drop an unfinished flow (e.g. the client disconnected)."""
+        self.advance(t)
+        if self.flows.pop(flow.fid, None) is not None:
+            self._dirty = True
+            self._notify()
+
     def pop_completed(self) -> list[Flow]:
         c, self.completed = self.completed, []
         return c

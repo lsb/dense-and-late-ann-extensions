@@ -1,0 +1,14 @@
+{
+  "name": "sqlite-httpvfs-ann",
+  "version": "0.0.1",
+  "description": "Read-only SQLite (FTS5 + ANN extensions) in WebAssembly over HTTP range requests, with parallel prefetch",
+  "type": "module",
+  "main": "./index.mjs",
+  "exports": {
+    ".": "./index.mjs",
+    "./dist/*": "./dist/*"
+  },
+  "files": ["index.mjs", "dist/"],
+  "engines": { "node": ">=22" },
+  "license": "AGPL-3.0-only"
+}
