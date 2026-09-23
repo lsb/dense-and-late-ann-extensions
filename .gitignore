@@ -7,3 +7,4 @@ build/
 *.db-journal
 __pycache__/
 node_modules/
+results/*.tmp
