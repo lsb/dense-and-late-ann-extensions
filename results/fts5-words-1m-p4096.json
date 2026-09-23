@@ -1,0 +1,90 @@
+{
+ "label": "1m",
+ "page_size": 4096,
+ "sqlite": "3.53.4",
+ "load": [
+  4.5712890625,
+  3.10888671875,
+  1.4189453125
+ ],
+ "build": {
+  "insert_docs_s": 3.410736282000016,
+  "fts_rebuild_s": 40.52416671100002,
+  "fts_optimize_s": 2.01938949700002,
+  "vacuum_s": 4.360642922000011,
+  "n_docs": 1000000,
+  "docs_per_s_bulk": 22760.94703473741,
+  "incremental_docs_per_s": 30229.23231939383,
+  "db_bytes": 723120128,
+  "bytes_by_table": {
+   "docs": 508403712,
+   "fts_data": 203735040,
+   "fts_docsize": 10051584,
+   "fts_idx": 921600,
+   "sqlite_schema": 4096,
+   "fts_config": 4096
+  }
+ },
+ "queries": {
+  "known/and": {
+   "recall@10": 1.0,
+   "success@1": 1.0,
+   "success@10": 1.0,
+   "mrr@10": 1.0,
+   "ndcg@10": 1.0,
+   "auc": 1.0,
+   "n": 1000,
+   "lat_ms_p50": 0.12578299998722287,
+   "lat_ms_p95": 0.21289740000725005,
+   "lat_ms_mean": 0.14420728599918675,
+   "cold_pages_mean": 21.455,
+   "cold_pages_p95": 23.0,
+   "cold_bytes_mean": 83815.68
+  },
+  "known/or": {
+   "recall@10": 1.0,
+   "success@1": 1.0,
+   "success@10": 1.0,
+   "mrr@10": 1.0,
+   "ndcg@10": 1.0,
+   "auc": 1.0,
+   "n": 1000,
+   "lat_ms_p50": 2.9004250000070897,
+   "lat_ms_p95": 3.922281600068799,
+   "lat_ms_mean": 3.046608599998649,
+   "cold_pages_mean": 1538.55,
+   "cold_pages_p95": 1761.4,
+   "cold_bytes_mean": 6311128.32
+  },
+  "word/and": {
+   "recall@10": 0.014713955497077867,
+   "success@1": 0.988,
+   "success@10": 1.0,
+   "mrr@10": 0.994,
+   "ndcg@10": 0.9847515682789265,
+   "auc": 0.5073568992086976,
+   "n": 1000,
+   "lat_ms_p50": 1.166706499986958,
+   "lat_ms_p95": 1.779466050021483,
+   "lat_ms_mean": 1.2282727480015865,
+   "cold_pages_mean": 687.965,
+   "cold_pages_p95": 684.0,
+   "cold_bytes_mean": 2816482.56
+  },
+  "word/or": {
+   "recall@10": 0.014713955497077867,
+   "success@1": 0.988,
+   "success@10": 1.0,
+   "mrr@10": 0.994,
+   "ndcg@10": 0.9847515682789265,
+   "auc": 0.5073568992086976,
+   "n": 1000,
+   "lat_ms_p50": 1.175208000006478,
+   "lat_ms_p95": 1.4714914500359535,
+   "lat_ms_mean": 1.2089696499992897,
+   "cold_pages_mean": 687.965,
+   "cold_pages_p95": 684.0,
+   "cold_bytes_mean": 2816482.56
+  }
+ }
+}
