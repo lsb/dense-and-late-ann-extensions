@@ -1,0 +1,9 @@
+# Large, deterministically regenerated artifacts
+data/corpora/words-1m.txt
+models/lfm2.5-350m/onnx/model_q4f16.onnx_data*
+data/emb/
+build/
+*.db
+*.db-journal
+__pycache__/
+node_modules/
