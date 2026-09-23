@@ -1,0 +1,90 @@
+{
+ "label": "10k",
+ "page_size": 4096,
+ "sqlite": "3.53.4",
+ "load": [
+  4.587890625,
+  3.0615234375,
+  1.38525390625
+ ],
+ "build": {
+  "insert_docs_s": 0.018107747000044583,
+  "fts_rebuild_s": 0.31375763900007314,
+  "fts_optimize_s": 0.051198805000012726,
+  "vacuum_s": 0.029484758999956284,
+  "n_docs": 10000,
+  "docs_per_s_bulk": 30132.69964827381,
+  "incremental_docs_per_s": 26879.936777831634,
+  "db_bytes": 7626752,
+  "bytes_by_table": {
+   "docs": 5074944,
+   "fts_data": 2433024,
+   "fts_docsize": 94208,
+   "fts_idx": 16384,
+   "sqlite_schema": 4096,
+   "fts_config": 4096
+  }
+ },
+ "queries": {
+  "known/and": {
+   "recall@10": 1.0,
+   "success@1": 1.0,
+   "success@10": 1.0,
+   "mrr@10": 1.0,
+   "ndcg@10": 1.0,
+   "auc": 1.0,
+   "n": 1000,
+   "lat_ms_p50": 0.03142750000506567,
+   "lat_ms_p95": 0.05537615006687698,
+   "lat_ms_mean": 0.035850378998247834,
+   "cold_pages_mean": 13.97,
+   "cold_pages_p95": 15.0,
+   "cold_bytes_mean": 53157.12
+  },
+  "known/or": {
+   "recall@10": 1.0,
+   "success@1": 1.0,
+   "success@10": 1.0,
+   "mrr@10": 1.0,
+   "ndcg@10": 1.0,
+   "auc": 1.0,
+   "n": 1000,
+   "lat_ms_p50": 0.047660500058555044,
+   "lat_ms_p95": 0.07465010000373694,
+   "lat_ms_mean": 0.05194273500023883,
+   "cold_pages_mean": 26.495,
+   "cold_pages_p95": 29.0,
+   "cold_bytes_mean": 104459.52
+  },
+  "word/and": {
+   "recall@10": 0.9915,
+   "success@1": 0.982,
+   "success@10": 1.0,
+   "mrr@10": 0.991,
+   "ndcg@10": 0.9873986159588021,
+   "auc": 0.9957409690610726,
+   "n": 1000,
+   "lat_ms_p50": 0.02519900004926967,
+   "lat_ms_p95": 0.04665464996946866,
+   "lat_ms_mean": 0.029017876000466458,
+   "cold_pages_mean": 16.335,
+   "cold_pages_p95": 17.0,
+   "cold_bytes_mean": 62844.16
+  },
+  "word/or": {
+   "recall@10": 0.9915,
+   "success@1": 0.982,
+   "success@10": 1.0,
+   "mrr@10": 0.991,
+   "ndcg@10": 0.9873986159588021,
+   "auc": 0.9957409690610726,
+   "n": 1000,
+   "lat_ms_p50": 0.026141999910578306,
+   "lat_ms_p95": 0.04392420003114236,
+   "lat_ms_mean": 0.02939860600065458,
+   "cold_pages_mean": 16.335,
+   "cold_pages_p95": 17.0,
+   "cold_bytes_mean": 62844.16
+  }
+ }
+}
