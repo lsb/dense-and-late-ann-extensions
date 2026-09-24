@@ -21,6 +21,8 @@ node web/test/tokenizer_parity.mjs        # tokenizer check in Node, 6,540 texts
 node --test web/test/web.test.mjs         # Chromium: encoder parity, one query per system, browser == native
 python3 web/test/compare_retrieval.py     # does the encoding difference change exact top-10? (after web.test)
 node web/test/profile_run.mjs --profiles 'none;lte,h1;4g,h1'   # page/encoder/query timings per profile
+node web/test/ttfr.mjs --dbs 'a=build/x/a.db;b=build/x/b.db' --variants 'a:off,a:auto,b:auto' \
+     --profiles '4g,h1;4g,h2' --visits first,repeat --delays 0,3000   # time to first result (HTTP/2 via h2proxy.mjs)
 ./web/vendor.sh                           # refresh web/vendor/ from npm (versions pinned in package.json)
 ```
 
@@ -157,6 +159,59 @@ What this says:
 - **The first visit is dominated by downloading the models**: a minute on 4G. Cache Storage fixes repeat visits. Smaller models (int4 or distilled) or loading only the encoder a query needs would help the first one; FTS5 works immediately.
 - **HTTP/1.1 costs more than round trips here.** A dense round fetches 16 pages and a late round up to 100 lists and documents; with six connections per host these become several latency steps each. On 4g the later dense query takes 3.1 s for 7 rounds (1.2 s of latency if every round were one parallel step), and the late query 3.3 s for 3 rounds. HTTP/2 from a real CDN, or multi-range requests, would bring both close to rounds × RTT; netsim's simulator (`h2`) predicts that, but a browser talking to this HTTP/1.1 server cannot show it.
 - Fetching the text of the hits costs 1–2 more rounds (0.2 s on lte, 0.4 s on 4g). Storing a short snippet next to each vector, or starting that fetch while re-ranking, would hide it.
+
+## Time to first result
+
+`web/test/ttfr.mjs` measures how long a page takes to show its first result, in Chromium (headless shell 141) against `netsim/rangeserver.py`: `web/test/ttfr.html` opens the database with `preload` of the encoder the system needs and searches as soon as the index is open (*delay 0*), or 3 s later, as if the user were typing (*delay 3,000*; then the time is counted from submitting the query). HTTP/1.1 profiles (`h1`) talk to the range server directly, so Chromium opens at most six connections; the `h2` profiles go through `web/test/h2proxy.mjs`, a real HTTP/2 (TLS) proxy whose upstream range server runs the `,h2` preset. *First visit*: an empty browser profile, so ONNX Runtime and the model are downloaded through the shaped link. *Repeat visit*: the same profile after one unshaped visit, so the encoder comes from Cache Storage (the page, the SQLite build and the database pages are fetched again, because the range server sends `no-store`). Database: llm-10k with every index. *before* is the matrix database built by the previous code (float16 codebooks and centroids, late format 2), *after* is rebuilt with the new defaults (int8 codebooks, IVF centroids and late centroids); *off* / *auto* is `openIndex(…, {warm})` (the harness names the queried index, as `'auto'` does for `dense` and `late`). Query "volcanic eruption", k = 10 with document text, default parameters (graph ef 64, IVF nprobe 16, late warp nprobe 8 + rerank 64). Medians of 2 runs (repeat) or 1 run (first visit), in seconds; all runs are in `results/static/ttfr-llm-10k.json`.
+
+Repeat visit, query typed 3 s after the index opened (time from submitting the query):
+
+| System | Profile | before, no warm-up | before, warm-up | after, no warm-up | **after, warm-up** |
+|---|---|---|---|---|---|
+| dense graph | 4g h1 | 4.70 | 3.81 | 4.38 | **3.66** |
+| dense graph | 4g h2 | 2.88 | 2.06 | 2.78 | **2.06** |
+| dense graph | lte h1 | 2.22 | 1.87 | 2.08 | **1.76** |
+| dense graph | lte h2 | 1.56 | 1.07 | 1.47 | **1.09** |
+| dense IVF | 4g h1 | 3.14 | 2.29 | 2.93 | **2.05** |
+| dense IVF | 4g h2 | 2.29 | 1.21 | 2.02 | **1.23** |
+| dense IVF | lte h1 | 1.67 | 1.00 | 1.43 | **1.01** |
+| dense IVF | lte h2 | 1.27 | 0.67 | 1.08 | **0.66** |
+| late | 4g h1 | 4.81 | 3.17 | 4.24 | **3.08** |
+| late | 4g h2 | 2.92 | 1.36 | 2.50 | **1.38** |
+| late | lte h1 | 2.33 | 1.42 | 2.07 | **1.42** |
+| late | lte h2 | 1.64 | 0.76 | 1.37 | **0.75** |
+
+Repeat visit, query submitted as soon as the index is open (time from navigation start):
+
+| System | Profile | before, no warm-up | before, warm-up | after, no warm-up | **after, warm-up** |
+|---|---|---|---|---|---|
+| dense graph | 4g h1 | 8.09 | 7.98 | 7.79 | **7.62** |
+| dense graph | 4g h2 | 6.33 | 6.27 | 6.20 | **6.09** |
+| dense graph | lte h2 | 3.48 | 3.43 | 3.45 | **3.35** |
+| dense IVF | 4g h1 | 6.68 | 6.92 | 6.73 | **6.34** |
+| dense IVF | 4g h2 | 5.73 | 5.57 | 5.35 | **5.33** |
+| dense IVF | lte h2 | 3.23 | 3.14 | 3.01 | **2.96** |
+| late | 4g h1 | 9.20 | 8.35 | 8.16 | **7.77** |
+| late | 4g h2 | 6.28 | 6.31 | 5.85 | **5.90** |
+| late | lte h2 | 3.59 | 3.54 | 3.33 | **3.32** |
+
+First visit, query submitted as soon as the index is open (time from navigation start; the encoder download dominates):
+
+| System | Profile | before, no warm-up | before, warm-up | **after, warm-up** |
+|---|---|---|---|---|
+| dense graph | 4g h1 / h2 | 46.0 / 44.2 | 45.5 / 43.7 | **45.2 / 43.8** |
+| dense graph | lte h1 / h2 | 30.1 / 29.5 | 30.0 / 29.2 | **29.7 / 29.2** |
+| dense IVF | 4g h1 / h2 | 44.4 / 43.7 | 43.8 / 43.1 | **43.6 / 42.9** |
+| dense IVF | lte h1 / h2 | 29.5 / 29.2 | 29.2 / 28.9 | **29.1 / 28.9** |
+| late | 4g h1 / h2 | 43.6 / 41.8 | 42.9 / 41.2 | **42.4 / 40.6** |
+| late | lte h1 / h2 | 28.6 / 28.0 | 28.4 / 27.7 | **27.9 / 27.3** |
+
+What this shows:
+
+- **When there is anything to hide behind, the warm-up removes the static data from the first query entirely**: with 3 s of typing, the first query costs what a query within a session costs. It is 30–55 % faster (late on `4g` h2: 2.92 → 1.38 s; IVF 2.29 → 1.23 s; graph 2.88 → 2.06 s). Smaller static data then no longer matters for this query, only for the bandwidth it takes from other downloads.
+- **On a repeat visit the encoder is not the long pole here.** It loads from Cache Storage in 1.1–1.7 s (session creation), while opening the page, the SQLite build (1.5 MB, fetched again because of `no-store`) and the database takes 1.9 s on `lte` and 3.4 s on `4g` h1. A query submitted the moment the index opens therefore finds nothing loaded yet, and the warm-up can only overlap with the encoding (tens of ms). The gains there (0.1–1.4 s) come mostly from the smaller static data. On a phone, where creating the ONNX session takes several times longer, the warm-up would hide more. HTTP caching of the page and the SQLite build would shorten the open.
+- **On a first visit the warm-up saves only 0.3–0.7 s of 28–46 s**: the static data competes for the same link as the 14 MB ONNX Runtime and the 17–23 MB model, so moving it earlier saves its round trips, not its transfer time; shrinking it (after) saves a further 0.2–0.5 s.
+- Warming an index the page does not query costs: in a first version `'auto'` also warmed FTS5 (five dependent rounds, 1.4 s on `4g` h1) and every dense index, and a search that arrived while one of those was running waited for it (IVF first query 1.6 → 1.9 s on `lte` h1). `'auto'` now warms only the index the default search uses.
 
 ## Demo database
 

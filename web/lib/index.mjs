@@ -55,11 +55,8 @@ export class SearchIndex {
    */
   warm(systems) {
     const tables = new Set();
-    for (const s of systems || this.indexes.map((i) => i.table)) {
-      const hit = this.indexes.filter((i) => i.table === s || i.kind === s);
-      if (!hit.length) throw new Error(`this database has no ${s} index`);
-      for (const i of hit) tables.add(i.table);
-    }
+    // system names resolve as in search(): 'dense' is the graph index if there is one
+    for (const s of systems || this.indexes.map((i) => i.table)) tables.add(this.resolve(s).table);
     return Promise.all([...tables].map((t) => {
       this.warming[t] ||= this.sql('warm', { table: t }).catch((e) => ({ table: t, error: String(e.message || e) }));
       return this.warming[t];
