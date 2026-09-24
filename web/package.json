@@ -1,0 +1,11 @@
+{
+  "name": "dense-late-web-demo",
+  "private": true,
+  "type": "module",
+  "description": "Browser demo and client library for the dense/late ANN SQLite extensions",
+  "devDependencies": {
+    "onnxruntime-web": "1.30.0",
+    "@huggingface/tokenizers": "0.2.0"
+  },
+  "license": "AGPL-3.0-only"
+}
