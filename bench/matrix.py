@@ -639,7 +639,22 @@ def aggregate(cfg, corpus):
                                                           "exact:lateon": "float exact MaxSim LateOn (numpy)"}[key],
                                       "quality": qconf[key]["metrics"]})
     res["sim_vs_real"] = sim_vs_real(cfg, corpus, simd)
+    res["coalesce"] = load_coalesce(corpus)
     return res
+
+
+COALESCE_STRATEGIES = ("h1 baseline", "h1 coalesce C=6", "h1 multipart C=6", "h2 baseline")
+
+
+def load_coalesce(corpus):
+    """Rows of results/coalesce/<corpus>.json (bench/coalesce_eval.py): recorded traces
+    re-simulated with the VFS's HTTP/1.1 request budget."""
+    p = REPO / "results" / "coalesce" / f"{corpus}.json"
+    if not p.exists():
+        return None
+    d = json.loads(p.read_text())
+    return {"profiles": d["profiles"],
+            "rows": [r for r in d["rows"] if r["strategy"] in COALESCE_STRATEGIES]}
 
 
 def sim_vs_real(cfg, corpus, simd):
@@ -718,6 +733,8 @@ def merge_splits(corpus, parts):
         for spec, o in (p.get("sim_vs_real") or {}).items():
             sv[f"{spec} ({p['db_file'].split('--')[-1].replace('.db', '')})"] = o
     r["sim_vs_real"] = sv or None
+    co = [p["coalesce"] for p in parts if p.get("coalesce")]
+    r["coalesce"] = {"profiles": co[0]["profiles"], "rows": [x for c in co for x in c["rows"]]} if co else None
     return r
 
 
@@ -815,6 +832,24 @@ def md_corpus(cfg, r):
                 ek = "–" if d.get("ext_kb") is None else f"{d['ext_kb']:,.0f}"
                 L.append(f"| {c['label']} | {d['rounds']:.1f} | {d['requests']:.1f} | {d['kb']:,.0f} | {ek} | " + " | ".join(cells) + " |")
             L.append("")
+    co = r.get("coalesce")
+    if co:
+        L.append("**HTTP/1.1 with the request budget** (`bench/coalesce_eval.py`: the recorded traces re-simulated "
+                 "with the VFS's per-round request planner; *coalesce* merges nearby ranges into at most six requests, "
+                 "over-fetching the gaps; *multi-range* sends at most six requests with several ranges each). "
+                 "p50 simulated latency in ms, one configuration per system:\n")
+        L.append("| System (config) | Regime | Profile | h1 | h1 + coalesce | h1 + multi-range | h2 |")
+        L.append("|---|---|---|---|---|---|---|")
+        cell = {}
+        for x in co["rows"]:
+            cell[(x["system"], x["config"], x["regime"], x["profile"], x["strategy"])] = x
+        keys = sorted({(x["system"], x["config"], x["regime"], x["profile"]) for x in co["rows"]},
+                      key=lambda k: (k[0], k[2] != "warm", co["profiles"].index(k[3]) if k[3] in co["profiles"] else 9))
+        for sysname, conf, regime, prof in keys:
+            vals = [cell.get((sysname, conf, regime, prof, st)) for st in COALESCE_STRATEGIES]
+            L.append(f"| {sysname} ({conf}) | {regime} | {prof} | "
+                     + " | ".join(ms(v["p50"]) if v else "–" for v in vals) + " |")
+        L.append("")
     sv = r.get("sim_vs_real")
     if sv:
         L.append("**Simulated versus real** (real = wall time through the shaped server; own-trace = the same run's "
