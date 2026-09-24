@@ -234,3 +234,36 @@ A first visit using both encoders transfers about 60 MB: 41 s on `lte` and 60 s 
 | Late (warp) | 0.30 s | 1.5 s | 3.3 s |
 
 The first query of a session takes 4.7–6.5 s on `4g` because it also loads each index's static data. On `4g` the browser's six-connections-per-host limit costs more than the round trips themselves: a round of 16–100 requests becomes several waits in sequence. HTTP/2 hosting, or fewer and larger range requests per round, is therefore a priority.
+
+## 2026-09-24 — Dense ANN: IVF-PQ layout compared with the graph
+
+`dense_ann` gained a `layout=ivf` option (15 tests pass).
+- *Coarse quantiser.* k-means with nlist lists; the centroids are stored as fp16, int8 or PQ codes in a head fetched once per connection.
+- *Posting lists.* PQ-64 codes of residuals in rows of at most 4,000 bytes, 69 bytes per entry (rowid, page delta, code), written list by list so each list is one contiguous page range.
+- *Queries.* Round 1 fetches all `nprobe` lists in parallel; round 2 fetches the stored vectors of the top `rerank_k` candidates for reranking. A query is therefore two rounds regardless of corpus size.
+
+**Matched-recall comparison.** Recall@10 is measured against exact search; times are netsim estimates on `4g` / `slow-4g` for a warm connection.
+
+| Data | Target recall | Graph (co-located PQ, HNSW-built) | IVF-PQ |
+|---|---|---|---|
+| synthetic 1M | 0.95 | 0.972 · 5.9 rounds · 606 KiB · 1,526 / 6,519 ms | 0.995 · 2 rounds · 404 KiB · 738 / 3,421 ms |
+| synthetic 1M | 0.90 | 1,336 ms | 635 ms |
+| words-10k MiniLM | 0.95 | 0.954 · 9.8 rounds · 1,058 KiB · 2,671 / 11,471 ms | 0.957 · 2 rounds · 1,049 KiB · 1,394 / 7,111 ms |
+| words-120k MiniLM | 0.80 | 0.815 · 12.5 rounds · 2.4 MB · 4,453 ms | 0.834 · 3.2 MB · 3,609 ms |
+| words-120k MiniLM | 0.90 | not reached | 0.924 · 5.8 MB · 6,242 / 34,379 ms (nprobe 512 of 1,386) |
+
+Storage at 1M:
+- IVF: 917 bytes per document (80 bytes of list entry and 821 bytes of fp16 vector). int8 rerank vectors cut this to about 500 bytes at the same recall; with no stored vectors it is about 95 bytes, but recall stops near 0.6.
+- Graph: 4,119 bytes per document.
+
+Setup per connection:
+- graph: 288 KiB;
+- IVF: 540 KiB at 10k and 736 KiB at 1M, the latter with PQ-compressed centroids (fp16 centroids would be 3.3 MB).
+
+**Interpretation.**
+- *Synthetic data flatters IVF*, because its clusters line up with the lists.
+- *On real MiniLM data the bottleneck is coarse probe coverage.* To reach 0.92 recall a query must probe about 37 % of the lists at both 10k and 120k, so bytes per query grow linearly with corpus size.
+- *The graph needs more rounds but fewer bytes*, and it levels off near recall 0.8 for single-word queries, which are out of distribution for 50-word documents. Queries that are themselves documents reach 0.93.
+- *Recall@10 against exact search is partly noise here.* Random-word documents are near-ties, so exact search's own top 10 depends on small encoder differences. A comparison against relevance labels on the LLM corpus should decide between the layouts.
+
+`ext/dense/run_words1m.sh` runs both layouts on the real 1M embeddings once they exist.

@@ -7,7 +7,7 @@ target, and prints a markdown table with rounds, bytes, simulated 4g /
 slow-4g times (netsim presets; one query on a warm connection), the one-time
 setup cost, index bytes per document and build time.
 
-  python3 ext/dense/compare.py synth1m-graph:synth1m-ivf-cpq w10k-graph:w10k-ivf ...
+  python3 ext/dense/compare.py [--targets=0.8,0.9,0.95] synth1m-graph:synth1m-ivf-cpq w10k-graph:w10k-ivf ...
 """
 import json
 import sys
@@ -55,4 +55,8 @@ def main(pairs, targets=(0.9, 0.95)):
 
 
 if __name__ == "__main__":
-    main(sys.argv[1:])
+    args = sys.argv[1:]
+    targets = (0.9, 0.95)
+    if args and args[0].startswith("--targets="):
+        targets = tuple(float(t) for t in args.pop(0).split("=", 1)[1].split(","))
+    main(args, targets)

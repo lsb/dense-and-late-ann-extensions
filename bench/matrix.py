@@ -450,7 +450,7 @@ def step_real(cfg, corpus, args):
     k = run["k"]
     profiles = args.profiles.split(",") if args.profiles else cfg["profiles"]
     specs = [f"{p},{c}" for p in profiles for c in cfg["concurrency"]]
-    fast = {"none", "lan", "wifi"}
+    fast = {"none", "lan"}   # exhaustive configs: thousands of rounds per query, only here
     jobs = []
     for spec in specs:
         p = spec.split(",")[0]
@@ -460,10 +460,10 @@ def step_real(cfg, corpus, args):
         for c in confs:
             if c.get("exhaustive") and p not in fast:
                 continue
-            qs = interleave_kinds(meta, per_kind)
+            qs = interleave_kinds(meta, 5 if c.get("exhaustive") else per_kind)
             warm_up = [interleave_kinds(meta)[-1]]
             runs.append(node_run(c, k, "warm", qs, warm_up))
-            runs.append(node_run(c, k, "cold", interleave_kinds(meta, max(2, per_kind // 5)), []))
+            runs.append(node_run(c, k, "cold", interleave_kinds(meta, 2 if c.get("exhaustive") else max(2, per_kind // 5)), []))
         jobs.append((spec, runs))
 
     def one(job):
@@ -581,7 +581,8 @@ def sim_vs_real(cfg, corpus, simd):
         for r in rs:
             own = sim.simulate(record_trace(r), profile(spec), seed=r["qi"]).total_ms
             pipe = est.get((r["config"], r["regime"], r["qi"]))
-            rows[r["regime"]].append((r["wall_ms"], own, pipe[j] if (pipe and j is not None) else None))
+            rows[r["regime"]].append((r["wall_ms"], own, pipe[j] if (pipe and j is not None) else None,
+                                      r["stats"]["rounds"]))
         o = {}
         for regime, xs in rows.items():
             if not xs:
@@ -590,14 +591,17 @@ def sim_vs_real(cfg, corpus, simd):
             own = [x[1] for x in xs]
             pipe = [x[2] for x in xs if x[2] is not None]
             realp = [x[0] for x in xs if x[2] is not None]
+            netx = [x for x in xs if x[2] is not None and x[3] > 0]
             o[regime] = {
                 "n": len(xs),
                 "real_p50": pct(real_ms, 50), "real_p95": pct(real_ms, 95),
                 "own_sim_p50": pct(own, 50), "own_sim_p95": pct(own, 95),
                 "pipeline_p50": pct(pipe, 50), "pipeline_p95": pct(pipe, 95),
-                "real_over_own_median": pct([a / b for a, b, _ in xs if b > 0], 50),
+                "real_over_own_median": pct([a / b for a, b, *_ in xs if b > 0], 50),
+                "real_minus_pipeline_median_ms": pct([a - p for a, _, p, _ in netx], 50),
+                "real_minus_pipeline_per_round_ms": pct([(a - p) / n for a, _, p, n in netx], 50),
                 "real_over_pipeline_median": pct([a / b for a, b in zip(realp, pipe) if b > 0], 50),
-                "real_minus_own_median_ms": pct([a - b for a, b, _ in xs], 50),
+                "real_minus_own_median_ms": pct([a - b for a, b, *_ in xs], 50),
                 "abs_rel_err_pipeline_median": pct([abs(a - b) / a for a, b in zip(realp, pipe) if a > 0], 50),
                 # the same, over queries that went to the network (real >= 20 ms)
                 "n_net": sum(1 for a in realp if a >= 20),
@@ -637,6 +641,10 @@ def md_corpus(cfg, r):
     L.append(f"{r['n_docs']:,} documents; {r['n_queries']:,} queries ("
              + ", ".join(f"{v:,} {k}" for k, v in r["query_kinds"].items())
              + f"). Database `{r['db_file']}`: {r['db_bytes'] / 1e6:.2f} MB.\n")
+    agr = [c.get("wasm_native_agreement") for c in r["configs"] if c.get("wasm_native_agreement") is not None]
+    if agr:
+        L.append(f"The top-10 lists returned through WASM are identical to the native ones for "
+                 f"{100 * min(agr):.1f} % (worst configuration) of the queries.\n")
     L.append("**Database composition** (dbstat, bytes of pages):\n")
     L.append("| Part | MB | Share | Index parameters |\n|---|---|---|---|")
     for k, v in sorted(r["sizes"].items(), key=lambda kv: -kv[1]):
@@ -689,13 +697,15 @@ def md_corpus(cfg, r):
                  "request log simulated; pipeline = the unshaped trace of the same query simulated, which is what the "
                  "tables above use). Medians over the real-run subset:\n")
         L.append("| Profile | Regime | Queries | Real p50 | Pipeline p50 | Real p95 | Pipeline p95 | "
-                 "Median real / own-trace | Median real / pipeline | Queries ≥ 20 ms | Abs. rel. error, median / p90 |")
-        L.append("|---|---|---|---|---|---|---|---|---|---|---|")
+                 "Median real / own-trace | Median real / pipeline | Median real − pipeline, ms (per round) | "
+                 "Queries ≥ 20 ms | Abs. rel. error there, median / p90 |")
+        L.append("|---|---|---|---|---|---|---|---|---|---|---|---|")
         for spec, o in sv.items():
             for regime, d in o.items():
                 L.append(f"| {spec} | {regime} | {d['n']} | {ms(d['real_p50'])} | {ms(d['pipeline_p50'])} | "
                          f"{ms(d['real_p95'])} | {ms(d['pipeline_p95'])} | {fmt(d['real_over_own_median'])} | "
-                         f"{fmt(d['real_over_pipeline_median'])} | {d['n_net']} | "
+                         f"{fmt(d['real_over_pipeline_median'])} | {fmt(d['real_minus_pipeline_median_ms'], 1)} "
+                         f"({fmt(d['real_minus_pipeline_per_round_ms'], 1)}) | {d['n_net']} | "
                          f"{pctfmt(d['abs_rel_err_pipeline_net_median'])} / {pctfmt(d['abs_rel_err_pipeline_net_p90'])} |")
         L.append("")
     return "\n".join(L)

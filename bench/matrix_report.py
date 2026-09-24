@@ -101,6 +101,7 @@ th,td{padding:4px 8px;border-bottom:1px solid var(--border);text-align:right;whi
 th:first-child,td:first-child{text-align:left}
 th{color:var(--text2);font-weight:600}
 svg{max-width:100%;height:auto;display:block}
+.pair{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:12px}
 svg text{fill:var(--text2);font-size:11px}
 svg .lbl{fill:var(--text);font-size:10.5px}
 .legend{display:flex;gap:18px;flex-wrap:wrap;font-size:13px;color:var(--text2);margin:.3em 0}
@@ -125,7 +126,7 @@ def scatter(r, spec, metric="ndcg@10", regime="warm", W=720, Hh=380):
         pts.append((d["latency"][spec]["p50"], q[metric], c))
     if not pts:
         return "<p>No data.</p>"
-    ml, mr, mt, mb = 56, 20, 16, 44
+    ml, mr, mt, mb = 50, 12, 22, 44
     xs = [max(1.0, p[0]) for p in pts]
     lo, hi = math.log10(min(xs)), math.log10(max(xs))
     lo, hi = math.floor(lo * 2) / 2, math.ceil(hi * 2) / 2
@@ -140,42 +141,52 @@ def scatter(r, spec, metric="ndcg@10", regime="warm", W=720, Hh=380):
         if k % 2 == 0:
             s.append(f'<line x1="{ml}" x2="{W - mr}" y1="{Y(v):.1f}" y2="{Y(v):.1f}" stroke="var(--grid)"/>'
                      f'<text x="{ml - 6}" y="{Y(v) + 4:.1f}" text-anchor="end">{v:.1f}</text>')
-    e = lo
-    while e <= hi + 1e-9:
-        for m in (1, 2, 5):
-            v = m * 10 ** math.floor(e)
-            if math.log10(v) < lo - 1e-9 or math.log10(v) > hi + 1e-9 or (m != 1 and e != math.floor(e)):
+    for d in range(math.floor(lo), math.ceil(hi) + 1):
+        for m in ((1, 2, 5) if hi - lo <= 2.5 else (1,)):
+            v = m * 10 ** d
+            if not (lo - 1e-9 <= math.log10(v) <= hi + 1e-9):
                 continue
             x = X(v)
+            lab = f"{v / 1e6:,.0f}M" if v >= 1e6 else f"{v / 1000:,.0f}k" if v >= 10000 else f"{v:,.0f}"
             s.append(f'<line x1="{x:.1f}" x2="{x:.1f}" y1="{mt}" y2="{Hh - mb}" stroke="var(--grid)"/>'
-                     f'<text x="{x:.1f}" y="{Hh - mb + 16}" text-anchor="middle">{v:,.0f}</text>')
-        e += 1
+                     f'<text x="{x:.1f}" y="{Hh - mb + 16}" text-anchor="middle">{lab}</text>')
     s.append(f'<line x1="{ml}" x2="{W - mr}" y1="{Hh - mb}" y2="{Hh - mb}" stroke="var(--axis)"/>')
     s.append(f'<text x="{(ml + W - mr) / 2}" y="{Hh - 8}" text-anchor="middle">p50 latency, ms (log scale), '
              f'{H.escape(spec)}, {regime}</text>')
     s.append(f'<text transform="translate(14 {(mt + Hh - mb) / 2}) rotate(-90)" text-anchor="middle">'
              f'{H.escape(metric)}</text>')
-    placed = []
-    for lat, val, c in sorted(pts, key=lambda p: p[0]):
+    boxes = []        # occupied rectangles: marks and placed labels
+    for lat, val, c in pts:
+        x, y = X(lat), Y(val)
+        boxes.append((x - 7, y - 7, x + 7, y + 7))
+    free = lambda b: all(b[2] < o[0] or b[0] > o[2] or b[3] < o[1] or b[1] > o[3] for o in boxes)  # noqa: E731
+    marks, labels = [], []
+    for lat, val, c in sorted(pts, key=lambda p: (-p[1], p[0])):
         x, y = X(lat), Y(val)
         fill = _fam_var(c["system"])
-        tip = (f"{c['label']} — {metric} {val:.3f}, p50 {lat:,.0f} ms, "
+        tip = (f"{c['label']}: {metric} {val:.3f}, p50 {lat:,.1f} ms, "
                f"{c[regime]['rounds']:.1f} rounds, {c[regime]['kb']:,.0f} KB")
         if SHAPE.get(c["system"]) == "square":
             mark = (f'<rect x="{x - 5:.1f}" y="{y - 5:.1f}" width="10" height="10" rx="2" fill="{fill}" '
                     f'stroke="var(--surface)" stroke-width="2"/>')
         else:
             mark = f'<circle cx="{x:.1f}" cy="{y:.1f}" r="5.5" fill="{fill}" stroke="var(--surface)" stroke-width="2"/>'
-        s.append(f'<g><title>{H.escape(tip)}</title>{mark}'
-                 f'<circle cx="{x:.1f}" cy="{y:.1f}" r="12" fill="transparent"/></g>')
-        ly = y - 9
-        for px, py in placed:
-            if abs(px - x) < 90 and abs(py - ly) < 12:
-                ly = py - 12
-        placed.append((x, ly))
-        anchor = "end" if x > W - 150 else "start"
-        dx = -4 if anchor == "end" else 6
-        s.append(f'<text class="lbl" x="{x + dx:.1f}" y="{ly:.1f}" text-anchor="{anchor}">{H.escape(c["label"])}</text>')
+        marks.append(f'<g><title>{H.escape(tip)}</title>{mark}'
+                     f'<circle cx="{x:.1f}" cy="{y:.1f}" r="12" fill="transparent"/></g>')
+        w = 6.0 * len(c["label"]) + 4
+        for dx, dy, anchor in ((8, 4, "start"), (8, -8, "start"), (8, 15, "start"), (-8, 4, "end"),
+                               (-8, -8, "end"), (-8, 15, "end")):
+            x0 = x + dx if anchor == "start" else x + dx - w
+            b = (x0, y + dy - 10, x0 + w, y + dy + 2)
+            if b[0] < ml or b[2] > W - 2 or b[1] < 0 or b[3] > Hh - mb:
+                continue
+            if free(b):
+                boxes.append(b)
+                labels.append(f'<text class="lbl" x="{x + dx:.1f}" y="{y + dy:.1f}" text-anchor="{anchor}">'
+                              f'{H.escape(c["label"])}</text>')
+                break
+    s.extend(marks)
+    s.extend(labels)
     s.append("</svg>")
     return "".join(s)
 
@@ -209,11 +220,12 @@ def table(r, spec):
         w, cd = c.get("warm") or {}, c.get("cold") or {}
         lt = (w.get("latency") or {}).get(spec, {})
         ct = (cd.get("latency") or {}).get(spec, {})
-        f = lambda v, d=3: "–" if v is None else f"{v:.{d}f}"  # noqa: E731
+        f = lambda v, d=3: "–" if v is None else f"{v:,.{d}f}"  # noqa: E731
+        g = lambda v: "–" if v is None else (f"{v:,.0f}" if v >= 10 else f"{v:.1f}")  # noqa: E731
         rows.append(f"<tr><td>{H.escape(c['label'])}</td><td>{f((c['index_bytes'] or 0) / 1e6, 2)}</td>"
                     f"<td>{f(q.get('ndcg@10'))}</td><td>{f(q.get('recall@10'))}</td><td>{f(q.get('auc@100'))}</td>"
                     f"<td>{f(q.get('r10_vs_exact'))}</td><td>{f(w.get('rounds'), 1)}</td><td>{f(w.get('kb'), 0)}</td>"
-                    f"<td>{f(lt.get('p50'), 0)}</td><td>{f(lt.get('p95'), 0)}</td><td>{f(ct.get('p50'), 0)}</td></tr>")
+                    f"<td>{g(lt.get('p50'))}</td><td>{g(lt.get('p95'))}</td><td>{g(ct.get('p50'))}</td></tr>")
     rows.append("</tbody></table>")
     return "".join(rows)
 
@@ -247,7 +259,9 @@ def html(cfg, results):
         for s in specs:
             for m in ("ndcg@10", "recall@10", "mrr@10", "success@1", "auc@100", "r10_vs_exact"):
                 vis = "" if (s == default and m == "ndcg@10") else " hidden"
-                out.append(f"<div class='chart' data-spec='{H.escape(s)}' data-met='{m}'{vis}>{scatter(r, s, m)}</div>")
+                out.append(f"<div class='chart' data-spec='{H.escape(s)}' data-met='{m}'{vis}>"
+                           f"<div class='pair'><div>{scatter(r, s, m, 'warm', W=520, Hh=360)}</div>"
+                           f"<div>{scatter(r, s, m, 'cold', W=520, Hh=360)}</div></div></div>")
         for s in specs:
             vis = "" if s == default else " hidden"
             out.append(f"<div class='wrap tab' data-spec='{H.escape(s)}'{vis}>{table(r, s)}</div>")

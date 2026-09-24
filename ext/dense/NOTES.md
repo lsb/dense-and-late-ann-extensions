@@ -2,14 +2,23 @@
 
 `dense_ann` is a SQLite virtual table for approximate nearest-neighbour (ANN) search over dense embeddings: all-MiniLM-L6-v2, 384 dimensions, cosine distance. It is designed for a read-only database that a browser fetches lazily with HTTP range requests, where each dependent round trip costs 50–150 ms but many requests can be in flight at once.
 
+It offers two index layouts behind one API:
+- **Graph (default).** An HNSW-built graph with the neighbours' PQ codes stored in each node row.
+- **IVF-PQ (`layout=ivf`).** Coarse lists over about 70-byte PQ entries. It costs 2 rounds per query.
+
+At matched recall, IVF is 2–2.5× faster on synthetic data and on 10k real MiniLM documents. On 120k real MiniLM documents both layouts become expensive; IVF is the only one that reaches recall 0.9, at about 6 MB per query. See [IVF-PQ layout](#ivf-pq-layout-layoutivf).
+
 - **Language and dependencies.** C11, depending only on SQLite and libm. The query path is single-threaded. Index building can optionally use pthreads (`-DDENSE_ANN_THREADS`, on in the native Makefile).
 - **Files.**
   - `dense_ann.c`: the virtual table.
   - `pq.c`: product quantisation (PQ), with optional OPQ.
   - `hnsw.c`: in-memory HNSW construction.
+  - `ivf.c`: coarse k-means and list probing for `layout=ivf`.
   - `rawpage.c`: direct page reads and the prefetch hook.
   - `test/countvfs.c`: a VFS that counts reads, used by the tests.
-  - `bench.py`: the benchmark.
+  - `bench.py`: the benchmark (recall, rounds, bytes and netsim `4g`/`slow-4g` times per configuration).
+  - `compare.py`: graph vs IVF at matched recall, from the result files.
+  - `run_words1m.sh`: one-command graph + IVF run on the real 1M MiniLM corpus.
   - `test/test_dense_ann.py`: the test suite.
 
 ## API
@@ -22,7 +31,11 @@ CREATE VIRTUAL TABLE v USING dense_ann(
     ef_construction=200,
     store_vectors=f16,    -- none | int8 | f16 | f32: vectors kept for reranking and exact search
     vectors=inline,       -- inline (inside the node row) | table (separate shadow table)
-    layout=colocated,     -- colocated (neighbour PQ codes in the node row) | separate
+    layout=colocated,     -- colocated (neighbour PQ codes in the node row) | separate | ivf
+    nlist=0,              -- ivf: number of lists (0 = 4 sqrt(n))
+    ivf_centroids=f16,    -- ivf: f16 | int8 | pq storage of the cached centroids
+    ivf_residual=1,       -- ivf: PQ on residuals x - centroid (IVFADC); 0 = on raw vectors
+    nprobe=32, rerank_k=64,  -- ivf: query defaults
     metric=cosine,        -- cosine (normalises on insert/query) | ip | l2
     entry_points=1024,    -- size of the cached entry set
     opq=0,                -- OPQ iterations (0 = plain PQ)
@@ -41,7 +54,9 @@ SELECT rowid, distance FROM v
    [AND beam = 16]      -- W: nodes expanded (fetched in parallel) per round
    [AND rerank = 0|1|2|3]  -- default 2 when vectors are stored, else 0
    [AND exact = 1|2]    -- brute force: 1 = stored vectors, 2 = PQ codes
-   [AND trace = 1];     -- stats JSON includes the page numbers fetched per round
+   [AND trace = 1]      -- stats JSON includes the page numbers fetched per round
+   [AND nprobe = 32]    -- ivf: lists scanned
+   [AND rerank_k = 64]; -- ivf: candidates reranked with stored vectors (R)
 -- the hidden column `stats` returns per-query JSON:
 --   rounds, pages, bytes, expanded, dist, entry_dist, rerank, fallback, setup_rounds, setup_pages, ms, ...
 
@@ -338,6 +353,149 @@ Cross-query caching barely helps at 1M. After 100 queries, a query still misses 
 
 **Without page hints** (plain SQL lookups through the b-tree). Each node read costs 2–3 dependent page reads (root and level-1 interior pages get cached, level-2 interior pages do not at 1M), and SQLite issues the W lookups of a step one after another. That multiplies rounds by about 2 × W. `finalize` removes this entirely. The wasm agent's `httpvfs_speculate_*` could batch the interior-page reads, at about one round per uncached level.
 
+## IVF-PQ layout (`layout=ivf`)
+
+The owner asked for about 64 bytes per document. The graph's node rows cost about 4 KB per document, because neighbour codes are duplicated about 23 times and a row fills a 4 KiB page. IVF-PQ stores each PQ code once.
+
+### Design
+- **Coarse quantiser.** k-means (10 Lloyd iterations on a sample of 40 points per list, at least 65,536) with `nlist` centroids. The default is 4√N: 400 at 10k, 1,265 at 100k, 4,000 at 1M. The assignment kernel dots four points against each centroid at once (`ivf.c`).
+- **Codes.** PQ-64 × 8 bits on the residual x − c(x) (IVFADC, the default), or on the raw vector (`ivf_residual=0`). The residual is taken against the *stored* (decoded) centroid, so the stored centroid and the codes are consistent. OPQ (`opq=N`) applies to the codes. For cosine/IP, d(q, c + r) = ADC(q, r) − ⟨q, c⟩, so one ADC table serves every list. For L2, a table per probed list is built from q − c.
+- **Cached head.** Loaded once per connection, in one round together with the PQ codebook (float16, 192 KiB):
+  - the centroids: `f16` (768 B each), `int8` (388 B) or `pq` (64-byte codes plus their own float16 codebook, 192 KiB);
+  - a directory of 12 B per list: number of chunks, first page, last page.
+- **Posting lists** go in `v_lists(id = list << 20 | j, data)`. Each chunk is at most 4,000 bytes, so it fits a 4 KiB page without overflow:
+  - header: `u16 count | u16 reserved | u32 first slot | u32 first vector page`;
+  - 57 entries of `u32 rowid | u8 vector-page delta | 64 B code`, i.e. **69 B per document**.
+- **Contiguous lists.** Lists are written list by list, so each one is a contiguous page range. `finalize` records the range in the directory, and a query fetches all `nprobe` ranges in one round; adjacent pages coalesce into one range request.
+  - To keep the ranges contiguous, `build` frees the float32 buffer only *after* writing. Reusing scattered freelist pages broke 52 of 400 lists on the first attempt. Run VACUUM (before `finalize`) to reclaim the buffer.
+  - A list whose chunks turn out non-contiguous or out of order loses its range and falls back to SQL lookups (counted in `fallback`).
+- **Rerank vectors** go in `v_vectors(id = slot, data)`, where slots are positions in (list, rowid) order. A list's vectors are therefore on consecutive pages, and candidates from the same list often share a page. Each chunk stores the page of its first slot plus a one-byte delta per entry, so the vector rows of the top R candidates are fetched **in one round with no b-tree lookups**.
+- **The rowid map** `v_rowids(rowid, node = list << 32 | slot)` serves deletes and exact search only. Rowids must fit in 32 bits.
+
+### Query cost
+- **Round 1:** the nprobe list ranges, about nprobe × (N/nlist × 69 B / 4 KiB + a partial page) pages. At 1M with 4,000 lists this is 5.7 pages per list.
+- **Round 2:** about R pages of vectors, fewer when candidates share pages. Without rerank there is only round 1.
+
+### Updates
+- **Insert after build** assigns the vector to its nearest list and appends a one-entry chunk. Such chunks are found through SQL until the next `finalize`, and many of them fragment the lists; rebuild after large changes.
+- **Delete** flags the entry in its chunk (delta `0xFE`).
+- The coarse centroids and the PQ codebook are never retrained.
+
+### Results
+
+**Setup.** Same machine and methods as above: 4 vCPUs shared with the LLM and late-interaction jobs, threads = 2 for the IVF builds.
+- **Time estimates.** `4g` (165 ms, 8.1 Mbit/s) and `slow-4g` (562.5 ms, 1.44 Mbit/s) are simulated with `netsim/simulate.py` from each query's recorded per-round page lists (adjacent pages merged into one range), averaged over 50 queries on a warm connection. The one-time setup is listed separately; it is modelled as page 1, the schema page, then the head in one range.
+- **Selection.** `compare.py` picks the configuration with the lowest `4g` time that reaches each target recall.
+- **Graph runs:** M = 16, inline float16 vectors, `rerank=2`.
+- **IVF runs:** float16 rerank vectors, residual PQ-64.
+
+| data | target | index | best config | recall@10 | rounds | KiB/query | 4g ms | slow-4g ms | setup KiB | setup 4g ms | index B/doc | build s |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| synth 1M | 0.90 | graph | ef=32 W=32 | 0.905 | 5.5 | 483 | 1,336 | 5,616 | 288 | 794 | 4,119 | 891 (4 thr) |
+| synth 1M | 0.90 | IVF, pq centroids | nprobe=8 R=32 | 0.940 | 2 | 302 | **635** | **2,839** | 736 | 1,247 | 917 | 944 (2 thr) |
+| synth 1M | 0.95 | graph | ef=64 W=32 | 0.972 | 5.9 | 606 | 1,526 | 6,519 | 288 | 794 | 4,119 | 891 |
+| synth 1M | 0.95 | IVF, pq centroids | nprobe=8 R=64 | 0.995 | 2 | 404 | **738** | **3,421** | 736 | 1,247 | 917 | 944 |
+| synth 100k | 0.90 | graph | ef=32 W=16 | 0.939 | 4.8 | 245 | 1,040 | 4,093 | 288 | 794 | 4,121 | 78 |
+| synth 100k | 0.95 | graph | ef=32 W=32 | 0.953 | 4.3 | 378 | 1,098 | 4,587 | 288 | 794 | 4,121 | 78 |
+| synth 100k | 0.95 | IVF, pq centroids | nprobe=8 R=32 | 0.986 | 2 | 172 | **505** | **2,107** | 520 | 1,029 | 933 | 136 |
+| words-10k | 0.90 | graph | ef=128 W=32 | 0.902 | 6.7 | 597 | 1,719 | 7,199 | 288 | 794 | 4,149 | 8 |
+| words-10k | 0.90 | IVF (nlist 400) | nprobe=128 R=64 | 0.934 | 2 | 826 | **1,167** | **5,834** | 540 | 1,049 | 989 | 7 |
+| words-10k | 0.90 | IVF (nlist 100) | nprobe=64 R=64 | 0.945 | 2 | 859 | 1,204 | 6,043 | 292 | 798 | 956 | 5 |
+| words-10k | 0.95 | graph | ef=256 W=32 | 0.954 | 9.8 | 1,058 | 2,671 | 11,471 | 288 | 794 | 4,149 | 8 |
+| words-10k | 0.95 | IVF (nlist 400) | nprobe=128 R=128 | 0.957 | 2 | 1,049 | **1,394** | **7,111** | 540 | 1,049 | 989 | 7 |
+| words-10k | 0.95 | IVF, int8 vectors | nprobe=256 R=64 | 0.960 | 2 | 1,118 | 1,464 | 7,505 | 540 | 1,049 | **578** | 8 |
+
+Notes on the table:
+- Index B/doc excludes free pages (as after VACUUM).
+- The 1M graph build used 4 threads, the IVF builds 2.
+
+**Headline (synthetic data and words-10k).** At matched recall, IVF-PQ is **2–2.5× faster** than the graph on `4g` and **1.6–2.2× faster** on `slow-4g`. It needs 2 rounds instead of 4–10, similar or fewer bytes, and a 4.5× smaller database. The price is a larger one-time setup (520–740 KiB versus 288 KiB). Even including setup, a cold first query is still faster on IVF at synthetic 1M: 1,247 + 738 ms versus 794 + 1,526 ms.
+
+At 120k real MiniLM documents both layouts become expensive; see the next table.
+
+**Caveat: synthetic data flatters IVF.** The generator draws points around √N cluster centres, so with 4√N lists `nprobe=8` already covers 100% of the true top-10.
+
+**On real MiniLM data (words-10k), coarse probing is the bottleneck.** PQ plus rerank recovers essentially everything inside the probed lists. Coverage of the true top-10 by the probed lists (nlist = 400):
+
+| nprobe | 8 | 16 | 32 | 64 | 128 |
+|---|---|---|---|---|---|
+| coverage | 0.36 | 0.52 | 0.68 | 0.84 | 0.96 |
+
+- 0.95 recall needs about 30% of the corpus scanned at 10k. This is the random-word near-tie problem again: neighbours are spread over many lists.
+- Whether the scanned fraction falls at 1M is **the** open question for the real corpus (`run_words1m.sh`). If it does not, IVF bytes grow linearly with N while the graph's grow roughly logarithmically, and the graph would win at 1M on MiniLM.
+- The table suggests the break-even point: in the `4g` model, about 165 KiB (165 ms at 8.1 Mbit/s) costs as much as one round, so IVF stays ahead while its extra bytes are under about (graph rounds − 2) × 165 KiB.
+
+**Real MiniLM at 120k documents** (`results/w120k-*.json`). The enc agent's 1M encoding stopped after 12 of 100 chunks, which is the first 120,000 documents of words-1m. Queries are held-out documents 120,000–120,199 plus the 200 single words. Exact search over PQ codes reaches recall 0.51–0.53.
+
+| target | index | best config | recall@10 | rounds | KiB/query | 4g ms | slow-4g ms | setup KiB | B/doc | build s |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 0.80 | graph | ef=512 W=64 | 0.815 | 12.5 | 2,405 | 4,453 | 20,551 | 288 | 4,121 | 107 |
+| 0.80 | IVF, 1,386 lists | nprobe=256 R=128 | 0.834 | 2 | 3,207 | **3,609** | **19,571** | 528 | 927 | 144 |
+| 0.90 | graph | not reached (best: 0.815) | | | | | | | | |
+| 0.90 | IVF, 1,386 lists | nprobe=512 R=128 | 0.924 | 2 | 5,786 | 6,242 | 34,379 | 528 | 927 | 144 |
+| 0.95 | IVF, 1,386 lists | nprobe=512 R=256 | 0.951 | 2 | 6,266 | 6,727 | 37,109 | 528 | 927 | 144 |
+| 0.95 | IVF, 346 lists | nprobe=256 R=128 | 0.951 | 2 | 7,677 | 8,140 | 45,057 | 492 | 918 | 68 |
+
+What the 120k results show:
+- **Both layouts get harder with N on this corpus.** IVF at 0.92 scans 37% of the lists (62k documents, 5.8 MB), the same fraction as at 10k. So bytes per query grow linearly with N, and at 1M this would be tens of MB, which is unusable.
+- **The graph's recall collapses on single-word queries.** It gets 0.70 at ef=512, versus 0.93 for held-out documents. Short queries lie off the manifold of 50-word documents, a known weakness of graph indexes with out-of-distribution queries (RoarGraph-style query-aware graphs address it). IVF handles them better (0.91–0.97).
+- **The corpus itself is part of the problem.** Random-word documents are near-ties: the 10th and 100th neighbours differ by about 0.03 in cosine. Recall@10 against exact search therefore rewards reproducing encoder noise; recall of *relevant* documents is a better target. The next evaluation should use `data/llm` (the LLM paragraphs with known relevant paragraphs per query) at scale.
+
+**Variants (words-10k).** Unless noted, nprobe = 128, R = 128. The results files are `results/w10k-ivf*.json`.
+
+| variant | recall@10 | KiB/query | setup KiB | B/doc | note |
+|---|---|---|---|---|---|
+| default: residual PQ, f16 centroids, f16 vectors | 0.957 | 1,049 | 540 | 989 | |
+| `ivf_residual=0` (PQ on raw vectors) | 0.951 | 1,059 | 540 | 989 | residuals help a little: exact-PQ 0.589 vs 0.572 |
+| `ivf_centroids=int8` | 0.956 | 1,048 | 380 | 973 | no loss |
+| `ivf_centroids=pq` | 0.951 | 1,038 | 448 | 980 | pays off from about 1,000 lists (1M: 736 KiB instead of about 3.3 MB with f16) |
+| `store_vectors=int8` | 0.948 | 1,004 | 540 | **578** | halves the DB; transfer about the same (random vector pages either way) |
+| `opq=10` | 0.957 (R=64: 0.941 vs 0.934) | 1,050 | 852 | 1,021 | small gain, +300 KiB setup |
+| `nlist=100` (√N) | 0.945 at nprobe=64 R=64 | 859 | 292 | 956 | fewer, larger lists: better here |
+| `nlist=1600` (16√N) | 0.935 at nprobe=256 | 1,151 | 1,524 | 1,083 | worse, and a large head |
+| no rerank (`rerank=0`) | 0.58 at nprobe=128 | 586 (1 round) | 540 | ~140 without vectors | capped by PQ-64 (exact PQ: 0.589) |
+
+**Storage at 1M** (`ivf_centroids=pq`), 917 B/doc in total:
+- posting lists: 79.5 B/doc (69 B entries plus chunk headers and partial pages);
+- float16 vectors: 821 B/doc (five per 4 KiB page);
+- rowid map: 15 B/doc.
+
+The minimal read-only variants are:
+- without stored vectors: about **95 B/doc**, but recall is capped near 0.6 on MiniLM;
+- with int8 vectors: about 500 B/doc.
+
+**Build at 1M:** 944 s with 2 threads:
+- coarse k-means (4,000 lists, 160k sample, 10 iterations) plus the assignment of 1M vectors: 497 s;
+- PQ training and encoding of residuals: 427 s;
+- writing: 5 s.
+
+Peak RSS was 4.7 GB, including the benchmark's own copy of the vectors and a float32 residual buffer (1.5 GB) that could be streamed.
+
+**Recommendation.**
+- **Data with cluster structure** (the synthetic sets, and most topical text corpora): use `layout=ivf` with `ivf_centroids=pq` (or `int8` below about 1,000 lists) and `store_vectors=int8` or `f16`. Start at `nprobe` ≈ 1–4% of `nlist` with `rerank_k=64`. It is 2 rounds, about 0.4–1 MB per query and about 0.7–1.2 s on `4g`, plus a one-time setup of about 0.5–0.75 MB.
+- **Near-tie data such as random-word MiniLM:** neither layout is cheap beyond about 100k documents. IVF is the better of the two (2 rounds; the only layout that reaches 0.9), but its bytes grow linearly with N.
+- **What would change that:**
+  - spilling each vector into two lists (SOAR);
+  - larger codes;
+  - query-aware graphs;
+  - accepting a lower recall@10 against exact search when it tracks relevance.
+
+  Evaluate on relevance-labelled data before choosing.
+
+### Real 1M MiniLM corpus: not run yet
+`data/emb/words-1m.minilm.npy` does not exist yet. The encoder stopped after 12 of 100 chunks, i.e. 120k documents, which were used above via `--emb`. Once the file exists, run:
+
+```sh
+ext/dense/run_words1m.sh
+```
+
+The script:
+- builds and sweeps the graph (`graphw` sweep), IVF with 4,000 lists and IVF with 1,000 lists (`ivfw` sweeps up to nprobe = 1,024), with 2 threads;
+- deletes each multi-GB database after use;
+- prints the matched-recall table.
+
+Queries are 200 held-out documents 1,000,000–1,000,199 regenerated from the deterministic word stream (`bench.heldout_docs`), plus 200 single words. It takes about 1–1.5 h on this machine and peaks around 6 GB of disk.
+
 ## Comparison with libSQL and sqlite-vec
 
 **libSQL `libsql_vector_idx` (DiskANN).** Verified by reading `libsql-sqlite3/src/vectordiskann.c` and `vectorIndexInt.h` (main branch, cloned 2026-09-24).
@@ -361,6 +519,11 @@ Cross-query caching barely helps at 1M. After 100 queries, a query still misses 
 - **Over HTTP**, brute force means downloading every vector (1M × 384 float32 = 1.5 GB; binary 48 MB), so it only suits small collections.
 
 ## Open questions and next steps
+
+- **Real MiniLM beyond 10k.** At 120k the scanned fraction IVF needs for 0.9 did not shrink (about 37% of the lists), and the graph plateaus near 0.8, mostly on single-word queries. Questions for the full 1M corpus and for relevance-labelled data (`data/llm`):
+  - Does spilling each vector into its two nearest lists (SOAR/ScaNN, doubling the 69 B entries) buy coverage cheaply?
+  - Would a query-aware graph fix single-word queries?
+  - The IVF rerank round costs about 1 page per candidate; clustering co-candidates' vector rows, or int4 vectors, would cut it.
 
 - **Real 1M MiniLM corpus.** The embeddings are coming from the enc agent. The synthetic data is easier than MiniLM: at 10k, words need about 2× the ef of synthetic data for the same recall. Rerun `bench.py --data words-1m` once `data/emb/words-1m.minilm.npy` exists (the loader already handles the `words-*` names).
 - **PQ quality versus bytes.** At fixed transfer, is PQ-96 or PQ-128 with a smaller M0 (the same row size) better than PQ-64 with M0 = 32?

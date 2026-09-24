@@ -103,7 +103,7 @@ def load_data(args):
     if args.data == "synth":
         return synth(args.n, args.queries, seed=args.seed)
     if args.data.startswith("words-") or args.data == "llm-paragraphs":
-        X = np.load(REPO / "data" / "emb" / f"{args.data}.minilm.npy", mmap_mode="r")
+        X = np.load(args.emb or REPO / "data" / "emb" / f"{args.data}.minilm.npy", mmap_mode="r")
         X = np.ascontiguousarray(X, dtype=np.float32)
         return normalize(X), normalize(words_queries(len(X)))
     raise SystemExit(f"unknown dataset {args.data}")
@@ -326,6 +326,7 @@ def main():
     ap.add_argument("--db", default=None, help="database path (default: ext/dense/build/<tag>.db)")
     ap.add_argument("--reuse", action="store_true", help="reuse an existing database")
     ap.add_argument("--tag", default=None)
+    ap.add_argument("--emb", default=None, help="embedding .npy to use instead of data/emb/<data>.minilm.npy")
     ap.add_argument("--net-queries", type=int, default=50, help="queries per config simulated with netsim")
     args = ap.parse_args()
 
