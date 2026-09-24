@@ -223,7 +223,8 @@ def cold_query_pages(path, Q, k, ef, beam, rerank, nq=10):
 SWEEPS = {
     "full": [(ef, beam, rr) for ef in (16, 32, 64, 128) for beam in (1, 4, 8) for rr in (0, 1, 2)],
     "small": [(ef, beam, rr) for ef in (32, 64, 128) for beam in (4,) for rr in (0, 1, 2)] + [(64, 1, 2), (64, 8, 2)],
-    "rr": [(ef, 4, rr) for ef in (16, 32, 64, 128, 256) for rr in (0, 2)],
+    "main": [(ef, beam, rr) for ef in (32, 64, 128) for beam in (4, 8, 16) for rr in (0, 2)] + [(256, 16, 2)],
+    "rr": [(ef, 4, rr) for ef in (16, 32, 64, 128, 256) for rr in (0, 2, 3)],
 }
 
 

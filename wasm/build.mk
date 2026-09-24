@@ -2,16 +2,17 @@
 # and the project's extensions. Included from the top-level Makefile; all
 # paths are relative to the repository root. See wasm/NOTES.md.
 #
-# Extensions: every directory ext/<name>/ whose .c files define the entry
-# point sqlite3_<name>_init is one extension (<name> reduced to lower-case
-# letters: ext/late -> sqlite3_late_init). All .c files of the directory are
-# compiled together. Directories without the entry point yet are skipped, so a
+# Extensions: every directory ext/<dir>/ whose .c files define an entry point
+# `int sqlite3_<x>_init(` is one extension; all .c files of the directory are
+# compiled together. Directories without an entry point yet are skipped, so a
 # half-written extension does not break the build. Override with
 #   make EXT_DIRS="ext/dense some/other/dir" ...
-# In static builds (WASM, native CLI) the sources are compiled with
-# -DSQLITE_CORE and each entry point is registered with sqlite3_auto_extension,
-# so every connection gets every extension. Keep non-entry symbols static (or
-# prefixed) so that extensions do not clash when linked together.
+# The loadable module is build/native/ext/<x>.so (named after the entry point,
+# so SQLite's default entry-point rule finds it). In static builds (WASM,
+# native CLI) the sources are compiled with -DSQLITE_CORE and every entry point
+# is registered with sqlite3_auto_extension, so every connection gets every
+# extension. Keep non-entry symbols static (or prefixed) so that extensions do
+# not clash when linked together.
 
 BUILD      ?= build
 SQLITE_DIR := $(BUILD)/sqlite
@@ -22,14 +23,23 @@ PKG_DIR    := wasm/pkg
 EMSDK      ?= /home/user/emsdk
 EMCC       ?= $(shell command -v emcc 2>/dev/null || echo $(EMSDK)/upstream/emscripten/emcc)
 CC         ?= cc
+# Resolved through the shell: with emsdk_env.sh sourced, PATH contains
+# /home/user/emsdk, whose node/ directory would otherwise shadow node.
+NODE       ?= $(shell command -v node)
 
-ext_entry   = sqlite3_$(shell printf '%s' '$(1)' | tr -cd 'A-Za-z' | tr 'A-Z' 'a-z')_init
+# Entry points defined by the .c files of an extension directory.
+lparen := (
+ext_entries_of = $(sort $(shell grep -ohE 'int[[:space:]]+sqlite3_[A-Za-z0-9]+_init[[:space:]]*[$(lparen)]' $(1)/*.c 2>/dev/null | grep -oE 'sqlite3_[A-Za-z0-9]+_init'))
 EXT_DIRS   ?= $(foreach d,$(patsubst %/,%,$(sort $(dir $(wildcard ext/*/*.c)))),\
-  $(if $(shell grep -l '$(call ext_entry,$(notdir $(d)))' $(d)/*.c 2>/dev/null),$(d)))
-EXT_NAMES  := $(notdir $(EXT_DIRS))
+  $(if $(call ext_entries_of,$(d)),$(d)))
+# Loadable module name: from the (first) entry point, so that SQLite's default
+# entry-point rule finds it: sqlite3_denseann_init -> denseann.so.
+ext_so_name = $(patsubst sqlite3_%_init,%,$(firstword $(call ext_entries_of,$(1))))
 EXT_SRCS   := $(foreach d,$(EXT_DIRS),$(wildcard $(d)/*.c))
 EXT_HDRS   := $(foreach d,$(EXT_DIRS),$(wildcard $(d)/*.h))
-EXT_ENTRIES := sqlite3_demoext_init $(foreach n,$(EXT_NAMES),$(call ext_entry,$(n)))
+EXT_ENTRIES := sqlite3_demoext_init $(foreach d,$(EXT_DIRS),$(call ext_entries_of,$(d)))
+EXT_SOS    := $(foreach d,$(EXT_DIRS),$(NATIVE_DIR)/ext/$(call ext_so_name,$(d)).so)
+EXT_WASM_OBJS := $(foreach d,$(EXT_DIRS),$(WASM_DIR)/ext/$(call ext_so_name,$(d)).o)
 
 HV_SRC     := wasm/src/httpvfs.c
 HV_HDR     := wasm/src/httpvfs.h
@@ -49,8 +59,8 @@ EXT_CFLAGS    ?=
         test test-native test-node test-browser clean-wasm FORCE
 
 print-exts:
-	@echo "EXT_DIRS=$(EXT_DIRS)"
-	@$(foreach n,$(EXT_NAMES),echo "  $(n) -> $(call ext_entry,$(n))";)
+	@echo "EXT_DIRS=$(strip $(EXT_DIRS))"
+	@$(foreach d,$(EXT_DIRS),echo "  $(d): $(call ext_entries_of,$(d)) -> $(NATIVE_DIR)/ext/$(call ext_so_name,$(d)).so";)
 
 # ---------------------------------------------------------------- SQLite ---
 sqlite: $(SQLITE_DIR)/sqlite3.c
@@ -74,7 +84,7 @@ $(NATIVE_DIR)/ext_registry.c $(WASM_DIR)/ext_registry.c: FORCE
 # libsqlite3.so.0 (plain SQLite for Python: LD_LIBRARY_PATH=build/native),
 # loadable extensions: httpvfs.so, demo_ext.so, ext/<name>.so.
 native: $(NATIVE_DIR)/sqlite3 $(NATIVE_DIR)/libsqlite3.so.0 $(NATIVE_DIR)/httpvfs.so \
-        $(NATIVE_DIR)/demo_ext.so $(patsubst %,$(NATIVE_DIR)/ext/%.so,$(EXT_NAMES))
+        $(NATIVE_DIR)/demo_ext.so $(EXT_SOS)
 
 $(NATIVE_DIR)/sqlite3.o: $(SQLITE_DIR)/sqlite3.c
 	@mkdir -p $(dir $@)
@@ -110,7 +120,7 @@ WASM_SQLITE_OPTS := $(SQLITE_OPTS) -DSQLITE_THREADSAFE=0 -DSQLITE_OMIT_LOAD_EXTE
   -DSQLITE_OMIT_DEPRECATED -DSQLITE_OMIT_SHARED_CACHE \
   -DSQLITE_TEMP_STORE=3 -DSQLITE_EXTRA_INIT=hv_extra_init
 WASM_COMMON_OBJS := $(WASM_DIR)/sqlite3.o $(WASM_DIR)/hv_init.o $(WASM_DIR)/demo_ext.o \
-  $(WASM_DIR)/ext_registry.o $(patsubst %,$(WASM_DIR)/ext/%.o,$(EXT_NAMES))
+  $(WASM_DIR)/ext_registry.o $(EXT_WASM_OBJS)
 
 empty :=
 space := $(empty) $(empty)
@@ -171,10 +181,10 @@ $(PKG_DIR)/dist/sqlite-httpvfs-sync.mjs: $(WASM_COMMON_OBJS) $(WASM_DIR)/httpvfs
 # ------------------------------------------------------------ extensions ---
 # One loadable .so and one relocatable WASM object per extension directory.
 define ext_rules
-$(NATIVE_DIR)/ext/$(notdir $(1)).so: $(wildcard $(1)/*.c) $(wildcard $(1)/*.h) $(HV_HDR) $(SQLITE_DIR)/sqlite3ext.h
+$(NATIVE_DIR)/ext/$(call ext_so_name,$(1)).so: $(wildcard $(1)/*.c) $(wildcard $(1)/*.h) $(HV_HDR) $(SQLITE_DIR)/sqlite3ext.h
 	@mkdir -p $$(dir $$@)
 	$$(CC) $$(NATIVE_CFLAGS) $$(EXT_INC) $$(EXT_CFLAGS) -fPIC -shared $(wildcard $(1)/*.c) -o $$@ -lm
-$(WASM_DIR)/ext/$(notdir $(1)).o: $(wildcard $(1)/*.c) $(wildcard $(1)/*.h) $(HV_HDR) $(SQLITE_DIR)/sqlite3ext.h
+$(WASM_DIR)/ext/$(call ext_so_name,$(1)).o: $(wildcard $(1)/*.c) $(wildcard $(1)/*.h) $(HV_HDR) $(SQLITE_DIR)/sqlite3ext.h
 	@mkdir -p $$(dir $$@)
 	$$(EMCC) $$(WASM_CFLAGS) $$(EXT_INC) -DSQLITE_CORE $$(EXT_CFLAGS) -r $(wildcard $(1)/*.c) -o $$@
 endef
@@ -183,11 +193,11 @@ $(foreach d,$(EXT_DIRS),$(eval $(call ext_rules,$(d))))
 # ----------------------------------------------------------------- tests ---
 test: test-native test-node test-browser
 test-native: native
-	python3 wasm/test/test_native.py
+	LD_LIBRARY_PATH=$(NATIVE_DIR) python3 wasm/test/test_native.py
 test-node: native wasm
-	node --test wasm/test/node.test.mjs
+	$(NODE) --test wasm/test/node.test.mjs
 test-browser: native wasm
-	node wasm/test/browser.test.mjs
+	$(NODE) --test wasm/test/browser.test.mjs
 
 clean-wasm:
 	rm -rf $(NATIVE_DIR) $(WASM_DIR) $(PKG_DIR)/dist

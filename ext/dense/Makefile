@@ -26,11 +26,11 @@ all: $(OUT)/dense_ann.so $(OUT)/countvfs.so
 
 $(OUT)/dense_ann.so: $(SRC) $(HDR)
 	@mkdir -p $(OUT)
-	$(CC) $(CFLAGS) -shared -o $@ $(SRC) -lm
+	$(CC) $(CFLAGS) -shared -o $@.tmp $(SRC) -lm && mv $@.tmp $@
 
 $(OUT)/countvfs.so: test/countvfs.c
 	@mkdir -p $(OUT)
-	$(CC) $(CFLAGS) -shared -o $@ test/countvfs.c
+	$(CC) $(CFLAGS) -shared -o $@.tmp test/countvfs.c && mv $@.tmp $@
 
 test: all
 	python3 test/test_dense_ann.py

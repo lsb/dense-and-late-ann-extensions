@@ -42,8 +42,9 @@ async function httpvfsFetchOne(cfg, off, len) {
   const headers = Object.assign({}, cfg.headers || {}, {
     Range: `bytes=${off}-${off + len - 1}`,
   });
-  const init = { headers };
-  if (cfg.cache) init.cache = cfg.cache;
+  // cache: 'no-store' matters: Chromium's HTTP cache takes a per-URL lock,
+  // which serialises concurrent range requests for the same file.
+  const init = { headers, cache: cfg.cache || 'no-store' };
   const resp = await fetchFn(cfg.url, init);
   let buf = new Uint8Array(await resp.arrayBuffer());
   let total = -1;
@@ -93,7 +94,7 @@ Module.httpvfsFetch = async function (h, n, offPtr, lenPtr, destPtr, t0Ptr, t1Pt
   for (let k = 0; k < Math.min(maxParallel, n); k++) workers.push(worker());
   await Promise.all(workers);
   if (failed) {
-    console.error(failed);
+    cfg.lastError = failed;   // reported by the JS API with the SQLite error
     return 10;
   }
   // Memory may have grown while we awaited: always use the current views.
@@ -103,7 +104,7 @@ Module.httpvfsFetch = async function (h, n, offPtr, lenPtr, destPtr, t0Ptr, t1Pt
     // is made before the size is known).
     const expect = total >= 0 ? Math.min(lens[i], total - offs[i]) : lens[i];
     if (buf.length !== expect) {
-      console.error(`httpvfs: response of ${buf.length} bytes, expected ${expect}, at ${offs[i]}`);
+      cfg.lastError = new Error(`httpvfs: response of ${buf.length} bytes, expected ${expect}, at ${offs[i]}`);
       return 10;
     }
     HEAPU8.set(buf, dests[i]);
@@ -133,7 +134,7 @@ Module.httpvfsFetchSync = function (h, n, offPtr, lenPtr, destPtr, t0Ptr, t1Ptr,
   try {
     results = cfg.fetchSync(cfg.url, offs, lens);
   } catch (e) {
-    console.error(e);
+    cfg.lastError = e;
     return 10;
   }
   const t1 = performance.now();

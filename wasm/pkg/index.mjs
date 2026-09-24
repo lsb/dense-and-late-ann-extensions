@@ -24,8 +24,8 @@ const STAT_NAMES = [
 const modules = new Map();   // variant -> Promise<Module>
 
 /**
- * Load (once) the WebAssembly module. variant: 'asyncify' (default, every
- * browser and Node), 'jspi' (Chromium 137+, not Node 22) or 'sync' (blocking
+ * Load (once) the WebAssembly module. variant: 'auto' (default), 'asyncify'
+ * (every browser and Node), 'jspi' (Chromium 137+, not Node 22) or 'sync' (blocking
  * fetches through a worker and Atomics.wait: Node, or a browser Worker in a
  * cross-origin-isolated page).
  */
@@ -36,7 +36,14 @@ const FILES = {
 };
 let defaultSyncFetcher = null;
 
-export function loadModule(variant = 'asyncify', moduleArgs = {}) {
+/** 'jspi' where JSPI is available (WebAssembly.Suspending), else 'asyncify'. */
+export function autoVariant() {
+  return typeof WebAssembly !== 'undefined' && typeof WebAssembly.Suspending === 'function'
+    ? 'jspi' : 'asyncify';
+}
+
+export function loadModule(variant = 'auto', moduleArgs = {}) {
+  if (variant === 'auto') variant = autoVariant();
   if (!modules.has(variant)) {
     const file = FILES[variant];
     if (!file) throw new Error(`unknown variant ${variant}`);
@@ -86,13 +93,16 @@ export class SqliteError extends Error {
  *   maxParallel     concurrent requests per round (default unlimited)
  *   headers         extra request headers
  *   fetch           fetch implementation (default globalThis.fetch)
+ *   httpCache       fetch() cache mode (default 'no-store'; other modes let
+ *                   Chromium serialise parallel requests on its cache lock)
  *   sqliteCacheKiB  SQLite's own page cache (PRAGMA cache_size), default 2048
- *   variant         'asyncify' | 'jspi' | 'sync'
+ *   variant         'auto' (default: jspi if supported, else asyncify) |
+ *                   'asyncify' | 'jspi' | 'sync'
  *   fetchSync       sync variant: (url, offsets, lengths) => [{buf, total}]
  *                   (default: a worker from sync-fetch.mjs)
  */
 export async function open(url, opts = {}) {
-  const variant = opts.variant || 'asyncify';
+  const variant = !opts.variant || opts.variant === 'auto' ? autoVariant() : opts.variant;
   const M = await loadModule(variant, opts.moduleArgs || {});
   let fetchSync = opts.fetchSync;
   if (variant === 'sync' && !fetchSync) {
@@ -132,12 +142,15 @@ export async function open(url, opts = {}) {
       M._free(pDb); M._free(pUri); M._free(pVfs);
     }
     if (rc !== SQLITE_OK) {
-      const msg = db ? M.UTF8ToString(M._sqlite3_errmsg(db)) : `open failed (${rc})`;
+      const cfg = M.httpvfsFiles.get(name);
+      let msg = db ? M.UTF8ToString(M._sqlite3_errmsg(db)) : `open failed (${rc})`;
+      if (cfg?.lastError) msg += ` (${cfg.lastError.message || cfg.lastError})`;
       if (db) M._sqlite3_close_v2(db);
       M.httpvfsUnregister(name);
       throw new SqliteError(`${msg}: ${url}`, rc);
     }
     const d = new Database(M, db, name, url);
+    d.variant = variant;
     const kib = opts.sqliteCacheKiB ?? 2048;
     await d._exec(`PRAGMA cache_size=-${kib}`);
     return d;
@@ -154,7 +167,12 @@ export class Database {
 
   _check(rc) {
     if (rc !== SQLITE_OK && rc !== SQLITE_ROW && rc !== SQLITE_DONE) {
-      const msg = this.M.UTF8ToString(this.M._sqlite3_errmsg(this.db));
+      let msg = this.M.UTF8ToString(this.M._sqlite3_errmsg(this.db));
+      const cfg = this.M.httpvfsFiles.get(this.name);
+      if ((rc & 0xff) === 10 && cfg?.lastError) {   // SQLITE_IOERR: say why
+        msg += ` (${cfg.lastError.message || cfg.lastError})`;
+        cfg.lastError = null;
+      }
       throw new SqliteError(msg, rc);
     }
     return rc;

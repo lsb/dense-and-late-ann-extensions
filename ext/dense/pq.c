@@ -17,6 +17,7 @@ int pq_init(PQ *pq, int dim, int m) {
 
 void pq_free(PQ *pq) {
   free(pq->cent);
+  free(pq->rot);
   memset(pq, 0, sizeof *pq);
 }
 
@@ -54,9 +55,9 @@ static void transpose_centroids(const float *c, int k, int d, float *cT, float *
 
 /* Lloyd's k-means for one subspace: data x[n*d] -> centroids c[k*d].
 ** k-means++ initialisation, deterministic given seed. */
-static void kmeans(const float *x, int64_t n, int d, int k, int iters, uint64_t seed, float *c) {
+static void kmeans(const float *x, int64_t n, int d, int k, int iters, uint64_t seed, float *c, int warm) {
   uint64_t rng = seed;
-  if (n <= k) {
+  if (n <= k && !warm) {
     /* Fewer points than centroids: copy points, duplicate the rest. */
     for (int j = 0; j < k; j++) memcpy(c + (size_t)j * d, x + (size_t)(n ? j % n : 0) * d, sizeof(float) * d);
     return;
@@ -68,20 +69,22 @@ static void kmeans(const float *x, int64_t n, int d, int k, int iters, uint64_t 
   float *cT = (float *)malloc(sizeof(float) * (size_t)k * d);
   float *cn = (float *)malloc(sizeof(float) * k), *acc = (float *)malloc(sizeof(float) * k);
 
-  /* k-means++ seeding. */
-  int64_t first = (int64_t)(dn_rng_uniform(&rng) * n);
-  memcpy(c, x + first * d, sizeof(float) * d);
-  for (int64_t i = 0; i < n; i++) mind[i] = dn_l2sq(x + i * d, c, d);
-  for (int j = 1; j < k; j++) {
-    double tot = 0;
-    for (int64_t i = 0; i < n; i++) tot += mind[i];
-    double r = dn_rng_uniform(&rng) * tot, acc = 0;
-    int64_t pick = n - 1;
-    for (int64_t i = 0; i < n; i++) { acc += mind[i]; if (acc >= r) { pick = i; break; } }
-    memcpy(c + (size_t)j * d, x + pick * d, sizeof(float) * d);
-    for (int64_t i = 0; i < n; i++) {
-      float s = dn_l2sq(x + i * d, c + (size_t)j * d, d);
-      if (s < mind[i]) mind[i] = s;
+  if (!warm) {
+    /* k-means++ seeding. */
+    int64_t first = (int64_t)(dn_rng_uniform(&rng) * n);
+    memcpy(c, x + first * d, sizeof(float) * d);
+    for (int64_t i = 0; i < n; i++) mind[i] = dn_l2sq(x + i * d, c, d);
+    for (int j = 1; j < k; j++) {
+      double tot = 0;
+      for (int64_t i = 0; i < n; i++) tot += mind[i];
+      double r = dn_rng_uniform(&rng) * tot, acc = 0;
+      int64_t pick = n - 1;
+      for (int64_t i = 0; i < n; i++) { acc += mind[i]; if (acc >= r) { pick = i; break; } }
+      memcpy(c + (size_t)j * d, x + pick * d, sizeof(float) * d);
+      for (int64_t i = 0; i < n; i++) {
+        float s = dn_l2sq(x + i * d, c + (size_t)j * d, d);
+        if (s < mind[i]) mind[i] = s;
+      }
     }
   }
 
@@ -119,8 +122,8 @@ static void kmeans(const float *x, int64_t n, int d, int k, int iters, uint64_t 
 }
 
 typedef struct {
-  const float *x; int64_t n, ns; int dim, dsub; int64_t *idx;
-  int iters; uint64_t seed; float *cent;
+  const float *s; int64_t ns; int dim, dsub;   /* training sample, ns x dim */
+  int iters, warm; uint64_t seed; float *cent;
 } TrainCtx;
 
 static void train_subspace(void *vctx, int64_t j, int thread) {
@@ -128,14 +131,96 @@ static void train_subspace(void *vctx, int64_t j, int thread) {
   int d = t->dsub;
   float *sub = (float *)malloc(sizeof(float) * (size_t)t->ns * d);
   for (int64_t i = 0; i < t->ns; i++)
-    memcpy(sub + i * d, t->x + t->idx[i] * t->dim + j * d, sizeof(float) * d);
+    memcpy(sub + i * d, t->s + i * t->dim + j * d, sizeof(float) * d);
   kmeans(sub, t->ns, d, PQ_KSUB, t->iters, dn_hash2(t->seed, (uint64_t)j),
-         t->cent + (size_t)j * PQ_KSUB * d);
+         t->cent + (size_t)j * PQ_KSUB * d, t->warm);
   free(sub);
 }
 
+/* y = x R for a row vector x (R is dim x dim, row-major). */
+static void rotate(const float *R, const float *x, float *y, int d) {
+  for (int j = 0; j < d; j++) y[j] = 0;
+  for (int i = 0; i < d; i++) {
+    float xi = x[i];
+    const float *row = R + (size_t)i * d;
+    for (int j = 0; j < d; j++) y[j] += xi * row[j];
+  }
+}
+
+typedef struct { const float *R, *x; float *y; int d; } RotCtx;
+static void rotate_task(void *vctx, int64_t i, int thread) {
+  RotCtx *c = (RotCtx *)vctx; (void)thread;
+  rotate(c->R, c->x + i * c->d, c->y + i * c->d, c->d);
+}
+
+/* R = U V^T where M = U S V^T: the orthogonal matrix closest to M
+** (orthogonal Procrustes). One-sided Jacobi SVD (Hestenes) in double:
+** rotate column pairs of A = M until orthogonal, accumulating V; then the
+** columns of A are U scaled by the singular values. */
+static void polar_orthogonal(const double *M, int d, float *R) {
+  double *A = (double *)malloc(sizeof(double) * (size_t)d * d);   /* column-major */
+  double *V = (double *)calloc((size_t)d * d, sizeof(double));
+  for (int i = 0; i < d; i++)
+    for (int j = 0; j < d; j++) A[(size_t)j * d + i] = M[(size_t)i * d + j];
+  for (int i = 0; i < d; i++) V[(size_t)i * d + i] = 1;
+  for (int sweep = 0; sweep < 30; sweep++) {
+    double off = 0;
+    for (int p = 0; p < d - 1; p++) {
+      for (int q = p + 1; q < d; q++) {
+        double *ap = A + (size_t)p * d, *aq = A + (size_t)q * d;
+        double al = 0, be = 0, ga = 0;
+        for (int k = 0; k < d; k++) { al += ap[k] * ap[k]; be += aq[k] * aq[k]; ga += ap[k] * aq[k]; }
+        if (fabs(ga) <= 1e-15 * sqrt(al * be) || ga == 0) continue;
+        double r = fabs(ga) / sqrt(al * be);
+        if (r > off) off = r;
+        double zeta = (be - al) / (2 * ga);
+        double t = (zeta >= 0 ? 1.0 : -1.0) / (fabs(zeta) + sqrt(1 + zeta * zeta));
+        double c = 1 / sqrt(1 + t * t), s = c * t;
+        double *vp = V + (size_t)p * d, *vq = V + (size_t)q * d;
+        for (int k = 0; k < d; k++) {
+          double x = ap[k], y = aq[k];
+          ap[k] = c * x - s * y; aq[k] = s * x + c * y;
+          x = vp[k]; y = vq[k];
+          vp[k] = c * x - s * y; vq[k] = s * x + c * y;
+        }
+      }
+    }
+    if (off < 1e-10) break;
+  }
+  /* U columns = A columns / norms; R = U V^T. */
+  for (int j = 0; j < d; j++) {
+    double *a = A + (size_t)j * d, nrm = 0;
+    for (int k = 0; k < d; k++) nrm += a[k] * a[k];
+    nrm = nrm > 0 ? 1 / sqrt(nrm) : 0;
+    for (int k = 0; k < d; k++) a[k] *= nrm;
+  }
+  for (int i = 0; i < d; i++)
+    for (int j = 0; j < d; j++) {
+      double s = 0;
+      for (int k = 0; k < d; k++) s += A[(size_t)k * d + i] * V[(size_t)k * d + j];
+      R[(size_t)i * d + j] = (float)s;
+    }
+  free(A); free(V);
+}
+
+typedef struct { const float *S, *Y; double *M; int64_t n; int d; } GramCtx;
+static void gram_row(void *vctx, int64_t i, int thread) {   /* M[i,:] = sum_r S[r,i] Y[r,:] */
+  GramCtx *g = (GramCtx *)vctx; (void)thread;
+  double *row = g->M + (size_t)i * g->d;
+  for (int j = 0; j < g->d; j++) row[j] = 0;
+  float *acc = (float *)calloc(g->d, sizeof(float));
+  for (int64_t r = 0; r < g->n; r++) {
+    float s = g->S[r * g->d + i];
+    const float *y = g->Y + r * g->d;
+    for (int j = 0; j < g->d; j++) acc[j] += s * y[j];
+    if ((r & 1023) == 1023) { for (int j = 0; j < g->d; j++) { row[j] += acc[j]; acc[j] = 0; } }
+  }
+  for (int j = 0; j < g->d; j++) row[j] += acc[j];
+  free(acc);
+}
+
 int pq_train(PQ *pq, const float *x, int64_t n, int dim, int m,
-             int64_t max_train, int iters, uint64_t seed, int nthreads) {
+             int64_t max_train, int iters, int opq_iters, uint64_t seed, int nthreads) {
   if (pq_init(pq, dim, m)) return 1;
   /* Deterministic sample: Fisher-Yates prefix of a shuffled index list. */
   int64_t ns = (max_train > 0 && n > max_train) ? max_train : n;
@@ -146,9 +231,48 @@ int pq_train(PQ *pq, const float *x, int64_t n, int dim, int m,
     int64_t j = i + (int64_t)(dn_rng_next(&rng) % (uint64_t)(n - i));
     int64_t tmp = idx[i]; idx[i] = idx[j]; idx[j] = tmp;
   }
-  TrainCtx t = { x, n, ns, dim, pq->dsub, idx, iters, seed, pq->cent };
-  dn_parallel_for(m, nthreads, 1, train_subspace, &t);
+  float *S = (float *)malloc(sizeof(float) * (size_t)ns * dim);
+  for (int64_t i = 0; i < ns; i++) memcpy(S + i * dim, x + idx[i] * dim, sizeof(float) * dim);
   free(idx);
+  float *Y = S;
+  int warm = 0;
+
+  if (opq_iters > 0) {
+    /* OPQ (Ge et al. 2013, non-parametric): alternate a few k-means
+    ** iterations on the rotated sample with a Procrustes update of R that
+    ** best maps the sample onto its reconstructions. Uses a subsample. */
+    int64_t no = ns < 20000 ? ns : 20000;
+    pq->rot = (float *)calloc((size_t)dim * dim, sizeof(float));
+    for (int i = 0; i < dim; i++) pq->rot[(size_t)i * dim + i] = 1;
+    Y = (float *)malloc(sizeof(float) * (size_t)ns * dim);
+    float *Yh = (float *)malloc(sizeof(float) * (size_t)no * dim);
+    double *M = (double *)malloc(sizeof(double) * (size_t)dim * dim);
+    uint8_t *code = (uint8_t *)malloc(m);
+    PQ plain = *pq; plain.rot = NULL;           /* codebook without rotation */
+    for (int it = 0; it < opq_iters; it++) {
+      RotCtx rc = { pq->rot, S, Y, dim };
+      dn_parallel_for(no, nthreads, 256, rotate_task, &rc);
+      TrainCtx t = { Y, no, dim, pq->dsub, 4, it > 0, seed + (uint64_t)it, pq->cent };
+      dn_parallel_for(m, nthreads, 1, train_subspace, &t);
+      for (int64_t i = 0; i < no; i++) {
+        pq_encode(&plain, Y + i * dim, code);
+        pq_decode(&plain, code, Yh + i * dim);
+      }
+      GramCtx g = { S, Yh, M, no, dim };
+      dn_parallel_for(dim, nthreads, 1, gram_row, &g);
+      polar_orthogonal(M, dim, pq->rot);
+    }
+    /* The rotation is stored as float16; use exactly that. */
+    for (size_t i = 0; i < (size_t)dim * dim; i++) pq->rot[i] = dn_f16_to_f32(dn_f32_to_f16(pq->rot[i]));
+    RotCtx rc = { pq->rot, S, Y, dim };
+    dn_parallel_for(ns, nthreads, 256, rotate_task, &rc);
+    free(Yh); free(M); free(code);
+    warm = 1;
+  }
+  TrainCtx t = { Y, ns, dim, pq->dsub, iters, warm, seed, pq->cent };
+  dn_parallel_for(m, nthreads, 1, train_subspace, &t);
+  if (Y != S) free(Y);
+  free(S);
   return 0;
 }
 
@@ -173,17 +297,21 @@ static void make_transposed(const PQ *pq, float **pcT, float **pcn) {
 }
 
 void pq_encode(const PQ *pq, const float *x, uint8_t *code) {
-  float *cT, *cn;
+  float *cT, *cn, *y = NULL;
   make_transposed(pq, &cT, &cn);
+  if (pq->rot) { y = (float *)malloc(sizeof(float) * pq->dim); rotate(pq->rot, x, y, pq->dim); x = y; }
   encode_t(pq, cT, cn, x, code);
-  free(cT); free(cn);
+  free(cT); free(cn); free(y);
 }
 
 typedef struct { const PQ *pq; const float *x; uint8_t *codes; const float *cT, *cn; } EncCtx;
 
 static void encode_one(void *vctx, int64_t i, int thread) {
   EncCtx *e = (EncCtx *)vctx; (void)thread;
-  encode_t(e->pq, e->cT, e->cn, e->x + i * e->pq->dim, e->codes + i * e->pq->m);
+  const float *x = e->x + i * e->pq->dim;
+  float y[4096];
+  if (e->pq->rot && e->pq->dim <= 4096) { rotate(e->pq->rot, x, y, e->pq->dim); x = y; }
+  encode_t(e->pq, e->cT, e->cn, x, e->codes + i * e->pq->m);
 }
 
 void pq_encode_many(const PQ *pq, const float *x, int64_t n, uint8_t *codes, int nthreads) {
@@ -202,6 +330,8 @@ void pq_decode(const PQ *pq, const uint8_t *code, float *out) {
 
 void pq_adc_table(const PQ *pq, const float *q, int metric, float *tab) {
   int d = pq->dsub;
+  float *y = NULL;
+  if (pq->rot) { y = (float *)malloc(sizeof(float) * pq->dim); rotate(pq->rot, q, y, pq->dim); q = y; }
   for (int j = 0; j < pq->m; j++) {
     const float *qs = q + j * d, *cs = pq->cent + (size_t)j * PQ_KSUB * d;
     float *row = tab + j * PQ_KSUB;
@@ -212,4 +342,5 @@ void pq_adc_table(const PQ *pq, const float *q, int metric, float *tab) {
   }
   if (metric != METRIC_L2)
     for (int c = 0; c < PQ_KSUB; c++) tab[c] += 1.0f;   /* fold "1 -" into subspace 0 */
+  free(y);
 }

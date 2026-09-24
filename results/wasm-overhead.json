@@ -1,0 +1,142 @@
+{
+ "db": "build/test/fts-test.db",
+ "queries": {
+  "fts_term_top10": "SELECT rowid, rank FROM docs_fts WHERE docs_fts MATCH 'baathist' ORDER BY rank LIMIT 10",
+  "fts_prefix_count": "SELECT count(*) FROM docs_fts WHERE docs_fts MATCH 'a*'",
+  "fts_or_join": "SELECT d.id, d.title FROM docs_fts JOIN docs d ON d.id = docs_fts.rowid WHERE docs_fts MATCH 'baal OR baath' ORDER BY docs_fts.rank, d.id LIMIT 5",
+  "rowid_lookup": "SELECT body FROM docs WHERE id = 1234"
+ },
+ "sqlite_version": "3.53.4",
+ "native_default_vfs": {
+  "fts_term_top10": {
+   "median_ms": 0.04528599993136595,
+   "mean_ms": 0.2285343050039046
+  },
+  "fts_prefix_count": {
+   "median_ms": 7.619774999966467,
+   "mean_ms": 6.214687615020011
+  },
+  "fts_or_join": {
+   "median_ms": 0.06561999998666579,
+   "mean_ms": 0.10972116999937498
+  },
+  "rowid_lookup": {
+   "median_ms": 0.004644999989977805,
+   "mean_ms": 0.004802434975772485
+  }
+ },
+ "native_httpvfs": {
+  "fts_term_top10": {
+   "median_ms": 0.045833999593014596,
+   "mean_ms": 0.06731951501024014
+  },
+  "fts_prefix_count": {
+   "median_ms": 4.353717999947548,
+   "mean_ms": 5.842478654988099
+  },
+  "fts_or_join": {
+   "median_ms": 0.06200000007083872,
+   "mean_ms": 0.09279467500846295
+  },
+  "rowid_lookup": {
+   "median_ms": 0.0012960003914486151,
+   "mean_ms": 0.0013291150162331178
+  }
+ },
+ "node_asyncify": {
+  "fts_term_top10": {
+   "median_ms": 0.2546950000000834,
+   "mean_ms": 2.1691181099999723
+  },
+  "fts_prefix_count": {
+   "median_ms": 10.374021000001449,
+   "mean_ms": 13.86382420500002
+  },
+  "fts_or_join": {
+   "median_ms": 0.2056059999995341,
+   "mean_ms": 0.8528340750000006
+  },
+  "rowid_lookup": {
+   "median_ms": 0.013241000000562053,
+   "mean_ms": 0.15493875000001026
+  }
+ },
+ "node_sync": {
+  "fts_term_top10": {
+   "median_ms": 0.14650199999960023,
+   "mean_ms": 1.1981685949999519
+  },
+  "fts_prefix_count": {
+   "median_ms": 9.195596999999907,
+   "mean_ms": 8.63365078499998
+  },
+  "fts_or_join": {
+   "median_ms": 0.10375700000076904,
+   "mean_ms": 0.36665905500000917
+  },
+  "rowid_lookup": {
+   "median_ms": 0.007229999999253778,
+   "mean_ms": 0.050897210000039196
+  }
+ },
+ "chromium_asyncify": {
+  "fts_term_top10": {
+   "median_ms": 0.2850000001490116,
+   "mean_ms": 2.0412000000057744
+  },
+  "fts_prefix_count": {
+   "median_ms": 9.995000000111759,
+   "mean_ms": 11.984300000001676
+  },
+  "fts_or_join": {
+   "median_ms": 0.19500000029802322,
+   "mean_ms": 0.6006000000005588
+  },
+  "rowid_lookup": {
+   "median_ms": 0.009999999776482582,
+   "mean_ms": 0.03100000000325963
+  }
+ },
+ "chromium_jspi": {
+  "fts_term_top10": {
+   "median_ms": 0.14500000001862645,
+   "mean_ms": 0.698875000004191
+  },
+  "fts_prefix_count": {
+   "median_ms": 6.135000000242144,
+   "mean_ms": 7.5621250000107105
+  },
+  "fts_or_join": {
+   "median_ms": 0.11500000022351742,
+   "mean_ms": 0.2621249999990687
+  },
+  "rowid_lookup": {
+   "median_ms": 0.009999999776482582,
+   "mean_ms": 0.010100000007078051
+  }
+ },
+ "chromium_sync": {
+  "fts_term_top10": {
+   "median_ms": 0.15500000026077032,
+   "mean_ms": 0.49672500000102443
+  },
+  "fts_prefix_count": {
+   "median_ms": 9.109999999869615,
+   "mean_ms": 8.023824999998324
+  },
+  "fts_or_join": {
+   "median_ms": 0.2050000000745058,
+   "mean_ms": 0.4019499999959953
+  },
+  "rowid_lookup": {
+   "median_ms": 0.01000000024214387,
+   "mean_ms": 0.07147500000428408
+  }
+ },
+ "date": "2026-09-23T23:58:24.094Z",
+ "loadavg": [
+  18.81,
+  18.3,
+  13.36
+ ]
+}

@@ -1,0 +1,22 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>httpvfs browser test</title>
+<pre id="out">running…</pre>
+<script type="module">
+// Runs worker.mjs in a dedicated module Worker and exposes its report as
+// window.testResult (a Promise) for Playwright.
+const params = new URLSearchParams(location.search);
+const worker = new Worker(new URL('./worker.mjs', import.meta.url), { type: 'module' });
+window.testResult = new Promise((resolve) => {
+  worker.onmessage = (e) => {
+    document.getElementById('out').textContent = JSON.stringify(e.data, null, 2);
+    resolve(e.data);
+  };
+  worker.onerror = (e) => resolve({ error: 'worker error: ' + (e.message || e) });
+});
+worker.postMessage({
+  variant: params.get('variant') || 'asyncify',
+  dbUrl: new URL(params.get('db'), location.href).href,
+  isolated: self.crossOriginIsolated,
+});
+</script>

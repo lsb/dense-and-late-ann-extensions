@@ -15,12 +15,14 @@ typedef struct PQ {
   int m;        /* number of subspaces (= bytes per code) */
   int dsub;     /* dim / m */
   float *cent;  /* centroids, laid out [m][PQ_KSUB][dsub] */
+  float *rot;   /* optional OPQ rotation, dim x dim row-major (y = x R); NULL = none */
 } PQ;
 
 /* Train on n vectors x[n*dim] (row-major). At most max_train vectors are
-** used, chosen with a deterministic shuffle from seed. Returns 0 on success. */
+** used, chosen with a deterministic shuffle from seed. With opq_iters > 0 an
+** OPQ rotation is learned first (stored in pq->rot). Returns 0 on success. */
 int pq_train(PQ *pq, const float *x, int64_t n, int dim, int m,
-             int64_t max_train, int iters, uint64_t seed, int nthreads);
+             int64_t max_train, int iters, int opq_iters, uint64_t seed, int nthreads);
 
 /* Allocate an untrained PQ (centroids zeroed), e.g. before loading. */
 int pq_init(PQ *pq, int dim, int m);
@@ -32,11 +34,13 @@ void pq_round_f16(PQ *pq);
 
 void pq_encode(const PQ *pq, const float *x, uint8_t *code);
 void pq_encode_many(const PQ *pq, const float *x, int64_t n, uint8_t *codes, int nthreads);
+/* Reconstruction in the rotated space (distances are unchanged by R). */
 void pq_decode(const PQ *pq, const uint8_t *code, float *out);
 
 /* Build the ADC table tab[m*256] for query q, such that
 **   distance(q, decode(code)) == pq_adc(tab, code, m)
-** for the given metric (COSINE/IP: 1 - <q,x>; L2: squared distance). The
+** for the given metric (COSINE/IP: 1 - <q,x>; L2: squared distance); q is
+** rotated first when the PQ has an OPQ rotation. The
 ** constant 1 of the cosine/IP distance is folded into subspace 0. */
 void pq_adc_table(const PQ *pq, const float *q, int metric, float *tab);
 

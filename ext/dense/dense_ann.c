@@ -55,6 +55,7 @@ static const char *const TABLE_SUFFIX[T_COUNT] = { "nodes", "codes", "vectors", 
 #define CHUNK_BYTES 3800
 #define CHUNK_ID_CODEBOOK 1
 #define CHUNK_ID_ENTRIES  1000000
+#define CHUNK_ID_ROTATION 2000000
 
 /* Node row header: u8 flags, u8 reserved, u16 degree, u32 vector-row page
 ** hint, i64 user rowid. */
@@ -93,6 +94,7 @@ typedef struct DenseCfg {
   int n_entry;       /* entry-set size */
   int64_t train_max; /* max PQ training sample */
   int iters;         /* k-means iterations */
+  int opq;           /* OPQ iterations (0 = plain PQ) */
   int64_t seed;
   double alpha;      /* pruning slack for graph construction */
   int reorder;       /* REORDER_* */
@@ -330,7 +332,7 @@ static int save_params(DenseVtab *vt) {
   S("dim", c->dim); S("pq_m", c->m); S("M", c->M); S("M0", c->M0);
   S("ef_construction", c->efc); S("metric", c->metric); S("store_vectors", c->vtype);
   S("vectors_inline", c->vinline); S("layout", c->layout); S("entry_points", c->n_entry);
-  S("pq_train", c->train_max); S("kmeans_iters", c->iters); S("seed", c->seed);
+  S("pq_train", c->train_max); S("kmeans_iters", c->iters); S("seed", c->seed); S("opq", c->opq);
   S("reorder", c->reorder); S("page_size_hint", c->page_hint); S("threads", c->nthreads);
   S("ef_search", c->ef_default); S("beam", c->beam_default); S("verbose", c->verbose);
 #undef S
@@ -362,7 +364,7 @@ static int load_config(DenseVtab *vt) {
     G("dim", c->dim); G("pq_m", c->m); G("M", c->M); G("M0", c->M0);
     G("ef_construction", c->efc); G("metric", c->metric); G("store_vectors", c->vtype);
     G("vectors_inline", c->vinline); G("layout", c->layout); G("entry_points", c->n_entry);
-    G("pq_train", c->train_max); G("kmeans_iters", c->iters); G("seed", c->seed);
+    G("pq_train", c->train_max); G("kmeans_iters", c->iters); G("seed", c->seed); G("opq", c->opq);
     G("reorder", c->reorder); G("page_size_hint", c->page_hint); G("threads", c->nthreads);
     G("ef_search", c->ef_default); G("beam", c->beam_default); G("verbose", c->verbose);
     G("built", vt->built); G("n_nodes", vt->n_nodes); G("n_deleted", vt->n_deleted);
@@ -402,6 +404,7 @@ static int parse_args(DenseCfg *c, int argc, const char *const *argv, char **pzE
     else if (!strcmp(key, "entry_points")) c->n_entry = (int)iv;
     else if (!strcmp(key, "pq_train")) c->train_max = iv;
     else if (!strcmp(key, "kmeans_iters")) c->iters = (int)iv;
+    else if (!strcmp(key, "opq")) c->opq = (int)iv;
     else if (!strcmp(key, "seed")) c->seed = iv;
     else if (!strcmp(key, "alpha")) c->alpha = atof(val);
     else if (!strcmp(key, "page_size_hint")) c->page_hint = (int)iv;
@@ -487,11 +490,13 @@ typedef struct QCtx {
   PageCache pc;
   void **allocs; int nalloc, capalloc;
   QStats *st;
+  float *vbuf;       /* dim floats of scratch */
 } QCtx;
 
 static void qc_init(QCtx *qc, DenseVtab *vt, int raw, QStats *st) {
   memset(qc, 0, sizeof *qc);
   qc->vt = vt; qc->raw = raw; qc->st = st;
+  qc->vbuf = (float *)malloc(sizeof(float) * vt->cfg.dim);
 }
 
 static void *qc_keep(QCtx *qc, void *p) {
@@ -508,6 +513,7 @@ static void qc_free(QCtx *qc) {
   free(qc->pc.keys); free(qc->pc.bufs);
   for (int i = 0; i < qc->nalloc; i++) free(qc->allocs[i]);
   free(qc->allocs);
+  free(qc->vbuf);
 }
 
 typedef struct RowReq {
@@ -623,18 +629,20 @@ static int write_chunks(DenseVtab *vt, int64_t first_id, const uint8_t *data, in
 ** are fetched in a single round. */
 static int ensure_loaded(DenseVtab *vt, int raw, QStats *st) {
   if (vt->loaded) return SQLITE_OK;
-  uint8_t *cl = NULL, *el = NULL;
-  int ncl = 0, nel = 0, rc;
+  uint8_t *cl = NULL, *el = NULL, *rl_ = NULL;
+  int ncl = 0, nel = 0, nrl = 0, rc;
   rc = cfg_get_blob(vt, "codebook_chunks", &cl, &ncl);
   if (rc == SQLITE_OK) rc = cfg_get_blob(vt, "entry_chunks", &el, &nel);
-  int nc = ncl / 8, ne = nel / 8;
-  RowReq *req = (RowReq *)calloc(nc + ne + 1, sizeof(RowReq));
+  if (rc == SQLITE_OK) rc = cfg_get_blob(vt, "rotation_chunks", &rl_, &nrl);
+  int nc = ncl / 8, ne = nel / 8, nr = nrl / 8;
+  RowReq *req = (RowReq *)calloc(nc + ne + nr + 1, sizeof(RowReq));
   for (int i = 0; i < nc; i++) { req[i].id = dn_rd32(cl + 8 * i); req[i].page = dn_rd32(cl + 8 * i + 4); }
   for (int i = 0; i < ne; i++) { req[nc + i].id = dn_rd32(el + 8 * i); req[nc + i].page = dn_rd32(el + 8 * i + 4); }
+  for (int i = 0; i < nr; i++) { req[nc + ne + i].id = dn_rd32(rl_ + 8 * i); req[nc + ne + i].page = dn_rd32(rl_ + 8 * i + 4); }
 
   QStats lst; memset(&lst, 0, sizeof lst);
   QCtx qc; qc_init(&qc, vt, raw && vt->hints_valid && ensure_pr(vt), &lst);
-  if (rc == SQLITE_OK) rc = q_fetch(&qc, T_BLOBS, req, nc + ne);
+  if (rc == SQLITE_OK) rc = q_fetch(&qc, T_BLOBS, req, nc + ne + nr);
 
   const DenseCfg *c = &vt->cfg;
   size_t cb_vals = (size_t)c->m * PQ_KSUB * (c->dim / c->m);
@@ -660,8 +668,19 @@ static int ensure_loaded(DenseVtab *vt, int raw, QStats *st) {
     epos += q->len;
   }
   if (rc == SQLITE_OK && epos != esz) rc = SQLITE_CORRUPT;
+  if (rc == SQLITE_OK && nr > 0) {
+    /* OPQ rotation, float16. */
+    size_t nrot = (size_t)c->dim * c->dim, rpos = 0;
+    vt->pq.rot = (float *)malloc(sizeof(float) * nrot);
+    for (int i = 0; i < nr && rc == SQLITE_OK; i++) {
+      const RowReq *q = &req[nc + ne + i];
+      if (!q->data) { rc = SQLITE_CORRUPT; break; }
+      for (int j = 0; j + 1 < q->len && rpos < nrot; j += 2) vt->pq.rot[rpos++] = dn_f16_to_f32(dn_rd16(q->data + j));
+    }
+    if (rc == SQLITE_OK && rpos != nrot) rc = SQLITE_CORRUPT;
+  }
   qc_free(&qc);
-  free(req); free(cl); free(el);
+  free(req); free(cl); free(el); free(rl_);
   if (rc == SQLITE_OK) {
     vt->loaded = 1;
     if (st) { st->setup_rounds += lst.rounds; st->setup_pages += lst.pages; st->bytes += lst.bytes; }
@@ -719,8 +738,8 @@ static int idset_add(IdSet *s, uint32_t id) {
 ** fetched in one round, and their neighbours are scored from the co-located
 ** PQ codes (or, in the separate layout, from a second round of code reads).
 ** Stops when all ef candidates in L have been expanded. */
-static int ann_core(DenseVtab *vt, QCtx *qc, const float *tab, int ef, int W, Cand *L, int *pnL,
-                    Cand **pexp, int *pnexp) {
+static int ann_core(DenseVtab *vt, QCtx *qc, const float *tab, const float *qexact, int ef, int W,
+                    Cand *L, int *pnL, Cand **pexp, int *pnexp) {
   const RowLayout *rl = &vt->rl;
   const int m = vt->cfg.m, M0 = vt->cfg.M0, estride = 8 + m;
   QStats *st = qc->st;
@@ -755,9 +774,23 @@ static int ann_core(DenseVtab *vt, QCtx *qc, const float *tab, int ef, int W, Ca
       L[bidx[b]].expanded = 1;
       L[bidx[b]].row = (req[b].data && req[b].len >= rl->size) ? req[b].data : NULL;
       st->expanded++;
+      if (qexact && L[bidx[b]].row) {
+        /* Exact navigation: the expanded node's own (inline) vector is in
+        ** hand, so replace its PQ estimate by the true distance. */
+        vec_decode(&vt->cfg, L[bidx[b]].row + rl->off_vec, qc->vbuf);
+        L[bidx[b]].d = dn_distance(vt->cfg.metric, qexact, qc->vbuf, vt->cfg.dim);
+        st->rerank++;
+      }
       if (pexp && L[bidx[b]].row) {
         if (nexp == capexp) { capexp = capexp ? 2 * capexp : 64; exp = (Cand *)realloc(exp, sizeof(Cand) * capexp); }
         exp[nexp++] = L[bidx[b]];
+      }
+    }
+    if (qexact) {   /* restore order after distance updates (insertion sort) */
+      for (int i = 1; i < nL; i++) {
+        Cand t = L[i]; int j = i - 1;
+        while (j >= 0 && L[j].d > t.d) { L[j + 1] = L[j]; j--; }
+        L[j + 1] = t;
       }
     }
     int np = 0;
@@ -822,8 +855,9 @@ static int ann_search(DenseVtab *vt, const float *q, int k, int ef, int W, int r
   Cand *L = (Cand *)calloc(ef, sizeof(Cand));
   Cand *exp = NULL;
   int nL = 0, nexp = 0;
-  rc = ann_core(vt, &qc, tab, ef, W, L, &nL, &exp, &nexp);
   if (rerank && c->vtype == VT_NONE) rerank = 0;
+  if (rerank >= 3 && !c->vinline) rerank = 2;
+  rc = ann_core(vt, &qc, tab, rerank >= 3 ? q : NULL, ef, W, L, &nL, &exp, &nexp);
 
   /* Candidates to return: rerank=0/1 use the final list L (PQ order);
   ** rerank=2 uses every expanded node, as DiskANN does. */
@@ -1039,7 +1073,7 @@ static int do_build(DenseVtab *vt) {
   /* 2. Train PQ and encode everything. The codebook is rounded to float16
   **    first, because that is what is stored. */
   PQ pq;
-  if (pq_train(&pq, X, n, dim, m, c->train_max, c->iters, (uint64_t)c->seed, c->nthreads)) {
+  if (pq_train(&pq, X, n, dim, m, c->train_max, c->iters, c->opq, (uint64_t)c->seed, c->nthreads)) {
     free(X); free(rowids); return SQLITE_NOMEM;
   }
   pq_round_f16(&pq);
@@ -1135,6 +1169,14 @@ static int do_build(DenseVtab *vt) {
   if (rc == SQLITE_OK) rc = write_chunks(vt, CHUNK_ID_CODEBOOK, cb, (int64_t)cb_vals * 2, &list, &nlist);
   if (rc == SQLITE_OK) rc = CFG_BLOB(vt, "codebook_chunks", list, nlist);
   free(list); list = NULL; free(cb);
+  if (pq.rot) {
+    size_t nrot = (size_t)dim * dim;
+    uint8_t *rb = (uint8_t *)malloc(nrot * 2);
+    for (size_t j = 0; j < nrot; j++) dn_wr16(rb + 2 * j, dn_f32_to_f16(pq.rot[j]));
+    if (rc == SQLITE_OK) rc = write_chunks(vt, CHUNK_ID_ROTATION, rb, (int64_t)nrot * 2, &list, &nlist);
+    if (rc == SQLITE_OK) rc = CFG_BLOB(vt, "rotation_chunks", list, nlist);
+    free(list); list = NULL; free(rb);
+  }
 
   int ne = c->n_entry < n ? c->n_entry : (int)n;
   if (ne < 1) ne = 1;
@@ -1192,11 +1234,11 @@ static void walk_map_cb(void *ctx, int64_t rowid, uint32_t pgno, int overflow) {
   if (rowid >= 0 && (uint64_t)rowid < w->n) w->pages[rowid] = pgno;
 }
 
-typedef struct { uint8_t *lists[2]; int n[2]; int64_t overflow; } BlobMap;
+typedef struct { uint8_t *lists[3]; int n[3]; int64_t overflow; } BlobMap;
 static void walk_blob_cb(void *ctx, int64_t rowid, uint32_t pgno, int overflow) {
   BlobMap *b = (BlobMap *)ctx;
   if (overflow) { b->overflow++; return; }
-  for (int l = 0; l < 2; l++)
+  for (int l = 0; l < 3; l++)
     for (int i = 0; i < b->n[l]; i++)
       if (dn_rd32(b->lists[l] + 8 * i) == (uint32_t)rowid) dn_wr32(b->lists[l] + 8 * i + 4, pgno);
 }
@@ -1313,13 +1355,15 @@ static int do_finalize(DenseVtab *vt) {
   BlobMap bm; memset(&bm, 0, sizeof bm);
   if (rc == SQLITE_OK) rc = cfg_get_blob(vt, "codebook_chunks", &bm.lists[0], &bm.n[0]);
   if (rc == SQLITE_OK) rc = cfg_get_blob(vt, "entry_chunks", &bm.lists[1], &bm.n[1]);
-  bm.n[0] /= 8; bm.n[1] /= 8;
+  if (rc == SQLITE_OK) rc = cfg_get_blob(vt, "rotation_chunks", &bm.lists[2], &bm.n[2]);
+  bm.n[0] /= 8; bm.n[1] /= 8; bm.n[2] /= 8;
   uint32_t broot;
   if (rc == SQLITE_OK) rc = table_root(vt, "blobs", &broot);
   if (rc == SQLITE_OK) rc = pr_walk_table(&vt->pr, broot, walk_blob_cb, &bm);
   if (rc == SQLITE_OK) rc = CFG_BLOB(vt, "codebook_chunks", bm.lists[0], bm.n[0] * 8);
   if (rc == SQLITE_OK) rc = CFG_BLOB(vt, "entry_chunks", bm.lists[1], bm.n[1] * 8);
-  free(bm.lists[0]); free(bm.lists[1]);
+  if (rc == SQLITE_OK && bm.n[2]) rc = CFG_BLOB(vt, "rotation_chunks", bm.lists[2], bm.n[2] * 8);
+  free(bm.lists[0]); free(bm.lists[1]); free(bm.lists[2]);
 
   if (rc == SQLITE_OK) {
     vt->hints_valid = 1;
@@ -1374,7 +1418,7 @@ static int insert_built(DenseVtab *vt, int64_t rowid, const float *x) {
   QCtx qc; qc_init(&qc, vt, 0, &st);
   int ef = c->efc > M0 ? c->efc : M0, nL = 0;
   Cand *L = (Cand *)calloc(ef, sizeof(Cand));
-  rc = ann_core(vt, &qc, tab, ef, 4, L, &nL, NULL, NULL);
+  rc = ann_core(vt, &qc, tab, NULL, ef, 4, L, &nL, NULL, NULL);
 
   /* Candidates: live expanded nodes, sorted by PQ distance. */
   int nc = 0;

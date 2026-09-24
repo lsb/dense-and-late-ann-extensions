@@ -85,3 +85,45 @@ A 50-word random-word document yields 111.4 LateOn token vectors; an LLM paragra
 `docs/plaid.md` specifies fast-plaid's algorithm with source references: centroid count K = 2^⌊log₂(16√T)⌋ for T token vectors, k-means, the residual codec (bucket cutoffs at quantiles i/2ⁿ, bucket weights at quantiles (i+0.5)/2ⁿ), the IVF, and the search stages with their defaults (`n_ivf_probe` 8 per query token, `n_full_scores` 4096). At dimension 48 a residual costs 6, 12 or 24 bytes at 1, 2 or 4 bits. With bit-packed centroid ids and IVF entries, the total is about 10.6, 16.6 or 28.6 bytes per token, against 96 bytes for fp16. That projects to about 1.2, 1.9 or 3.2 GB for the 1M random-word corpus.
 
 **Finding: default PLAID probing touches too much of the corpus for httpvfs.** A NumPy simulation on words-10k with `n_ivf_probe` = 8 probes about 69 centroid cells per query and gathers about 2,800 candidate documents (28 % of the corpus), whose codes all have to be fetched for approximate scoring. PLAID's centroid-score pruning threshold (0.4 in next-plaid) removes almost nothing for this model. Omar Khattab's measurements in the Hugging Face blog (1-bit residuals, bit-packed ids, document-side pruning) point towards small indexes. A centroid-major layout in the style of WARP, where each centroid's posting list stores document ids together with residuals, lets a query finish in one parallel round after choosing centroids, and is the main candidate for the SQLite design.
+
+## 2026-09-24 — Build toolchain and the WASM HTTP VFS (`wasm/`, `Makefile`)
+
+**SQLite source.** SQLite 3.53.4 comes from the GitHub mirror at tag `version-3.53.4`, because sqlite.org is blocked. The amalgamation is generated with the JimTcl bundled in the source tree. `wasm/scripts/fetch-sqlite.sh` pins SHA-256 digests of the generated files, and a fresh clone reproduced them. Emscripten 6.0.10.
+
+**Builds.** `make native` produces an `sqlite3` shell and `libsqlite3.so` with FTS5, plus loadable extensions. `make wasm` builds three WebAssembly variants. `make test` runs 4 native, 7 Node and 5 Chromium tests, all passing. Any directory `ext/*/` whose C files define `sqlite3_<name>_init` is compiled in. In static builds a generated registry calls `sqlite3_auto_extension` for each such extension.
+
+**The HTTP VFS** (`wasm/src/httpvfs.c`) is one C file shared by the native and WASM builds. Its features:
+- an LRU block cache, sequential readahead in the style of sql.js-httpvfs, and merging of adjacent ranges;
+- a log of every request (`offset`, `length`, `round`, start and end time), in the trace format of `netsim/simulate.py`;
+- counters for requests, bytes, rounds and cache hits.
+
+All network access goes through one backend call, "fetch these N ranges and return when all have arrived". Each call is one **round**. Extensions reach the VFS through `sqlite3_file_control`, so there is no link-time dependency; the calls do nothing on an ordinary file. The C API is:
+- `httpvfs_prefetch(db, offsets, lengths, n)` for batches of byte ranges;
+- *speculative batching*: during a pass, uncached reads return zero-filled blocks and are only recorded; the recorded blocks are then fetched in one round and the pass is repeated. This batches B-tree lookups whose byte offsets an extension cannot know in advance.
+
+**Parallel fetching in the browser.** Synchronous XMLHttpRequest, as used by sql.js-httpvfs, can only fetch one range at a time, so three variants were built from the same objects:
+
+| Variant | Mechanism | Size of `.wasm` with both extensions (raw / gzip) | Requirements |
+|---|---|---|---|
+| Asyncify | Emscripten stack unwinding around `Promise.all` | 2.37 MB / 846 KB | none; works in every browser and Node |
+| JSPI | WebAssembly JavaScript Promise Integration | 1.40 MB / 574 KB | Chromium 137+ (not Node 22) |
+| sync | worker performs fetches while the SQLite thread waits in `Atomics.wait` | 1.40 MB / 574 KB | SharedArrayBuffer, so COOP/COEP headers in browsers |
+
+The JS API (`wasm/pkg/index.mjs`) picks JSPI when available and otherwise Asyncify.
+
+**Measurements.** Timings are noisy because the machine load average was 15–18 on 4 CPUs; round counts are exact.
+- *Cold lookups by rowid.* With a 20 ms server delay, 16 cold rowid lookups take 18 rounds (about 420 ms) one at a time and 3 rounds (85–165 ms) with speculative batching.
+- *Readahead.* It reduces a full table scan from 336 requests to 12.
+- *CPU overhead.* With a warm cache, a small FTS5 query costs a fixed 0.1–0.25 ms extra in WASM. A heavier FTS5 query costs 1.4–1.8 times native with Asyncify and 0.8–1.3 times with JSPI or sync. Both are negligible next to one mobile round trip.
+
+**Browser behaviour discovered.**
+- *Cache lock.* Chromium serialises concurrent range requests for the same URL through its HTTP cache unless `fetch` uses `cache: 'no-store'`, which is now the default.
+- *Connection limit.* Over HTTP/1.1 Chromium sends at most 6 requests per host at once.
+- *Worker messaging.* A thread blocked in `Atomics.wait` does not get messages delivered to its nested worker; a `MessageChannel` works.
+
+**Open issues.**
+- The Asyncify build is larger than the others.
+- The sync variant is untested in Firefox and Safari.
+- The native build has no real HTTP backend; it only simulates a delay per round.
+- Speculative batching is tested only for rowid lookups.
+- Index construction must stay native, because the WASM build is single-threaded.

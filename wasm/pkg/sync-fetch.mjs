@@ -17,17 +17,22 @@ export async function createSyncFetcher({ fetchHeaders } = {}) {
         worker = new Worker(url);
         worker.once('message', resolve);
         worker.once('error', reject);
-        worker.unref();
         post = (m) => worker.postMessage(m);
       }, reject);
     } else {
+      // Batches go over a MessageChannel: in Chromium, messages posted to a
+      // nested worker itself are not delivered while this thread is blocked
+      // in Atomics.wait, but MessagePort messages are.
       worker = new Worker(url, { type: 'module' });
-      worker.onmessage = () => resolve();
+      const ch = new MessageChannel();
+      ch.port1.onmessage = () => resolve();
       worker.onerror = reject;
-      post = (m) => worker.postMessage(m);
+      worker.postMessage({ port: ch.port2 }, [ch.port2]);
+      post = (m) => ch.port1.postMessage(m);
     }
   });
   await ready;   // the worker must be running before we ever block
+  if (isNode) worker.unref();
 
   function fetchSync(fileUrl, offs, lens) {
     const n = offs.length;

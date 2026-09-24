@@ -1,0 +1,13 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>httpvfs overhead benchmark</title>
+<script type="module">
+const params = new URLSearchParams(location.search);
+const worker = new Worker(new URL('./bench-worker.mjs', import.meta.url), { type: 'module' });
+window.benchResult = new Promise((resolve) => {
+  worker.onmessage = (e) => resolve(e.data);
+  worker.onerror = (e) => resolve({ error: String(e.message || e) });
+});
+worker.postMessage({ variant: params.get('variant') || 'asyncify',
+                     dbUrl: new URL(params.get('db'), location.href).href });
+</script>

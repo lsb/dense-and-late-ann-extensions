@@ -435,7 +435,8 @@ static int hvRead(sqlite3_file *pFile, void *zBuf, int iAmt,
       f->st.cache_hits++;
       memcpy(out + (lo-iOfst), f->cache.data + (size_t)s*bs + (lo - b*bs),
              (size_t)(hi-lo));
-    }else if( f->speculating ){
+    }else if( f->speculating && b>0 ){
+      /* Block 0 (the header and page 1) is always fetched for real. */
       f->st.spec_misses++;
       memset(out + (lo-iOfst), 0, (size_t)(hi-lo));
       rc = hvSpecRecord(f, b);
@@ -619,6 +620,7 @@ static int hvFileControl(sqlite3_file *pFile, int op, void *pArg){
         memset(&f->st, 0, sizeof(f->st));
         f->nlog = 0;
         if( a[2] && sqlite3_stricmp(a[2], "cache")==0 ) hvCacheClear(&f->cache);
+        a[0] = sqlite3_mprintf("ok");   /* NULL would be a NULL column name */
         return SQLITE_OK;
       }
       return SQLITE_NOTFOUND;

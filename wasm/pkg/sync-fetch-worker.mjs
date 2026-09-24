@@ -11,7 +11,9 @@ async function handle({ url, offs, lens, sab, metaOff, dataOff, headers }) {
     const starts = lens.map((l) => { const s = p; p += l; return s; });
     await Promise.all(offs.map(async (off, i) => {
       const t0 = performance.timeOrigin + performance.now();
-      const resp = await fetch(url, { headers: Object.assign({}, headers || {},
+      // cache: 'no-store' avoids Chromium's per-URL HTTP cache lock, which
+      // would serialise these requests.
+      const resp = await fetch(url, { cache: 'no-store', headers: Object.assign({}, headers || {},
         { Range: `bytes=${off}-${off + lens[i] - 1}` }) });
       let buf = new Uint8Array(await resp.arrayBuffer());
       let total = -1;
@@ -47,6 +49,9 @@ if (isNode) {
   parentPort.on('message', handle);
   parentPort.postMessage('ready');
 } else {
-  self.onmessage = (e) => handle(e.data);
-  self.postMessage('ready');
+  self.onmessage = (e) => {
+    const port = e.data.port;
+    port.onmessage = (m) => handle(m.data);
+    port.postMessage('ready');
+  };
 }
