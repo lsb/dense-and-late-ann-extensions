@@ -1,0 +1,24 @@
+{
+ "corpus": "words-1m--late",
+ "systems": {
+  "FTS5": "fts-bm25",
+  "dense graph": "graph-ef64",
+  "dense IVF": "ivf-np64",
+  "late warp": "warp-np8-rr64"
+ },
+ "profiles": [
+  "4g",
+  "lte",
+  "slow-4g",
+  "wifi"
+ ],
+ "rows": [],
+ "notes": {
+  "max_blocks": 512,
+  "multipart_part_bytes": 100,
+  "fixed_defaults": [
+   100.0,
+   10000.0
+  ]
+ }
+}
