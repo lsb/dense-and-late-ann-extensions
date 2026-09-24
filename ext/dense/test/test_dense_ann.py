@@ -238,5 +238,60 @@ class DenseAnnTest(unittest.TestCase):
         self.assertEqual(st["rounds"], 2)
 
 
+    # ------------------------------------------------- head storage, warm
+
+    @staticmethod
+    def head_bytes(db):
+        return db.execute("SELECT sum(length(data)) FROM v_blobs").fetchone()[0]
+
+    def test_codebook_types(self):
+        """codebook=int8 halves the PQ codebook in the cached head and keeps
+        the results of codebook=f16 (format 2); both layouts."""
+        for layout in ("layout=colocated", "layout=ivf, nlist=30"):
+            res, size = {}, {}
+            for cb in ("f16", "int8"):
+                db, path = self.open(f"cb-{cb}.db", params=f"{layout}, codebook={cb}", n=1500)
+                size[cb] = self.head_bytes(db)
+                db = self.connect(path)               # fresh connection: head read back from disk
+                ids, _, st = self.search(db, self.X[7], "AND nprobe = 30 AND rerank_k = 32")
+                self.assertEqual(ids[0], 8, (layout, cb))
+                self.assertEqual(st["fallback"], 0)
+                res[cb] = self.recall(db, "AND ef = 64 AND nprobe = 16", X=self.X[:1500])
+            self.assertLess(size["int8"], size["f16"] - 90000, layout)
+            self.assertGreater(res["int8"], res["f16"] - 0.03, layout)
+
+    def test_ivf_centroids_auto(self):
+        db, _ = self.open("auto.db", params="layout=ivf, nlist=30", n=1500)
+        self.assertEqual(db.execute("SELECT value FROM v_config WHERE key='ivf_centroids'").fetchone()[0], 1)  # int8
+        db, _ = self.open("auto-f16.db", params="layout=ivf, nlist=30, ivf_centroids=f16", n=1500)
+        self.assertEqual(db.execute("SELECT value FROM v_config WHERE key='ivf_centroids'").fetchone()[0], 0)
+
+    def test_format_1_still_reads(self):
+        """An index written before format 2 (no 'format'/'codebook' keys,
+        float16 codebook) still loads."""
+        db, path = self.open("fmt1.db", params="codebook=f16", n=1500)
+        want = self.search(self.connect(path), self.Q[0])[0]
+        db.execute("DELETE FROM v_config WHERE key IN ('format', 'codebook')")
+        self.assertEqual(self.search(self.connect(path), self.Q[0])[0], want)
+
+    def test_newer_format_is_a_clear_error(self):
+        db, path = self.open("fmt9.db", n=500)
+        db.execute("UPDATE v_config SET value = 9 WHERE key = 'format'")
+        with self.assertRaises(sqlite3.Error) as cm:
+            self.search(self.connect(path), self.Q[0])
+        self.assertIn("format 9", str(cm.exception))
+
+    def test_warm(self):
+        """MATCH 'warm' loads the head: no rows, and the next query has no setup."""
+        for params in ("layout=colocated", "layout=ivf, nlist=30"):
+            _, path = self.open("warm.db", params=params, n=1500)
+            db = self.connect(path)
+            self.assertEqual(db.execute("SELECT rowid FROM v WHERE embedding MATCH 'warm'").fetchall(), [])
+            _, _, st = self.search(db, self.Q[0])
+            self.assertEqual((st["setup_rounds"], st["setup_pages"]), (0, 0), params)
+            cold = self.search(self.connect(path), self.Q[0])[2]
+            self.assertGreater(cold["setup_pages"], 0)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

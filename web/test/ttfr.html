@@ -1,0 +1,34 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>time to first result</title>
+<!-- Harness for web/test/ttfr.mjs: opens a database, starts loading the
+     encoder the system needs, and searches as soon as the index is open.
+     ?db=URL&system=fts|dense|dense_ivf|late&q=TEXT&warm=auto|off&delay=MS
+     warm=auto warms the queried index while the encoder loads (as the default does for
+     system dense or late; for dense_ivf the page must name it).
+     delay: submit the query MS after the index is open (a user typing). -->
+<pre id="out">running…</pre>
+<script type="module">
+import { openIndex } from '../lib/index.mjs';
+
+const p = new URLSearchParams(location.search);
+const system = p.get('system') || 'late';
+const enc = system === 'fts' ? null : system === 'late' ? 'lateon' : 'minilm';
+window.ttfr = (async () => {
+  const marks = { start: performance.now() };
+  const ix = await openIndex(p.get('db'), { preload: enc ? [enc] : [], warm: p.get('warm') === 'off' ? false : [system] });
+  marks.open = performance.now();
+  const delay = Number(p.get('delay') || 0);
+  if (delay) await new Promise((r) => setTimeout(r, delay));
+  marks.submit = performance.now();
+  const r = await ix.search(p.get('q') || 'volcanic eruption', { system });
+  marks.result = performance.now();
+  const encoder = enc ? await ix.loadEncoder(enc) : null;
+  const warm = await Promise.all(Object.values(ix.warming));
+  const out = { marks, rows: r.rows.map((x) => x.id), stats: r.stats, ext: r.ext, encoder, warm,
+                variant: ix.variant, open: ix.openStats };
+  document.getElementById('out').textContent = JSON.stringify(out, null, 1);
+  await ix.close();
+  return out;
+})().catch((e) => ({ error: String(e.stack || e) }));
+</script>

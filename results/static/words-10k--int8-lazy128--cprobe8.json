@@ -1,0 +1,56 @@
+{
+ "corpus": "words-10k",
+ "name": "int8-lazy128",
+ "index": "late",
+ "params": "dim=48 nbits=2 layout=both order=1 threads=2 input=f16 layout=warp centroids=16384 centroid_type=int8 lazy_cells=128",
+ "index_bytes": 16445440,
+ "n_queries": 2000,
+ "static": {
+  "static_payload": 14116,
+  "static_pages": 4
+ },
+ "configs": {
+  "warp-np8+cprobe=8": {
+   "label": "warp nprobe 8",
+   "ndcg10": 0.3103041141339014,
+   "r10_exact": 0.40985,
+   "by_kind": {
+    "known": 0.4916723841123775,
+    "word": 0.1289358441554252
+   },
+   "cold": {
+    "n": 40,
+    "rounds": 5.0,
+    "kb": 506.0,
+    "requests": 44.5,
+    "ms": {
+     "4g,h1": 2072.8589391481487,
+     "4g,h2": 1370.080620697531,
+     "lte,h1": 979.8246268888889,
+     "lte,h2": 725.7136316666665
+    }
+   }
+  },
+  "warp-np32+cprobe=8": {
+   "label": "warp nprobe 32",
+   "ndcg10": 0.39115355626011905,
+   "r10_exact": 0.48345,
+   "by_kind": {
+    "known": 0.6333972329653413,
+    "word": 0.14890987955489673
+   },
+   "cold": {
+    "n": 40,
+    "rounds": 5.0,
+    "kb": 788.0,
+    "requests": 72.0,
+    "ms": {
+     "4g,h1": 2934.2780163415637,
+     "4g,h2": 1631.9974874567902,
+     "lte,h1": 1347.406180950618,
+     "lte,h2": 897.9886973333336
+    }
+   }
+  }
+ }
+}

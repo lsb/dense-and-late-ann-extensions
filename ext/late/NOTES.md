@@ -43,6 +43,8 @@ CREATE VIRTUAL TABLE t USING late_plaid(
     layout=both,              -- plaid | warp | both
     kmeans_iters=4, kmeans_ppc=256, sample_docs=0, sample_tokens=4000000,
     assign_probe=8, refine=2, order=1, fast_assign=0,
+    centroid_type=int8,       -- int8 | f16 | int4: storage of the centroids (format 3)
+    lazy_cells=0,             -- G > 0: flat centroids stored in G cells fetched on demand
     threads=4, mem_mb=1024, seed=42, input=f32);
 
 -- documents: one blob of n_tokens x dim float32 (or float16 with input=f16)
@@ -50,6 +52,8 @@ INSERT INTO t(rowid, vectors) VALUES (?1, ?2);
 INSERT INTO t(t) VALUES ('build');                         -- from the inserted rows
 INSERT INTO t(t) VALUES ('build_npy VECTORS.npy OFFSETS.npy'); -- or stream from files
 INSERT INTO t(t) VALUES ('finalize');                      -- store page hints; rerun after VACUUM
+SELECT rowid FROM t WHERE t MATCH 'warm';                  -- load the static data (and the document
+                                                           -- table's interior pages) now; no rows
 
 SELECT rowid, score, stats FROM t
  WHERE t MATCH ?1                 -- query: float32 blob [n_query_tokens x dim]
@@ -280,6 +284,54 @@ With 100 documents the whole index (200 KB of document rows, 107 KB of static da
 | session start | 2 (+ schema) | static data: one b-tree level per round |
 
 The faithful PLAID pipeline is round-efficient (2 rounds) but reads every candidate's row: 4–17 MB per query at 10k, 5–17 s on a 4G phone. Ranking candidates from the IVF alone (`approx=ivf`) keeps 2 rounds and reads 0.35–0.66 MB for nDCG 0.33–0.35, close to float-exact's 0.359. The centroid-major warp layout needs only 1 round, reads 0.08–0.5 MB and answers in 0.25–0.67 s on 4g, but ranks worse by itself (0.21–0.33); one more round to re-rank its best 32–64 documents exactly brings it to 0.34–0.36 in 0.6–0.9 s. On a 4G link (165 ms per round trip, 8.1 Mbit/s) one round costs about as much as 170 KB of transfer, so the second round is worth taking whenever it buys quality.
+
+### Static data: precision, number of centroids, lazy cells (2026-09-24)
+
+The static data (centroids, list lengths, page hints) is what a new connection reads before its first query; with float16 centroids it was 104 bytes per centroid, 1.7 MB at K = 16,384 (words-10k) and 0.83 MB at K = 8,192 (llm-10k, where the fast-plaid formula gives 8,192). Three ways to shrink it were measured with `bench/static_eval.py` (one late index per database, `layout=both nbits=2 order=1`, all 2,000 queries of each corpus for quality; 40 cold queries through the WASM build, each on a new connection, replayed through netsim, p50):
+
+- **Centroid precision** (`centroid_type=f16|int8|int4`, format 3). Each centroid is stored with a float16 scale and 48 int8 (50 B) or int4 (26 B) values. The build rounds the centroids to their stored values *before* the codec is trained and the residuals are computed, so decompression is exact with respect to what the query sees. Format 3 also stores the list lengths as varints (about 2.6 instead of 8 bytes per centroid).
+- **Fewer centroids** (K/2, K/4), all int8.
+- **Lazy cells** (`lazy_cells=G`, new): the same flat k-means centroids, but stored in G cells of similar centroids (the ordering groups); the static data keeps only the G cell centroids (14 KB), and a query fetches the cells its tokens probe (`cprobe` best cells per query token) in one extra round. Unlike `coarse=G`, the index is identical to the flat one, so with enough cells probed the results are identical too. It needs every centroid for re-ranking or the plaid layout, so it suits `layout=warp` without `rerank`.
+
+| Corpus | Variant | Static KB | warp 8: nDCG@10 | R@10 vs exact | warp 8 + rerank 64: nDCG@10 | R@10 vs exact | Cold KB (warp 8 + rr 64) | Cold 4g h1 / h2 ms | Cold lte h1 / h2 ms |
+|---|---|---|---|---|---|---|---|---|---|
+| llm-10k | f16, format 2 (before) | 832 | 0.444 | 0.389 | 0.443 | 0.462 | 1,226 | 4,332 / 2,400 | 2,140 / 1,332 |
+| llm-10k | f16, format 3 | 786 | 0.444 | 0.389 | 0.443 | 0.462 | 1,178 | 4,284 / 2,353 | 2,108 / 1,301 |
+| llm-10k | **int8 (new default)** | **418** | 0.444 | 0.389 | 0.442 | 0.462 | 808 | 3,909 / 1,977 | 1,854 / 1,046 |
+| llm-10k | int4 | 226 | 0.453 | 0.406 | 0.458 | 0.490 | 610 | 3,697 / 1,776 | 1,711 / 910 |
+| llm-10k | int8, K = 4,096 | 212 | 0.429 | 0.393 | 0.427 | 0.444 | 614 | 3,707 / 1,781 | 1,718 / 914 |
+| llm-10k | int8, K = 2,048 | 107 | 0.421 | 0.331 | 0.418 | 0.405 | 474 | 3,410 / 1,641 | 1,558 / 820 |
+| words-10k | f16, format 2 (before) | 1,664 | 0.313 | 0.413 | 0.409 | 0.539 | 2,154 | 5,811 / 3,342 | 2,994 / 1,969 |
+| words-10k | f16, format 3 | 1,572 | 0.313 | 0.413 | 0.409 | 0.539 | 2,058 | 5,715 / 3,245 | 2,929 / 1,904 |
+| words-10k | **int8 (new default)** | **836** | 0.313 | 0.412 | 0.408 | 0.537 | 1,304 | 4,921 / 2,481 | 2,414 / 1,388 |
+| words-10k | int4 | 451 | 0.299 | 0.413 | 0.401 | 0.543 | 914 | 4,513 / 2,088 | 2,139 / 1,122 |
+| words-10k | int8, K = 8,192 | 422 | 0.334 | 0.418 | 0.400 | 0.516 | 914 | 4,494 / 2,086 | 2,126 / 1,121 |
+| words-10k | int8, K = 4,096 | 215 | 0.268 | 0.361 | 0.355 | 0.455 | 672 | 4,051 / 1,841 | 1,867 / 955 |
+
+Lazy cells (128 cells, int8, `layout=warp`, warp nprobe 8, no rerank; cold = static directory + the probed cells + postings):
+
+| Corpus | cprobe | nDCG@10 | R@10 vs exact | Cold rounds | Cold KB | Cold 4g h1 / h2 ms | Flat int8, same query: cold KB, 4g h1 / h2 ms |
+|---|---|---|---|---|---|---|---|
+| llm-10k | 4 | 0.376 | 0.327 | 5 | 192 | 1,241 / 1,030 | 532, 1,509 / 1,204 |
+| llm-10k | 8 | 0.411 | 0.363 | 5 | 268 | 1,513 / 1,101 | |
+| llm-10k | 16 | 0.444 | 0.389 | 5 | 354 | 1,547 / 1,186 | (flat: 0.444, 0.389) |
+| words-10k | 4 | 0.291 | 0.392 | 5 | 344 | 1,750 / 1,192 | 1,000, 2,314 / 1,694 |
+| words-10k | 8 | 0.310 | 0.410 | 5 | 506 | 2,073 / 1,370 | |
+| words-10k | 16 | 0.313 | 0.412 | 5 | 702 | 2,232 / 1,552 | (flat: 0.313, 0.412) |
+
+What this shows:
+
+- **int8 centroids are free**: every configuration is within ±0.002 nDCG and ±0.002 recall of float16 on both corpora (plaid-ivf and warp nprobe 32 too; `results/static/`), for half the static data. Measured against the float16 format-2 index, a cold first query is about 420 ms (llm-10k) and 860 ms (words-10k) faster on `4g` with HTTP/2-like concurrency, and 290 / 580 ms faster on `lte`. This is the new default (`centroid_type=int8`, also in `bench/matrix_config.json`).
+- **int4 is not at matched quality**: it *gains* 0.01–0.015 nDCG on llm-10k but loses 0.007–0.014 on words-10k. It is kept as an option.
+- **Fewer centroids cost quality** with the default re-ranked configuration (−0.015 nDCG at K/2 on llm-10k, −0.008 on words-10k; the IVF-ranked plaid mode loses 0.04), although on words-10k K = 8,192 improves the warp first stage alone (0.334 against 0.313), as earlier: fewer centroids mean longer lists, i.e. more candidates per probe. At equal static bytes int8 at full K is better than float16 at K/2.
+- **Lazy cells recover flat quality at cprobe 16** (identical nDCG and recall), whereas the trained two-level mode lost 0.05–0.09: the loss came from the per-cell k-means, not from routing through cells. Cold, they save 0.2–0.3 MB at K = 16,384 (140 ms on `4g` h2 at cprobe 16, 320 ms at cprobe 8 for −0.003 nDCG) and nothing measurable at K = 8,192, because the extra round costs about as much as the bytes saved. Every later query also pays that round until its cells are cached, and re-ranking needs all cells. With the static data loaded in the background (`MATCH 'warm'`, below), loading everything is better at 10k; lazy cells are for indexes whose flat table is too large to load up front (K = 65,536 at 1M: 3.4 MB int8).
+- **Format 3's varint list lengths** save 6% (46 KB at llm-10k, 92 KB at words-10k).
+
+**`MATCH 'warm'`.** `SELECT rowid FROM t WHERE t MATCH 'warm'` loads the static data now and also the interior pages of the document table (read level by level, stopping above the leaf level, whose size is estimated from N and the row size), which the first re-ranking query would otherwise walk in two extra rounds. It returns no rows. The browser client runs it while the query encoder loads (`web/NOTES.md`).
+
+**Format and compatibility.** Format 3 adds the centroid type after the version-2 header and stores the flat table's list lengths as varints; in two-level and lazy modes the centroid type also applies to the cell blocks. This build reads formats 1–3; a newer format is refused with "index format version N is not supported by this build". Older builds cannot read format 3 (they report "cannot load index"); `finalize` rewrites any index it is run on in format 3.
+
+**Option parsing (fixed).** `tools/build_db.py` passes the late index parameters as one space-separated argument (`dim=48 nbits=2 …`), which the parser used to read as `dim` with a long value: every other option, `threads` included, was silently ignored and the defaults were used. The earlier matrix databases therefore had the default parameters (for words-1m: K from the formula, both layouts, no `fast_assign`); at 10k the defaults happened to equal the intended parameters. Options may now be separated by commas or white space.
 
 ## Scaling to 1M documents
 

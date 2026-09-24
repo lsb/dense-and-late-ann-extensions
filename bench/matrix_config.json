@@ -43,27 +43,27 @@
       "system": "dense graph",
       "table": "dense_graph",
       "embedding": "minilm",
-      "params": "dim=384, layout=colocated, vectors=inline, store_vectors=f16, M=16, ef_construction=200, threads=2",
-      "desc": "HNSW-built layer-0 graph, co-located PQ-64 neighbour codes, inline float16 vectors, page hints"
+      "params": "dim=384, layout=colocated, vectors=inline, store_vectors=f16, M=16, ef_construction=200, threads=2, codebook=int8",
+      "desc": "HNSW-built layer-0 graph, int8 PQ codebook, co-located PQ-64 neighbour codes, inline float16 vectors, page hints"
     },
     "dense_ivf": {
       "kind": "dense_ann",
       "system": "dense IVF",
       "table": "dense_ivf",
       "embedding": "minilm",
-      "params": "dim=384, layout=ivf, store_vectors=f16, threads=2",
-      "desc": "IVF-PQ (IVFADC, PQ-64 residual codes), nlist = 4 sqrt(N), float16 vectors in a table for reranking"
+      "params": "dim=384, layout=ivf, store_vectors=f16, threads=2, ivf_centroids=auto, codebook=int8",
+      "desc": "IVF-PQ (IVFADC, PQ-64 residual codes, int8 codebook), nlist = 4 sqrt(N), int8 centroids below 1,024 lists (PQ above), float16 vectors in a table for reranking"
     },
     "late": {
       "kind": "late_plaid",
       "system": "late",
       "table": "late",
       "embedding": "lateon",
-      "params": "dim=48 nbits=2 centroids=0 layout=both order=1 threads=2 input=f16",
+      "params": "dim=48 nbits=2 centroids=0 layout=both order=1 threads=2 input=f16 centroid_type=int8",
       "per_corpus": {
-        "words-1m": "layout=warp nbits=2 centroids=65536 fast_assign=1 sample_tokens=2000000 mem_mb=1024"
+        "words-1m": "layout=warp nbits=2 centroids=65536 fast_assign=1 sample_tokens=2000000 mem_mb=1024 centroid_type=int8"
       },
-      "desc": "LateOn-Code-edge token vectors, 2-bit residuals, K = fast-plaid formula (65,536 at 1M), warp postings + plaid rows + IVF"
+      "desc": "LateOn-Code-edge token vectors, 2-bit residuals, K = fast-plaid formula (65,536 at 1M), int8 centroids, warp postings + plaid rows + IVF"
     }
   },
   "configs": [

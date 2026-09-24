@@ -5,6 +5,8 @@
 // Methods:
 //   open({url, sqliteModule, ...openOptions}) -> {indexes, docs, stats, net, openMs, variant}
 //   search({table, text | vector, k, params, cold, fetchDocs}) -> result
+//   warm({table}) -> {table, ms, rounds, requests, bytes}: load the index's
+//     per-connection static data now (queued behind any search)
 //   query({sql, params}) / stats() / log() / netState() / setNetOptions(o) /
 //   resetStats({clearCache}) / close()
 
@@ -24,6 +26,7 @@ const handlers = {
              openMs: performance.now() - t0 };
   },
   async search(args) { return sdb.search(args); },
+  async warm({ table }) { return sdb.warm(table); },
   async query({ sql, params }) { return db.queryRaw(sql, params); },
   async stats() { return db.stats(); },
   async log() { return db.log(); },
@@ -33,4 +36,6 @@ const handlers = {
   async close() { if (db) await db.close(); db = null; sdb = null; return true; },
 };
 // Serial: the VFS counter deltas of a search must belong to that search alone.
-serve(self, handlers, { serial: true });
+// Warm-ups are background work: a search that arrives while they are queued
+// runs first (one that is already running is not interrupted).
+serve(self, handlers, { serial: true, priority: (method) => (method === 'warm' ? 1 : 0) });

@@ -376,3 +376,38 @@ int lpg_scan(LpReader *r, uint32_t root, lpg_scan_cb cb, void *ctx) {
   free(cur);
   return rc;
 }
+
+int lpg_warm_interior(LpReader *r, uint32_t root, int64_t est_leaves, int max_pages) {
+  if (!r->ok || !root) return -1;
+  int ncur = 1, total = 0, rc = SQLITE_OK;
+  uint32_t *cur = (uint32_t *)malloc(sizeof(uint32_t));
+  if (!cur) return -1;
+  cur[0] = root;
+  for (int depth = 0; ncur > 0 && depth < 24; depth++) {
+    if (depth > 0 && (ncur > max_pages || (int64_t)ncur * 16 > est_leaves)) break;
+    uint8_t **bufs = (uint8_t **)malloc(sizeof(uint8_t *) * ncur);
+    char *owned = (char *)malloc(ncur);
+    int ncap = 64, nn = 0, np = ncur;
+    uint32_t *nxt = (uint32_t *)malloc(sizeof(uint32_t) * ncap);
+    if (!bufs || !owned || !nxt) { free(bufs); free(owned); free(nxt); rc = SQLITE_NOMEM; break; }
+    int before = r->tn;
+    rc = read_round(r, cur, &np, bufs, owned);
+    total += r->tn - before;
+    for (int i = 0; i < np && rc == SQLITE_OK; i++) {
+      const uint8_t *page = bufs[i];
+      int ho = cur[i] == 1 ? 100 : 0, nc = (int)g2(page + ho + 3);
+      if (page[ho] != 0x05) continue;               /* a leaf: nothing below */
+      if (owned[i]) cache_put(r, cur[i], page);
+      for (int c = 0; c <= nc; c++) {
+        if (nn == ncap) { ncap *= 2; uint32_t *t = (uint32_t *)realloc(nxt, sizeof(uint32_t) * ncap); if (!t) { rc = SQLITE_NOMEM; break; } nxt = t; }
+        nxt[nn++] = c < nc ? g4(page + g2(page + ho + 12 + 2 * c)) : g4(page + ho + 8);
+      }
+    }
+    for (int i = 0; i < np; i++) if (owned[i]) free(bufs[i]);
+    free(bufs); free(owned);
+    free(cur); cur = nxt; ncur = nn;
+    if (rc) break;
+  }
+  free(cur);
+  return rc == SQLITE_OK ? total : -1;
+}

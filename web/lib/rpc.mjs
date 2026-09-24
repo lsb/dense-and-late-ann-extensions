@@ -8,15 +8,28 @@
 // the page receives them through the onNotify callback of that call.
 // Handlers may return {__transfer: [buffers], value} to transfer buffers.
 
-export function serve(port, handlers, { serial = false } = {}) {
-  // serial: run one handler at a time, in arrival order (handlers are async
-  // and would otherwise interleave at every await).
-  let queue = Promise.resolve();
+export function serve(port, handlers, { serial = false, priority = null } = {}) {
+  // serial: run one handler at a time (handlers are async and would otherwise
+  // interleave at every await), in arrival order within a priority level;
+  // priority(method) -> number, lower runs first (default 0 for every call).
+  // A running handler is never interrupted: priorities only reorder the queue.
+  const queue = [];
+  let busy = false;
+  const pump = async () => {
+    if (busy) return;
+    busy = true;
+    while (queue.length) {
+      let best = 0;
+      for (let i = 1; i < queue.length; i++) if (queue[i].prio < queue[best].prio) best = i;
+      const [job] = queue.splice(best, 1);
+      try { await handle(job.e); } catch { /* handle() reports errors to the caller */ }
+    }
+    busy = false;
+  };
   port.onmessage = (e) => {
     if (!serial) return handle(e);
-    const p = queue.then(() => handle(e));
-    queue = p.catch(() => {});
-    return p;
+    queue.push({ e, prio: priority ? priority(e.data && e.data.method) : 0 });
+    return pump();
   };
   const handle = async (e) => {
     const { id, method, args } = e.data || {};

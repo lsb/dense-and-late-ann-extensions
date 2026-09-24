@@ -65,6 +65,8 @@ export declare const DEFAULT_PARAMS: Record<string, SearchParams>;
 export declare const FTS_RANKS: readonly ['bm25c', 'bm25', 'bm25-prefetch', 'bm25-rerank', 'none'];
 export declare function ftsQuery(text: string, mode?: 'or' | 'and'): string;
 export declare function discover(db: Database): Promise<{ indexes: IndexInfo[]; docs: DocsInfo | null }>;
+/** The statement that makes an index load its static data (returns no rows). */
+export declare function warmSql(ix: IndexInfo): string;
 export declare function buildSql(ix: IndexInfo, k: number, params: SearchParams): { sql: string; extra?: unknown[] };
 
 export declare class SearchDb {
@@ -77,5 +79,6 @@ export declare class SearchDb {
   /** Fetch the %_docsize rows of these documents in one batch (httpvfs_warm). */
   warmDocsizes(ix: IndexInfo, ids: number[]): Promise<boolean>;
   search(req: SearchRequest): Promise<SearchResult>;
+  warm(table: string): Promise<{ table: string; kind: IndexInfo['kind']; ms: number; rounds: number; requests: number; bytes: number; skipped?: string }>;
   close(): Promise<void>;
 }

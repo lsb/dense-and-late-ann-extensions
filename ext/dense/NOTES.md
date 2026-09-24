@@ -33,7 +33,9 @@ CREATE VIRTUAL TABLE v USING dense_ann(
     vectors=inline,       -- inline (inside the node row) | table (separate shadow table)
     layout=colocated,     -- colocated (neighbour PQ codes in the node row) | separate | ivf
     nlist=0,              -- ivf: number of lists (0 = 4 sqrt(n))
-    ivf_centroids=f16,    -- ivf: f16 | int8 | pq storage of the cached centroids
+    ivf_centroids=auto,   -- ivf: auto | f16 | int8 | pq storage of the cached centroids
+                          --   (auto: int8 below 1,024 lists, pq from 1,024)
+    codebook=int8,        -- f16 | int8: storage of the cached PQ codebook(s) (format 2)
     ivf_residual=1,       -- ivf: PQ on residuals x - centroid (IVFADC); 0 = on raw vectors
     nprobe=32, rerank_k=64,  -- ivf: query defaults
     metric=cosine,        -- cosine (normalises on insert/query) | ip | l2
@@ -59,6 +61,8 @@ SELECT rowid, distance FROM v
    [AND rerank_k = 64]; -- ivf: candidates reranked with stored vectors (R)
 -- the hidden column `stats` returns per-query JSON:
 --   rounds, pages, bytes, expanded, dist, entry_dist, rerank, fallback, setup_rounds, setup_pages, ms, ...
+
+SELECT rowid FROM v WHERE embedding MATCH 'warm'; -- load the cached head now; returns no rows
 
 SELECT embedding FROM v WHERE rowid = ?;        -- stored vector as float32 (NULL with store_vectors=none)
 DELETE FROM v WHERE rowid = ?;  UPDATE ...;     -- supported (see "Updates")
@@ -495,6 +499,42 @@ The script:
 - prints the matched-recall table.
 
 Queries are 200 held-out documents 1,000,000–1,000,199 regenerated from the deterministic word stream (`bench.heldout_docs`), plus 200 single words. It takes about 1–1.5 h on this machine and peaks around 6 GB of disk.
+
+## Per-connection static data (2026-09-24)
+
+Every new connection first loads the *index head*: the PQ codebook plus the entry set (graph) or the coarse centroids and list directory (IVF). On a phone this is most of the first query's cost, so it was shrunk and made loadable ahead of time.
+
+- **`MATCH 'warm'`.** `SELECT rowid FROM v WHERE embedding MATCH 'warm'` loads the head and returns no rows. The browser client runs it in the background while the query encoder loads (`web/NOTES.md`), so the first search no longer waits for it.
+- **`codebook=int8` (new default, format 2).** Each of the 64 sub-quantisers stores a float32 scale and its 256 × 6 values as int8, 98.6 KB instead of 196.6 KB as float16. The trained codebook is rounded to the stored values *before* encoding, so codes and query-time tables agree. The same applies to the centroid-PQ codebook of `ivf_centroids=pq`.
+- **`ivf_centroids=auto` (new default).** `int8` below 1,024 lists, `pq` from 1,024 lists (where 64-byte codes plus a 98.6 KB codebook become smaller than 388 B per int8 centroid).
+- **Format.** The head format is the config key `format` (2 when written by this build) with `codebook` giving the codebook type. An index without these keys (format 1) is read as before: float16 codebooks. A build that finds a newer format refuses with `dense_ann: index format N is not supported by this build`. Older builds cannot read an int8 codebook (they report that the index head cannot be loaded); build with `codebook=f16` for them.
+
+Measured with `bench/static_eval.py` (one index per database, built with the matrix parameters; all 2,000 queries of each corpus for quality; 40 cold queries through the WASM build, each on a new connection, replayed through netsim; p50):
+
+| Corpus | Index | Head | Head KB | Config | nDCG@10 | R@10 vs exact | Cold rounds | Cold KB | 4g h1 ms | 4g h2 ms | lte h1 ms | lte h2 ms |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| llm-10k | graph | f16 codebook (before) | 264 | ef 64 | 0.587 | 0.984 | 9 | 596 | 3,575 | 2,086 | 1,669 | 1,037 |
+| llm-10k | graph | **int8 codebook** | **168** | ef 64 | 0.587 | 0.984 | 9 | 492 | 3,468 | 1,978 | 1,597 | 964 |
+| llm-10k | graph | int8, 256 entries | 114 | ef 64 | 0.586 | 0.985 | 9 | 460 | 3,607 | 1,957 | 1,649 | 949 |
+| llm-10k | graph | int8, 4,096 entries | 384 | ef 64 | 0.586 | 0.987 | 8 | 690 | 3,342 | 2,022 | 1,595 | 1,035 |
+| llm-10k | IVF | f16 centroids + codebook (before) | 497 | nprobe 16 | 0.488 | 0.739 | 5 | 774 | 2,352 | 1,612 | 1,175 | 882 |
+| llm-10k | IVF | **int8 centroids + codebook** | **252** | nprobe 16 | 0.487 | 0.739 | 5 | 508 | 2,079 | 1,345 | 990 | 702 |
+| llm-10k | IVF | pq centroids, int8 codebooks | 222 | nprobe 16 | 0.479 | 0.734 | 5 | 472 | 2,033 | 1,306 | 959 | 675 |
+| llm-10k | IVF | f16 (before) | 497 | nprobe 64 | 0.545 | 0.909 | 5 | 976 | 3,432 | 1,814 | 1,655 | 1,018 |
+| llm-10k | IVF | **int8** | 252 | nprobe 64 | 0.544 | 0.909 | 5 | 714 | 3,159 | 1,549 | 1,471 | 839 |
+| words-10k | graph | f16 codebook (before) | 264 | ef 64 | 0.073 | 0.730 | 10 | 608 | 3,752 | 2,265 | 1,747 | 1,117 |
+| words-10k | graph | **int8 codebook** | 168 | ef 64 | 0.072 | 0.730 | 10 | 508 | 3,651 | 2,166 | 1,680 | 1,050 |
+| words-10k | graph | int8, 256 entries | 114 | ef 64 | 0.071 | 0.723 | 10 | 492 | 3,967 | 2,168 | 1,809 | 1,051 |
+| words-10k | graph | int8, 4,096 entries | 384 | ef 64 | 0.078 | 0.806 | 9 | 704 | 3,523 | 2,202 | 1,675 | 1,115 |
+| words-10k | IVF | f16 (before) | 497 | nprobe 64 | 0.071 | 0.802 | 5 | 1,088 | 3,978 | 1,927 | 1,900 | 1,095 |
+| words-10k | IVF | **int8** | 252 | nprobe 64 | 0.071 | 0.801 | 5 | 826 | 3,708 | 1,662 | 1,718 | 916 |
+| words-10k | IVF | pq | 222 | nprobe 64 | 0.070 | 0.794 | 5 | 788 | 3,670 | 1,624 | 1,692 | 890 |
+
+(graph ef 128 and IVF nprobe 16 on words-10k behave the same way; every row is in `results/static/`.)
+
+- **int8 codebooks cost nothing measurable** (nDCG within 0.001, recall against exact search within 0.001) and remove 96 KB from every head: the graph head shrinks 264 → 168 KB, 100 ms less on a cold `4g` query.
+- **int8 IVF centroids are free too** (as on words-10k earlier): with the int8 codebook the IVF head halves (497 → 252 KB) and a cold query is 250–270 ms faster on `4g`. PQ centroids save another 30 KB at 400 lists but lose 0.008 nDCG at nprobe 16, so `auto` keeps int8 at this size.
+- **The entry set is worth its bytes.** 256 entries save 54 KB but cost recall and, under HTTP/1.1, a little time; 4,096 entries (+216 KB) raise recall against exact search on words-10k from 0.730 to 0.806 at ef 64 and save a round. The default stays at 1,024; a deployment that warms the head in the background can afford a larger one (`entry_points=4096`).
 
 ## Comparison with libSQL and sqlite-vec
 

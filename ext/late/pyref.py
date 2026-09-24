@@ -13,6 +13,39 @@ import numpy as np
 LAY_PLAID, LAY_WARP = 1, 2
 
 
+def _varints(blob, p, n):
+    """n LEB128 varints starting at p -> (uint32 array, new p)."""
+    out = np.zeros(n, np.uint32)
+    for i in range(n):
+        x = sh = 0
+        while True:
+            c = blob[p]; p += 1
+            x |= (c & 0x7F) << sh
+            sh += 7
+            if not c & 0x80:
+                break
+        out[i] = x
+    return out, p
+
+
+def decode_centroids(blob, p, K, D, cq):
+    """Stored flat centroids -> (float32 [K, D], new p). cq: 0 f16, 1 int8, 2 int4
+    (int8/int4: float16 scale per centroid, then the values)."""
+    if cq == 0:
+        return np.frombuffer(blob, np.float16, K * D, p).astype(np.float32).reshape(K, D), p + 2 * K * D
+    cb = 2 + (D if cq == 1 else D // 2)
+    raw = np.frombuffer(blob, np.uint8, K * cb, p).reshape(K, cb)
+    scale = raw[:, :2].copy().view(np.float16).astype(np.float32)          # [K, 1]
+    if cq == 1:
+        vals = raw[:, 2:].view(np.int8).astype(np.float32)
+    else:
+        b = raw[:, 2:].astype(np.int16)
+        vals = np.empty((K, D), np.float32)
+        vals[:, 0::2] = (b & 15) - 8
+        vals[:, 1::2] = (b >> 4) - 8
+    return vals * scale, p + K * cb
+
+
 def _stream(con, table):
     return b"".join(r[0] for r in con.execute(f"SELECT data FROM {table} ORDER BY id"))
 
@@ -22,7 +55,7 @@ class Index:
         self.name = name
         blob = _stream(con, f"{name}_meta")
         magic, ver = struct.unpack_from("<II", blob, 0)
-        assert magic == 0x3150544C and ver in (1, 2)
+        assert magic == 0x3150544C and ver in (1, 2, 3)
         (self.dim, self.nbits, self.K, self.layout, self.kbits, self.idbits, self.chunk,
          self.rowid_identity) = struct.unpack_from("<8I", blob, 8)
         self.N, self.T, self.ivf_entries = struct.unpack_from("<3Q", blob, 40)
@@ -36,15 +69,24 @@ class Index:
         if ver >= 2:
             self.G, _ = struct.unpack_from("<II", blob, p)
             p += 8
+        self.cq = 0
+        if ver >= 3:
+            (self.cq,) = struct.unpack_from("<I", blob, p)
+            p += 4
         K, D = self.K, self.dim
         self.ivf_cnt = self.post_cnt = None
         if self.G == 0:
-            self.centroids = np.frombuffer(blob, np.float16, K * D, p).astype(np.float32).reshape(K, D)
-            p += 2 * K * D
-            if self.layout & LAY_PLAID:
-                self.ivf_cnt = np.frombuffer(blob, np.uint32, K, p); p += 4 * K
-            if self.layout & LAY_WARP:
-                self.post_cnt = np.frombuffer(blob, np.uint32, K, p); p += 4 * K
+            self.centroids, p = decode_centroids(blob, p, K, D, self.cq)
+            if ver >= 3:
+                if self.layout & LAY_PLAID:
+                    self.ivf_cnt, p = _varints(blob, p, K)
+                if self.layout & LAY_WARP:
+                    self.post_cnt, p = _varints(blob, p, K)
+            else:
+                if self.layout & LAY_PLAID:
+                    self.ivf_cnt = np.frombuffer(blob, np.uint32, K, p); p += 4 * K
+                if self.layout & LAY_WARP:
+                    self.post_cnt = np.frombuffer(blob, np.uint32, K, p); p += 4 * K
         else:
             G = self.G
             p += 2 * G * D
@@ -53,7 +95,8 @@ class Index:
             cen, ivf, post, q = [], [], [], 0
             for g in range(G):
                 kg = int(start[g + 1] - start[g])
-                cen.append(np.frombuffer(cells, np.float16, kg * D, q).astype(np.float32).reshape(kg, D)); q += 2 * kg * D
+                c, q = decode_centroids(cells, q, kg, D, self.cq)
+                cen.append(c)
                 if self.layout & LAY_PLAID:
                     ivf.append(np.frombuffer(cells, np.uint32, kg, q)); q += 4 * kg
                 if self.layout & LAY_WARP:
@@ -77,6 +120,8 @@ class Index:
 
     def decode(self, codes, residuals):
         """codes [n], residuals uint8 [n, rbytes] -> unit vectors [n, dim]."""
+        if len(codes) == 0:
+            return np.zeros((0, self.dim), np.float32)
         b = self.byte_buckets[residuals].reshape(len(codes), -1)
         v = self.centroids[codes] + self.weights[b]
         return v / np.maximum(np.linalg.norm(v, axis=1, keepdims=True), 1e-12)
