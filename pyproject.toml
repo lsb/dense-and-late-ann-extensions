@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dense-late-ann"
+version = "0.1.0"
+description = "SQLite extensions for dense (dense_ann) and late-interaction (late_plaid) ANN search, and a builder for databases served over HTTP range requests"
+readme = "python/README.md"
+license = "AGPL-3.0-only"
+license-files = ["LICENSE"]
+requires-python = ">=3.9"
+dependencies = []
+classifiers = [
+  "Programming Language :: C",
+  "Programming Language :: Python :: 3",
+  "Topic :: Database",
+  "Operating System :: POSIX :: Linux",
+  "Operating System :: MacOS",
+]
+
+[project.urls]
+Homepage = "https://github.com/lsb/dense-and-late-ann-extensions"
+
+[project.optional-dependencies]
+# Encoding documents and queries (build-db without precomputed vectors, search).
+encoders = ["numpy>=1.22", "onnxruntime>=1.17", "tokenizers>=0.15"]
+# Loading vector files only (build-db with --minilm-npy / --lateon-npy).
+numpy = ["numpy>=1.22"]
+# For Pythons whose sqlite3 module cannot load extensions (e.g. some macOS builds).
+apsw = ["apsw>=3.45"]
+
+[project.scripts]
+dense-late-ann = "dense_late_ann.cli:main"
+
+[tool.setuptools]
+# The package wraps the research code in place: enc/ (encoders) and
+# tools/build_db.py (the database recipe) are installed as subpackages.
+package-dir = { "dense_late_ann" = "python/dense_late_ann", "dense_late_ann.enc" = "enc", "dense_late_ann.tools" = "tools" }
+packages = ["dense_late_ann", "dense_late_ann.enc", "dense_late_ann.tools"]
+include-package-data = false
+
+[tool.setuptools.package-data]
+"dense_late_ann" = ["py.typed"]
+"dense_late_ann.enc" = ["lateon_onnx_config.json"]
+
+[tool.setuptools.exclude-package-data]
+"*" = ["__pycache__/*"]

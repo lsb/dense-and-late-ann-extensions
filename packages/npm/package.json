@@ -1,0 +1,80 @@
+{
+  "name": "dense-late-ann",
+  "version": "0.1.0",
+  "description": "Read-only SQLite in WebAssembly over HTTP range requests, with FTS5, dense ANN (dense_ann) and late-interaction (late_plaid) search and in-browser query encoders",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lsb/dense-and-late-ann-extensions.git",
+    "directory": "packages/npm"
+  },
+  "homepage": "https://github.com/lsb/dense-and-late-ann-extensions#readme",
+  "type": "module",
+  "main": "./index.mjs",
+  "types": "./index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "default": "./index.mjs"
+    },
+    "./search": {
+      "types": "./search/index.d.ts",
+      "default": "./search/index.mjs"
+    },
+    "./search-core": {
+      "types": "./search/search-core.d.ts",
+      "default": "./search/search-core.mjs"
+    },
+    "./encoder": {
+      "types": "./search/encoder-core.d.ts",
+      "default": "./search/encoder-core.mjs"
+    },
+    "./tokenize": "./search/tokenize.mjs",
+    "./dist/*": "./dist/*",
+    "./search/*": "./search/*",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.mjs",
+    "index.d.ts",
+    "sync-fetch.mjs",
+    "sync-fetch-worker.mjs",
+    "dist/*.mjs",
+    "dist/*.wasm",
+    "search/*.mjs",
+    "search/*.d.ts",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "assemble": "node assemble.mjs",
+    "prepack": "node assemble.mjs --check"
+  },
+  "peerDependencies": {
+    "onnxruntime-web": ">=1.30.0 <2",
+    "@huggingface/tokenizers": "^0.2.0"
+  },
+  "peerDependenciesMeta": {
+    "onnxruntime-web": {
+      "optional": true
+    },
+    "@huggingface/tokenizers": {
+      "optional": true
+    }
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "sideEffects": false,
+  "keywords": [
+    "sqlite",
+    "wasm",
+    "httpvfs",
+    "range-requests",
+    "vector-search",
+    "ann",
+    "colbert",
+    "plaid",
+    "fts5"
+  ],
+  "license": "AGPL-3.0-only"
+}

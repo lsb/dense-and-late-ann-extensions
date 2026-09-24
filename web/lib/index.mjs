@@ -15,23 +15,23 @@
 
 import { client } from './rpc.mjs';
 import { fetchBytes } from './fetch-cache.mjs';
+import { DEFAULT_PARAMS, paramsKey } from './search-core.mjs';
+import * as PATHS from './paths.mjs';
+
+export { DEFAULT_PARAMS };
 
 const HERE = new URL('.', import.meta.url);
 
-/** Default query parameters per index kind (see the extensions' NOTES.md). */
-export const DEFAULT_PARAMS = {
-  fts: { mode: 'or' },
-  'dense:graph': { ef: 64, beam: 16, rerank: 2 },
-  'dense:ivf': { nprobe: 16, rerank_k: 64, rerank: 2 },
-  late: { nprobe: 8, layout: 'warp', stoplist: 0.02, rerank: 64 },
-};
+/** Absolute URL of an option (relative ones resolve against the page). */
+function absUrl(v, name) {
+  if (!v) throw new Error(`openIndex: no default for the ${name} option here; pass it explicitly`);
+  return new URL(v, globalThis.location?.href).href;
+}
 
 export const MODEL_FILES = {
   minilm: { model: 'models/minilm-l6-v2/model_qint8_arm64.onnx', tokenizer: 'models/minilm-l6-v2/tokenizer.json' },
   lateon: { model: 'models/lateon-code-edge/model_int8.onnx', tokenizer: 'models/lateon-code-edge/tokenizer.json' },
 };
-
-function paramsKey(ix) { return ix.kind === 'dense' ? `dense:${ix.layout}` : ix.kind; }
 
 function label(ix) {
   if (ix.kind === 'fts') return 'FTS5 (bm25)';
@@ -57,14 +57,16 @@ export class SearchIndex {
       const base = this.opts.modelBase;
       e = this.encoders[which] = { worker, call, listeners: new Set() };
       // Both encoder workers use the same 14 MB ONNX Runtime binary: fetch it once.
-      this.ortWasm ||= fetchBytes(new URL('../vendor/ort/ort-wasm-simd-threaded.wasm', HERE).href,
+      const ortBase = absUrl(this.opts.ortBase || PATHS.ortBase, 'ortBase');
+      this.ortWasm ||= fetchBytes(new URL('ort-wasm-simd-threaded.wasm', ortBase).href,
         { cache: this.opts.modelCache !== false });
       e.loaded = this.ortWasm.then(async (wasm) => ({ ...await call('load', {
         ortWasm: wasm.bytes,
         which,
         modelUrl: new URL(this.opts.models?.[which]?.model || MODEL_FILES[which].model, base).href,
         tokenizerUrl: new URL(this.opts.models?.[which]?.tokenizer || MODEL_FILES[which].tokenizer, base).href,
-        ortBase: new URL('../vendor/ort/', HERE).href,
+        ortBase,
+        tokenizersModule: absUrl(this.opts.tokenizersModule || PATHS.tokenizersModule, 'tokenizersModule'),
         numThreads: this.opts.encoderThreads || 1,
         cache: this.opts.modelCache !== false,
       }, (p) => { for (const l of e.listeners) l(p); }),
@@ -151,22 +153,24 @@ export class SearchIndex {
  * opts:
  *   variant          SQLite WASM build: 'auto' (JSPI where supported, else Asyncify) | 'asyncify' | 'jspi'
  *   pageCacheBytes, blockSize, readaheadBytes, maxParallel   passed to wasm/pkg open()
- *   sqliteModule     URL of wasm/pkg/index.mjs (default: ../../wasm/pkg/index.mjs)
- *   modelBase        base URL for models/ (default: the repository root, ../../)
+ *   sqliteModule     URL of the SQLite module (default: see paths.mjs)
+ *   ortBase          directory URL of onnxruntime-web's dist files (default: see paths.mjs)
+ *   tokenizersModule URL of @huggingface/tokenizers' ES module (default: see paths.mjs)
+ *   modelBase        base URL for the MODEL_FILES paths (default: see paths.mjs)
  *   models           {minilm: {model, tokenizer}, lateon: {…}} relative to modelBase
  *   preload          ['minilm', 'lateon']: start loading encoders now
  *   modelCache       keep model files in Cache Storage (default true)
  *   encoderThreads   ONNX Runtime threads (needs cross-origin isolation; default 1)
  */
 export async function openIndex(url, opts = {}) {
-  const ix = new SearchIndex({ modelBase: new URL('../../', HERE).href, ...opts });
+  const ix = new SearchIndex({ ...opts, modelBase: absUrl(opts.modelBase || PATHS.modelBase || './', 'modelBase') });
   for (const w of opts.preload || []) ix.loadEncoder(w).catch(() => {});
   ix.sqliteWorker = new Worker(new URL('sqlite-worker.mjs', HERE), { type: 'module', name: 'sqlite' });
   ix.sql = client(ix.sqliteWorker);
   const { variant = 'auto', pageCacheBytes = 16 << 20, blockSize, readaheadBytes, maxParallel } = opts;
   const info = await ix.sql('open', {
     url: new URL(url, globalThis.location?.href).href,
-    sqliteModule: opts.sqliteModule || new URL('../../wasm/pkg/index.mjs', HERE).href,
+    sqliteModule: absUrl(opts.sqliteModule || PATHS.sqliteModule, 'sqliteModule'),
     variant, pageCacheBytes, blockSize, readaheadBytes, maxParallel,
   });
   ix.url = url;

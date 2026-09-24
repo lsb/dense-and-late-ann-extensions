@@ -1,0 +1,69 @@
+# Build the native and WebAssembly targets, run the repository's tests, and
+# test the Python and npm packages the way a user would install them.
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  EMSCRIPTEN_VERSION: 6.0.10   # wasm/NOTES.md, "Pinned versions"
+  PLAYWRIGHT_VERSION: 1.56.1
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Cache the SQLite amalgamation
+        uses: actions/cache@v4
+        with:
+          path: build/sqlite
+          key: sqlite-${{ hashFiles('wasm/scripts/fetch-sqlite.sh') }}
+
+      - name: Set up Emscripten
+        uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: ${{ env.EMSCRIPTEN_VERSION }}
+          actions-cache-folder: emsdk-cache
+
+      - name: Install Playwright and Chromium
+        run: |
+          # The tests default to /opt/pw-browsers (the development container)
+          echo "PLAYWRIGHT_BROWSERS_PATH=$RUNNER_TEMP/pw-browsers" >> "$GITHUB_ENV"
+          export PLAYWRIGHT_BROWSERS_PATH="$RUNNER_TEMP/pw-browsers"
+          npm install -g playwright@${PLAYWRIGHT_VERSION}
+          npx -y playwright@${PLAYWRIGHT_VERSION} install --with-deps chromium
+
+      - name: Build (SQLite, native, WebAssembly)
+        run: |
+          make sqlite
+          make -j"$(nproc)" native
+          make -j"$(nproc)" wasm
+
+      - name: Test native, Node and Chromium
+        run: make test
+
+      - name: Python package (fresh venv, build a database, query it)
+        run: |
+          python -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install ".[encoders]"
+          "$RUNNER_TEMP/venv/bin/python" python/tests/test_package.py \
+            --corpus data/corpora/llm-100.txt --models models --out-dir "$RUNNER_TEMP/dla"
+
+      - name: npm package (pack, install in a fresh project, Node and Chromium)
+        run: packages/npm/test/run.sh "$RUNNER_TEMP/dla" models

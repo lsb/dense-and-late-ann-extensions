@@ -1,0 +1,14 @@
+# sdist contents for the Python package (see setup.py and docs/INSTALL.md)
+include LICENSE setup.py pyproject.toml python/README.md
+recursive-include ext/dense *.c *.h
+recursive-include ext/late *.c *.h
+prune ext/dense/test
+prune ext/late/test
+prune ext/dense/build
+prune ext/late/build
+include wasm/src/httpvfs.h
+include wasm/scripts/fetch-sqlite.sh
+include enc/*.py enc/lateon_onnx_config.json
+include tools/*.py
+recursive-include python *.py py.typed
+global-exclude __pycache__ *.pyc *.so *.dylib

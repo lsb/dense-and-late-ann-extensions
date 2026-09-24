@@ -3,7 +3,7 @@
 // models load and run in parallel.
 //
 // Methods:
-//   load({which, modelUrl, tokenizerUrl, ortBase, numThreads, cache}) -> load stats
+//   load({which, modelUrl, tokenizerUrl, ortBase, tokenizersModule, numThreads, cache}) -> load stats
 //   encode({text}) -> {ids, vectors (Float32Array, transferred), n, dim, tokenizeMs, inferMs, ms}
 
 import { serve } from './rpc.mjs';
@@ -13,13 +13,13 @@ import { fetchBytes } from './fetch-cache.mjs';
 let encoder = null;
 let loading = null;
 
-async function load({ which, modelUrl, tokenizerUrl, ortBase, ortWasm, numThreads = 1, cache = true }, notify) {
+async function load({ which, modelUrl, tokenizerUrl, ortBase, tokenizersModule, ortWasm, numThreads = 1, cache = true }, notify) {
   const t0 = performance.now();
   const ort = await import(new URL('ort.wasm.min.mjs', ortBase).href);
   ort.env.wasm.wasmPaths = ortBase;
   ort.env.wasm.numThreads = self.crossOriginIsolated ? numThreads : 1;
   ort.env.wasm.proxy = false;
-  const { Tokenizer } = await import('../vendor/tokenizers.min.mjs');
+  const { Tokenizer } = await import(tokenizersModule || '../vendor/tokenizers.min.mjs');
   const tLib = performance.now() - t0;
   // The ONNX Runtime WebAssembly binary (14 MB) is fetched once by the page
   // (through the same cache) and handed to both encoder workers.

@@ -1,0 +1,9 @@
+# Copied in by assemble.mjs from wasm/pkg and web/lib
+/index.mjs
+/sync-fetch.mjs
+/sync-fetch-worker.mjs
+/dist/
+/LICENSE
+/search/*.mjs
+!/search/paths.mjs
+/*.tgz

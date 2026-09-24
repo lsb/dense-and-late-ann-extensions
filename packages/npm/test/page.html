@@ -1,0 +1,43 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>dense-late-ann smoke test</title>
+<script type="module">
+// Served from the root of a project with dense-late-ann installed; the
+// package is imported by URL from node_modules, as a site without a bundler
+// would do.
+import { open } from '/node_modules/dense-late-ann/index.mjs';
+import { SearchDb } from '/node_modules/dense-late-ann/search/search-core.mjs';
+import { openIndex } from '/node_modules/dense-late-ann/search/index.mjs';
+
+const SYSTEMS = ['fts', 'dense_graph', 'dense_ivf', 'late'];
+
+window.run = async () => {
+  const ref = await (await fetch('reference.json')).json();
+  const exact = {};
+  for (const variant of ['asyncify', 'jspi']) {
+    const db = await open('search.db', { variant });
+    const s = await SearchDb.open(db);
+    exact[variant] = [];
+    for (const q of ref.queries) {
+      const r = {};
+      for (const t of SYSTEMS) {
+        const vector = t === 'late' ? Float32Array.from(q.lateon) : t === 'fts' ? undefined : Float32Array.from(q.minilm);
+        r[t] = (await s.search({ table: t, text: q.text, vector, k: 10 })).rows.map((x) => x.id);
+      }
+      exact[variant].push(r);
+    }
+    await db.close();
+  }
+  // Workers, in-browser encoders; models are served from ./models/.
+  const ix = await openIndex('search.db', { preload: ['minilm', 'lateon'], modelBase: new URL('./', location.href).href });
+  const encoded = [];
+  for (const q of ref.queries) {
+    const r = {};
+    for (const t of SYSTEMS) r[t] = (await ix.search(q.text, { system: t, k: 10 })).rows.map((x) => x.id);
+    encoded.push(r);
+  }
+  const variant = ix.variant;
+  await ix.close();
+  return { exact, encoded, variant };
+};
+</script>

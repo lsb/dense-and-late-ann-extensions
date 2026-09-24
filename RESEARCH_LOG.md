@@ -308,3 +308,20 @@ References for exhaustive search on llm-10k: MiniLM exact nDCG@10 = 0.586, LateO
 - *Session start dominates the first query.* A cold query costs 1.6–3.3 s on `4g` for every method, mostly per-connection static data (late centroids ≈1.7 MB, IVF centroids, PQ codebook and entry set). Within a session, IVF answers in about 0.4 s and the graph in about 1.2 s.
 - *Session caching can make the "warm" regime look free.* At 10k documents the 4 MiB block cache ends up holding much of the hot data, so warm-session numbers depend on query order and cache size; the "Ext. KB" column shows the extension's reads before the cache.
 - *Exhaustive dense search in the extension (`exact=1`) reads one page per round* (about 2,000 sequential rounds at 10k), so it is useful only as a quality baseline.
+
+## 2026-09-24 — Packaging (`docs/INSTALL.md`)
+
+The project is distributed through two packages that share one database format, both provisionally named `dense-late-ann`. Nothing has been published.
+- **npm package** (`packages/npm/`), 2.2 MB packed. It contains the three SQLite WASM builds, the JS API and the search client, with hand-written TypeScript declarations. `onnxruntime-web` and `@huggingface/tokenizers` are optional peer dependencies, needed only for in-browser query encoding.
+- **Python package** (`pyproject.toml`, `python/dense_late_ann/`). It compiles both extensions as loadable modules and provides `load(conn)` for `sqlite3` or APSW connections, plus a `dense-late-ann` command (`check`, `build-db`, `search`, `encode-query`) that wraps `tools/build_db.py` and `enc/`. Models are not bundled.
+
+**Tested from scratch.**
+- *Python.* `pip install .` in a fresh virtualenv, then `dense-late-ann build-db` on llm-100, gave top-10 lists identical to the benchmark database.
+- *npm.* The packed tarball was installed into a fresh project; its results were identical to native in Node and Chromium.
+- *sqlite3 shell.* The extensions load in the shell with `.load`.
+
+**Workflows.**
+- `.github/workflows/ci.yml` builds native and WASM and runs all tests.
+- `.github/workflows/release.yml` builds wheels (cibuildwheel for Linux and macOS), the sdist and the npm tarball on version tags. Publishing stays off until credentials are configured and `PUBLISH_PACKAGES` is set. Neither workflow has been run on GitHub yet.
+
+Windows is unsupported because index building uses pthreads.
