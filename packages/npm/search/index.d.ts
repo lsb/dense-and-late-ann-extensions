@@ -23,7 +23,8 @@ export interface OpenIndexOptions extends Pick<OpenOptions, 'pageCacheBytes' | '
   encoderThreads?: number;
   /**
    * Load indexes' per-connection static data in the background: 'auto' (default:
-   * the indexes of each encoder as soon as it starts loading), true (every index),
+   * the index search({system: 'dense' | 'late'}) uses, as soon as its encoder
+   * starts loading), true (every index),
    * false, or a list of systems / tables.
    */
   warm?: 'auto' | boolean | string[];

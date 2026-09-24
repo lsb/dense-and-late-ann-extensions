@@ -66,14 +66,16 @@ export class SearchIndex {
     }));
   }
 
-  /** opts.warm = 'auto': warm the indexes an encoder serves when it starts loading. */
+  /**
+   * opts.warm = 'auto': when an encoder starts loading, warm the index that
+   * search({system: 'dense' | 'late'}) would use. Only that one: a warm-up
+   * that is running cannot be interrupted, so warming an index the page never
+   * queries (say the graph when it uses IVF) would delay its first search.
+   */
   _autoWarm(which) {
     if ((this.opts.warm ?? 'auto') !== 'auto' || !this.indexes) return;
     const kind = which === 'minilm' ? 'dense' : 'late';
-    // smallest static data first: the graph's entry set and codebook, then IVF
-    const order = (i) => (i.layout === 'graph' ? 0 : 1);
-    const idx = this.indexes.filter((i) => i.kind === kind).sort((a, b) => order(a) - order(b));
-    if (idx.length) this.warm(idx.map((i) => i.table));
+    if (this.indexes.some((i) => i.kind === kind)) this.warm([this.resolve(kind).table]);
   }
 
   /**
