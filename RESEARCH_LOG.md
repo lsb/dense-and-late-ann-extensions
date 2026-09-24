@@ -267,3 +267,11 @@ Setup per connection:
 - *Recall@10 against exact search is partly noise here.* Random-word documents are near-ties, so exact search's own top 10 depends on small encoder differences. A comparison against relevance labels on the LLM corpus should decide between the layouts.
 
 `ext/dense/run_words1m.sh` runs both layouts on the real 1M embeddings once they exist.
+
+## 2026-09-24 — LLM corpus finished
+
+All 10,000 paragraphs were generated (9,995 ended with the end-of-turn token within 256 new tokens; mean 127 tokens). 39 paragraphs are shorter than 50 words and are used whole. `scripts/make_llm_corpus.py` wrote `data/corpora/llm-{100,10k}.txt` (document *i* = the first 50 words of the paragraph about word *i*) and `data/queries/llm-{100,10k}.jsonl`, with two known-item query kinds per document:
+- **word**: the word itself;
+- **llmq**: the model's own search query.
+
+The generated queries are short (3.1 words on average) and often vague. Common ones are "creative ideas" (70 times), "historical significance" (68) and "negative impact" (68). 21.8 % contain the target word despite the instruction. Because each has exactly one relevant document, llmq is a hard, noisy known-item task; it resembles what a small model produces rather than what a careful user types. The LLM corpora were encoded with both models, one document at a time, into `data/emb/llm-{100,10k}.*`.
