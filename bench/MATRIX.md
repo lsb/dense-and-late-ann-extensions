@@ -78,6 +78,7 @@ python3 bench/matrix.py report
 
 - **Warm sessions cache a lot.** At 10k the VFS block cache (4 MiB) holds a large share of the smaller indexes after a few hundred queries: FTS5 needs 0.2–0.3 rounds per warm query, and at llm-10k the warp posting stream (about 8 MB) is served almost entirely from cache (3 KB transferred against 125 KB read by the extension). The *Ext. KB* column shows the extension's own reads before the cache.
 - **The dense exhaustive baseline (`exact=1`) reads its vector table one page per round** (2,006 rounds per query at 10k): the scan is neither prefetched nor detected as sequential by readahead. It is a baseline for quality only; over a network it would need batching.
+- **HTTP/1.1 costs a lot, and multi-range requests win it back.** The per-corpus section *HTTP/1.1 with the request budget* re-simulates the traces with `bench/coalesce_eval.py` (the VFS's own planner via ctypes). At 10k on 4g, warm, plain h1 is 1.5–3.4× slower than h2 for the multi-request systems (graph 2,409 vs 1,240 ms at llm-10k; warp + rerank 2,086 vs 622 ms at words-10k). With at most six multi-range requests per round, h1 comes within 1 % of h2. Coalescing with over-fetch recovers only part of the gap.
 - **Cold starts are dominated by static data.** Late interaction's centroid table (1.7 MB at K = 16,384) makes its first query 2.5–3.5 s on 4g even though a warm warp query is 0.2 s.
 
 ## FTS5 ranking

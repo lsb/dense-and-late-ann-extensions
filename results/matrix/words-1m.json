@@ -1,0 +1,256 @@
+{
+ "corpus": "words-1m",
+ "n_docs": 1000000,
+ "db_file": "words-1m--fts.db",
+ "db_bytes": 723120128,
+ "sizes": {
+  "docs": 508403712,
+  "fts": 214712320,
+  "schema": 4096
+ },
+ "tables": {
+  "docs": {
+   "pages": 124122,
+   "bytes": 508403712,
+   "payload": 455485068,
+   "owner": "docs"
+  },
+  "fts_config": {
+   "pages": 1,
+   "bytes": 4096,
+   "payload": 11,
+   "owner": "fts"
+  },
+  "fts_data": {
+   "pages": 49740,
+   "bytes": 203735040,
+   "payload": 200870994,
+   "owner": "fts"
+  },
+  "fts_docsize": {
+   "pages": 2454,
+   "bytes": 10051584,
+   "payload": 4000000,
+   "owner": "fts"
+  },
+  "fts_idx": {
+   "pages": 225,
+   "bytes": 921600,
+   "payload": 758677,
+   "owner": "fts"
+  },
+  "sqlite_schema": {
+   "pages": 1,
+   "bytes": 4096,
+   "payload": 546,
+   "owner": "schema"
+  }
+ },
+ "index_params": {
+  "fts": ""
+ },
+ "build_seconds": {
+  "words-1m--fts.db": {
+   "fts": 51.88986778259277,
+   "vacuum": 6.82688570022583,
+   "finalize": 1.049041748046875e-05
+  }
+ },
+ "k": 10,
+ "k_deep": 100,
+ "n_queries": 500,
+ "n_queries_in_set": 2000,
+ "query_kinds": {
+  "known": 250,
+  "word": 250
+ },
+ "encode_ms": {
+  "minilm": {
+   "p50": 2.1805000000000003,
+   "p95": 3.4356499999999994,
+   "threads": 1
+  },
+  "lateon": {
+   "p50": 1.542,
+   "p95": 2.0774499999999994,
+   "threads": 1
+  }
+ },
+ "profiles": [],
+ "configs": [
+  {
+   "id": "fts-bm25",
+   "label": "FTS5 bm25 (AND)",
+   "system": "FTS5",
+   "index": "fts",
+   "index_bytes": 214712320,
+   "exhaustive": false,
+   "sql": "SELECT rowid AS id FROM {table} WHERE {table} MATCH :q ORDER BY rank LIMIT :k",
+   "quality": {
+    "all": {
+     "recall@10": 0.5073515838278599,
+     "success@1": 0.996,
+     "mrr@10": 0.998,
+     "ndcg@10": 0.992287893251186,
+     "auc@100": 0.7867006701012779,
+     "r10_vs_exact": 1.0
+    },
+    "n": 500,
+    "known": {
+     "recall@10": 1.0,
+     "success@1": 1.0,
+     "mrr@10": 1.0,
+     "ndcg@10": 1.0,
+     "auc@100": 1.0,
+     "r10_vs_exact": 1.0,
+     "n": 250
+    },
+    "word": {
+     "recall@10": 0.014703167655719954,
+     "success@1": 0.992,
+     "mrr@10": 0.996,
+     "ndcg@10": 0.984575786502372,
+     "auc@100": 0.5734013402025557,
+     "r10_vs_exact": 1.0,
+     "n": 250
+    }
+   },
+   "quality_ref": "fts-bm25",
+   "native_ms_p50": 1.0985,
+   "wasm_native_agreement": null
+  },
+  {
+   "id": "fts-bm25-or",
+   "label": "FTS5 bm25 (OR)",
+   "system": "FTS5",
+   "index": "fts",
+   "index_bytes": 214712320,
+   "exhaustive": false,
+   "sql": "SELECT rowid AS id FROM {table} WHERE {table} MATCH :q ORDER BY rank LIMIT :k",
+   "quality": {
+    "all": {
+     "recall@10": 0.5073515838278599,
+     "success@1": 0.996,
+     "mrr@10": 0.998,
+     "ndcg@10": 0.992287893251186,
+     "auc@100": 0.7867006701012779,
+     "r10_vs_exact": 1.0
+    },
+    "n": 500,
+    "known": {
+     "recall@10": 1.0,
+     "success@1": 1.0,
+     "mrr@10": 1.0,
+     "ndcg@10": 1.0,
+     "auc@100": 1.0,
+     "r10_vs_exact": 1.0,
+     "n": 250
+    },
+    "word": {
+     "recall@10": 0.014703167655719954,
+     "success@1": 0.992,
+     "mrr@10": 0.996,
+     "ndcg@10": 0.984575786502372,
+     "auc@100": 0.5734013402025557,
+     "r10_vs_exact": 1.0,
+     "n": 250
+    }
+   },
+   "quality_ref": "fts-bm25-or",
+   "native_ms_p50": 2.9785,
+   "wasm_native_agreement": null
+  },
+  {
+   "id": "fts-bm25c-or",
+   "label": "FTS5 bm25c (OR)",
+   "system": "FTS5",
+   "index": "fts",
+   "index_bytes": 214712320,
+   "exhaustive": false,
+   "sql": "SELECT rowid AS id FROM {table} WHERE {table} MATCH :q AND rank MATCH 'bm25c()' ORDER BY rank LIMIT :k",
+   "quality": {
+    "all": {
+     "recall@10": 0.5073515838278599,
+     "success@1": 0.996,
+     "mrr@10": 0.998,
+     "ndcg@10": 0.992287893251186,
+     "auc@100": 0.7867006701012779,
+     "r10_vs_exact": 1.0
+    },
+    "n": 500,
+    "known": {
+     "recall@10": 1.0,
+     "success@1": 1.0,
+     "mrr@10": 1.0,
+     "ndcg@10": 1.0,
+     "auc@100": 1.0,
+     "r10_vs_exact": 1.0,
+     "n": 250
+    },
+    "word": {
+     "recall@10": 0.014703167655719954,
+     "success@1": 0.992,
+     "mrr@10": 0.996,
+     "ndcg@10": 0.984575786502372,
+     "auc@100": 0.5734013402025557,
+     "r10_vs_exact": 1.0,
+     "n": 250
+    }
+   },
+   "quality_ref": "fts-bm25-or",
+   "native_ms_p50": 0.48550000000000004,
+   "wasm_native_agreement": null
+  },
+  {
+   "id": "fts-unranked",
+   "label": "FTS5 unranked (AND)",
+   "system": "FTS5",
+   "index": "fts",
+   "index_bytes": 214712320,
+   "exhaustive": false,
+   "sql": "SELECT rowid AS id FROM {table} WHERE {table} MATCH :q LIMIT :k",
+   "quality": {
+    "all": {
+     "recall@10": 0.5073396256813727,
+     "success@1": 0.99,
+     "mrr@10": 0.995,
+     "ndcg@10": 0.9909909864888309,
+     "auc@100": 0.7866976781953581,
+     "r10_vs_exact": 0.999
+    },
+    "n": 500,
+    "known": {
+     "recall@10": 1.0,
+     "success@1": 1.0,
+     "mrr@10": 1.0,
+     "ndcg@10": 1.0,
+     "auc@100": 1.0,
+     "r10_vs_exact": 1.0,
+     "n": 250
+    },
+    "word": {
+     "recall@10": 0.014679251362745366,
+     "success@1": 0.98,
+     "mrr@10": 0.99,
+     "ndcg@10": 0.9819819729776619,
+     "auc@100": 0.5733953563907159,
+     "r10_vs_exact": 0.998,
+     "n": 250
+    }
+   },
+   "quality_ref": "fts-bm25",
+   "native_ms_p50": 0.0615,
+   "wasm_native_agreement": null
+  }
+ ],
+ "references": [],
+ "encoders": {
+  "minilm": "models/minilm-l6-v2/model_w8.onnx",
+  "lateon": "models/lateon-code-edge/model_w8.onnx"
+ },
+ "sim_vs_real": null,
+ "coalesce": null,
+ "split": [
+  "words-1m--fts.db"
+ ]
+}
