@@ -9,7 +9,8 @@
 //     native (Python + build/native) search with the same query vectors.
 // Environment: WEB_TEST_DB (database path relative to the repo root; default
 // build/web/words-10k.db, else build/matrix/words-100.db), WEB_TEST_REPORT
-// (JSON report path; default build/web/test-report.json).
+// (JSON report path; default build/web/test-report.json), WEB_TEST_PARAMS (extra
+// page URL parameters, e.g. "maxRequests=0" or "multipart=1").
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -45,10 +46,12 @@ before(async () => {
   page = await browser.newPage();
   page.on('pageerror', (e) => console.log('# pageerror', e.message));
   // A fresh browser profile: models are downloaded, not taken from Cache Storage.
-  await page.goto(`${server.url}/web/?db=../${DB}`);
+  await page.goto(`${server.url}/web/?db=../${DB}${process.env.WEB_TEST_PARAMS ? '&' + process.env.WEB_TEST_PARAMS : ''}`);
   await page.waitForFunction(() => window.demo && window.demo.ready, null, { timeout: 60000 });
   await page.evaluate(() => window.demo.ready);
   report.userAgent = await page.evaluate(() => navigator.userAgent);
+  report.params = process.env.WEB_TEST_PARAMS || '';
+  report.netAtOpen = await page.evaluate(() => window.demo.ix.net);
 });
 
 after(async () => {
@@ -165,6 +168,14 @@ test('one query per system through the page', async () => {
   }
   // The WASM extensions must return exactly what the native build returns
   // for the same query vector (and FTS5 for the same MATCH expression).
+  // The request budget: netsim speaks HTTP/1.1, so 'auto' must pick 6.
+  const net = await page.evaluate(() => window.demo.ix.sql('netState'));
+  report.net = net;
+  console.log(`# request budget: ${JSON.stringify(net)}`);
+  if (!process.env.WEB_TEST_PARAMS?.includes('maxRequests')) {
+    assert.equal(net.protocol, 'http/1.1');
+    assert.equal(net.maxRequests, 6);
+  }
   const got = native(nat.map(({ sql, args, vector }) => ({ sql, args, vector })));
   nat.forEach((q, i) => assert.deepEqual(q.ids, got[i], `${q.sys}: browser and native results differ`));
 });
