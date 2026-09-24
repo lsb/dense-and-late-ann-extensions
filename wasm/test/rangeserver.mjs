@@ -4,6 +4,11 @@
 // netsim/rangeserver.py.
 //
 //   node wasm/test/rangeserver.mjs --dir build --port 0 [--latency-ms 50] [--isolate]
+//        [--multi refuse|ignore|first]
+// Multi-range requests (bytes=a-b,c-d) are not supported; --multi picks how
+// that shows, as with real servers: 'refuse' answers 416 (default), 'ignore'
+// sends the whole file with 200 (as S3 and many CDNs do), 'first' serves only
+// the first range with 206.
 //   import { startServer } from './rangeserver.mjs'
 import http from 'node:http';
 import fs from 'node:fs';
@@ -12,7 +17,7 @@ import path from 'node:path';
 const TYPES = { '.html': 'text/html', '.mjs': 'text/javascript', '.js': 'text/javascript',
   '.wasm': 'application/wasm', '.json': 'application/json' };
 
-export function startServer({ dir, port = 0, latencyMs = 0, isolate = false, host = '127.0.0.1' }) {
+export function startServer({ dir, port = 0, latencyMs = 0, isolate = false, host = '127.0.0.1', multi = 'refuse' }) {
   const root = path.resolve(dir);
   const log = [];
   const server = http.createServer((req, res) => {
@@ -37,10 +42,14 @@ export function startServer({ dir, port = 0, latencyMs = 0, isolate = false, hos
     const size = fs.statSync(file).size;
     headers['Content-Type'] = TYPES[path.extname(file)] || 'application/octet-stream';
     let status = 200, start = 0, end = size - 1;
-    const range = req.headers.range;
+    let range = req.headers.range;
+    if (range && range.includes(',')) {
+      if (multi === 'ignore') range = undefined;
+      else if (multi === 'first') range = range.split(',')[0];
+    }
     if (range) {
       const m = /^bytes=(\d*)-(\d*)$/.exec(range);
-      if (!m) { res.writeHead(416, headers); res.end(); return; }
+      if (!m) { log.push({ path: url.pathname, status: 416, t: performance.now(), range: req.headers.range }); res.writeHead(416, headers); res.end(); return; }
       if (m[1] === '') { start = Math.max(0, size - Number(m[2])); }
       else { start = Number(m[1]); if (m[2] !== '') end = Math.min(Number(m[2]), size - 1); }
       if (start >= size || start > end) {
@@ -51,7 +60,7 @@ export function startServer({ dir, port = 0, latencyMs = 0, isolate = false, hos
       headers['Content-Range'] = `bytes ${start}-${end}/${size}`;
     }
     headers['Content-Length'] = String(end - start + 1);
-    log.push({ path: url.pathname, start, end, t: performance.now() });
+    log.push({ path: url.pathname, start, end, t: performance.now(), range: req.headers.range });
     const send = () => {
       res.writeHead(status, headers);
       if (req.method === 'HEAD') { res.end(); return; }
@@ -74,6 +83,6 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   const args = process.argv.slice(2);
   const get = (k, d) => { const i = args.indexOf(k); return i >= 0 ? args[i + 1] : d; };
   const s = await startServer({ dir: get('--dir', '.'), port: Number(get('--port', 8000)),
-    latencyMs: Number(get('--latency-ms', 0)), isolate: args.includes('--isolate') });
+    latencyMs: Number(get('--latency-ms', 0)), isolate: args.includes('--isolate'), multi: get('--multi', 'refuse') });
   console.log(`serving at ${s.url}`);
 }

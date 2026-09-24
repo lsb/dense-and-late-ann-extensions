@@ -133,7 +133,8 @@ WASM_EXPORTS := $(subst $(space),,$(strip \
   _sqlite3_column_double,_sqlite3_column_text,_sqlite3_column_blob,_sqlite3_column_bytes, \
   _sqlite3_errmsg,_sqlite3_errcode,_sqlite3_changes,_sqlite3_libversion, \
   _sqlite3_db_release_memory,_sqlite3_file_control, \
-  _httpvfs_stats_array,_httpvfs_reset,_httpvfs_log_count,_httpvfs_log_copy,_httpvfs_now))
+  _httpvfs_stats_array,_httpvfs_reset,_httpvfs_log_count,_httpvfs_log_copy,_httpvfs_now, \
+  _httpvfs_net_config,_httpvfs_net_state))
 # Exports that can block on the network (JSPI needs them listed).
 WASM_ASYNC_EXPORTS := sqlite3_open_v2,sqlite3_exec,sqlite3_prepare_v2,sqlite3_step,sqlite3_file_control
 
@@ -141,7 +142,14 @@ WASM_LDFLAGS := -O2 -sMODULARIZE -sEXPORT_ES6 -sEXPORT_NAME=createSqliteHttpvfs 
   -sENVIRONMENT=web,worker,node -sALLOW_MEMORY_GROWTH -sINITIAL_MEMORY=32MB \
   -sSTACK_SIZE=1MB -sEXPORTED_FUNCTIONS=$(WASM_EXPORTS) \
   -sEXPORTED_RUNTIME_METHODS=ccall,UTF8ToString,stringToUTF8,lengthBytesUTF8,HEAPU8,HEAP32,HEAPU32,HEAPF64 \
-  --pre-js wasm/src/httpvfs-pre.js
+  --pre-js $(WASM_DIR)/multipart-pre.js --pre-js wasm/src/httpvfs-pre.js
+WASM_PRE := $(WASM_DIR)/multipart-pre.js wasm/src/httpvfs-pre.js
+
+# wasm/pkg/multipart.mjs is an ES module (used by the sync worker and tests);
+# the glue gets the same code with the `export` keywords removed.
+$(WASM_DIR)/multipart-pre.js: $(PKG_DIR)/multipart.mjs
+	@mkdir -p $(dir $@)
+	sed -e 's/^export //' $< > $@
 
 wasm: wasm-asyncify wasm-jspi wasm-sync
 wasm-asyncify: $(PKG_DIR)/dist/sqlite-httpvfs.mjs
@@ -166,15 +174,15 @@ $(WASM_DIR)/demo_ext.o: $(DEMO_SRC) $(HV_HDR) $(SQLITE_DIR)/sqlite3ext.h
 $(WASM_DIR)/ext_registry.o: $(WASM_DIR)/ext_registry.c
 	$(EMCC) $(WASM_CFLAGS) $(EXT_INC) -c $< -o $@
 
-$(PKG_DIR)/dist/sqlite-httpvfs.mjs: $(WASM_COMMON_OBJS) $(WASM_DIR)/httpvfs.o wasm/src/httpvfs-pre.js
+$(PKG_DIR)/dist/sqlite-httpvfs.mjs: $(WASM_COMMON_OBJS) $(WASM_DIR)/httpvfs.o $(WASM_PRE)
 	@mkdir -p $(dir $@)
 	$(EMCC) $(filter %.o,$^) $(WASM_LDFLAGS) -sASYNCIFY -sASYNCIFY_STACK_SIZE=262144 -o $@
 
-$(PKG_DIR)/dist/sqlite-httpvfs-jspi.mjs: $(WASM_COMMON_OBJS) $(WASM_DIR)/httpvfs.o wasm/src/httpvfs-pre.js
+$(PKG_DIR)/dist/sqlite-httpvfs-jspi.mjs: $(WASM_COMMON_OBJS) $(WASM_DIR)/httpvfs.o $(WASM_PRE)
 	@mkdir -p $(dir $@)
 	$(EMCC) $(filter %.o,$^) $(WASM_LDFLAGS) -sJSPI -sJSPI_EXPORTS=$(WASM_ASYNC_EXPORTS) -o $@
 
-$(PKG_DIR)/dist/sqlite-httpvfs-sync.mjs: $(WASM_COMMON_OBJS) $(WASM_DIR)/httpvfs-sync.o wasm/src/httpvfs-pre.js
+$(PKG_DIR)/dist/sqlite-httpvfs-sync.mjs: $(WASM_COMMON_OBJS) $(WASM_DIR)/httpvfs-sync.o $(WASM_PRE)
 	@mkdir -p $(dir $@)
 	$(EMCC) $(filter %.o,$^) $(WASM_LDFLAGS) -o $@
 
@@ -195,7 +203,7 @@ test: test-native test-node test-browser
 test-native: native
 	LD_LIBRARY_PATH=$(NATIVE_DIR) python3 wasm/test/test_native.py
 test-node: native wasm
-	$(NODE) --test wasm/test/node.test.mjs
+	$(NODE) --test wasm/test/node.test.mjs wasm/test/coalesce.test.mjs
 test-browser: native wasm
 	$(NODE) --test wasm/test/browser.test.mjs
 

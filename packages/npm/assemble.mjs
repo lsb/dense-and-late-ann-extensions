@@ -29,7 +29,7 @@ if (missing.length) {
   process.exit(1);
 }
 
-for (const f of ['index.mjs', 'sync-fetch.mjs', 'sync-fetch-worker.mjs']) copy(path.join(WASM_PKG, f), path.join(HERE, f));
+for (const f of ['index.mjs', 'multipart.mjs', 'sync-fetch.mjs', 'sync-fetch-worker.mjs']) copy(path.join(WASM_PKG, f), path.join(HERE, f));
 fs.rmSync(path.join(HERE, 'dist'), { recursive: true, force: true });
 for (const b of BUILDS) for (const ext of ['.mjs', '.wasm']) {
   copy(path.join(WASM_PKG, 'dist', b + ext), path.join(HERE, 'dist', b + ext));

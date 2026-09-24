@@ -55,9 +55,10 @@ export function nativeQuery(db, sql) {
 
 /**
  * Start a range server for dir in a child process. Returns {url, close}.
- * opts.latencyMs adds a fixed delay per response; opts.isolate sends COOP/COEP.
+ * opts.latencyMs adds a fixed delay per response; opts.isolate sends COOP/COEP;
+ * opts.extraArgs are appended to the server's command line.
  */
-export async function startServerProcess(dir, { latencyMs = 0, isolate = false, preferNode = false } = {}) {
+export async function startServerProcess(dir, { latencyMs = 0, isolate = false, preferNode = false, extraArgs = [] } = {}) {
   const netsim = path.join(ROOT, 'netsim/rangeserver.py');
   let cmd, args;
   if (!preferNode && fs.existsSync(netsim)) {
@@ -70,6 +71,7 @@ export async function startServerProcess(dir, { latencyMs = 0, isolate = false, 
       '--latency-ms', String(latencyMs)];
     if (isolate) args.push('--isolate');
   }
+  args.push(...extraArgs);
   const child = spawn(cmd, args, { stdio: ['ignore', 'pipe', 'inherit'] });
   const url = await new Promise((resolve, reject) => {
     let buf = '';

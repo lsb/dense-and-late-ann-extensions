@@ -28,6 +28,13 @@
 **   gap_kb        merge ranges of one batch whose gap is at most this (default 0)
 **   latency_ms    native backend only: simulated round-trip time per round
 **   log_max       maximum log entries kept (default 1000000)
+**   max_req       request budget per round: when a round needs more requests
+**                 than this, nearby ranges are merged (or, with multipart=1,
+**                 sent as multi-range requests); 0 disables (default 0)
+**   rtt_ms        estimated request latency for the merge cost model (100)
+**   bw_kbps       estimated bandwidth in kbit/s for the cost model (10000)
+**   multipart     1: ranges may be combined into multi-range requests (0)
+**   net_auto      1: re-estimate rtt_ms and bw_kbps from observed rounds (1)
 **
 ** Built three ways from this one file:
 **   - static, with -DSQLITE_CORE (WASM build and the native CLI); call
@@ -60,13 +67,18 @@ typedef struct HvBackend HvBackend;
 struct HvBackend {
   /* Fetch n ranges concurrently into dest[]; one call is one round. Fill
   ** t0[i], t1[i] (milliseconds). *pSize receives the file size if the
-  ** backend learns it (it is -1 on entry when unknown). Returns SQLITE_OK or
-  ** an SQLite error code. */
+  ** backend learns it (it is -1 on entry when unknown). If grp is not NULL,
+  ** ranges with equal grp[i] (grp is nondecreasing) should be requested
+  ** together as one multi-range request; a backend that cannot do that, or
+  ** finds that the server does not, fetches them separately and sets
+  ** HV_FLAG_NO_MULTIPART in *pFlags. Returns SQLITE_OK or an error code. */
   int (*xFetch)(HvBackend*, int n, const double *off, const int *len,
                 unsigned char **dest, double *t0, double *t1,
-                sqlite3_int64 *pSize);
+                sqlite3_int64 *pSize, const int *grp, int *pFlags);
   void (*xClose)(HvBackend*);
 };
+
+#define HV_FLAG_NO_MULTIPART 1   /* server ignored or refused multi-range */
 
 #ifdef __EMSCRIPTEN__
 
@@ -75,13 +87,15 @@ struct HvBackend {
 ** block until the batch is in memory, e.g. a worker doing parallel fetches
 ** while this thread waits on a SharedArrayBuffer with Atomics.wait. */
 EM_JS(int, hv_js_fetch, (int h, int n, const double *off, const int *len,
-      unsigned char **dest, double *t0, double *t1, double *pSize), {
-  return Module.httpvfsFetchSync(h, n, off, len, dest, t0, t1, pSize);
+      unsigned char **dest, double *t0, double *t1, double *pSize,
+      const int *grp, int *pFlags), {
+  return Module.httpvfsFetchSync(h, n, off, len, dest, t0, t1, pSize, grp, pFlags);
 });
 #else
 EM_ASYNC_JS(int, hv_js_fetch, (int h, int n, const double *off, const int *len,
-            unsigned char **dest, double *t0, double *t1, double *pSize), {
-  return await Module.httpvfsFetch(h, n, off, len, dest, t0, t1, pSize);
+            unsigned char **dest, double *t0, double *t1, double *pSize,
+            const int *grp, int *pFlags), {
+  return await Module.httpvfsFetch(h, n, off, len, dest, t0, t1, pSize, grp, pFlags);
 });
 #endif
 EM_JS(int, hv_js_open, (const char *zName), {
@@ -94,9 +108,10 @@ typedef struct HvJsBackend { HvBackend base; int h; } HvJsBackend;
 
 static int hvJsFetch(HvBackend *p, int n, const double *off, const int *len,
                      unsigned char **dest, double *t0, double *t1,
-                     sqlite3_int64 *pSize){
+                     sqlite3_int64 *pSize, const int *grp, int *pFlags){
   double sz = (double)*pSize;
-  int rc = hv_js_fetch(((HvJsBackend*)p)->h, n, off, len, dest, t0, t1, &sz);
+  int rc = hv_js_fetch(((HvJsBackend*)p)->h, n, off, len, dest, t0, t1, &sz,
+                       grp, pFlags);
   *pSize = (sqlite3_int64)sz;
   return rc;
 }
@@ -121,11 +136,11 @@ typedef struct HvFileBackend {
 
 static int hvFileFetch(HvBackend *p, int n, const double *off, const int *len,
                        unsigned char **dest, double *t0, double *t1,
-                       sqlite3_int64 *pSize){
+                       sqlite3_int64 *pSize, const int *grp, int *pFlags){
   HvFileBackend *f = (HvFileBackend*)p;
   double start = hv_now(), end;
   int i;
-  (void)pSize;
+  (void)pSize; (void)grp; (void)pFlags;   /* pread: groups cost nothing */
   if( f->latency_ms>0 ){
     struct timespec ts;
     ts.tv_sec = (time_t)(f->latency_ms/1000);
@@ -244,12 +259,197 @@ static void hvCacheClear(HvCache *c){
 }
 
 /* ------------------------------------------------------------------------ */
+/* Request planning under a per-round request budget                         */
+
+/*
+** One round needs m disjoint block ranges [rs[i], re[i]) (sorted, in blocks
+** of bs bytes). Over HTTP/1.1 a browser runs at most six requests per host
+** at once, so m > 6 requests take about ceil(m/6) latencies. This planner
+** assigns the ranges to requests, grp[i] = request number (nondecreasing),
+** and returns the number of requests:
+**
+**   multipart == 0 (coalescing): the ranges of one request are merged into
+**     one contiguous range, so the blocks between them are fetched too. The
+**     cost model is
+**         T(g) = ceil(g / max_req) * rtt_ms + bytes(g) / bw_Bpms,
+**     where bytes(g) is the smallest total span of g contiguous requests:
+**     cut at the g-1 largest gaps. Only g = m and multiples of max_req can
+**     be optimal (between them the number of waves is constant and more
+**     requests fetch fewer bytes), so all candidates are evaluated exactly.
+**     The total span may not exceed max_blocks (> 0; unless g = m).
+**   multipart != 0: every range is fetched exactly; the ranges are split
+**     in offset order into min(max_req, m) requests of similar byte size,
+**     with at most max_parts ranges per request.
+**
+** max_req <= 0 or m <= max_req: one request per range. Pure function;
+** exported so that the tests and the trace re-simulation
+** (bench/coalesce_eval.py) use exactly this code.
+*/
+typedef struct HvGap { sqlite3_int64 len; int idx; } HvGap;
+static int hvGapCmp(const void *a, const void *b){
+  const HvGap *x = (const HvGap*)a, *y = (const HvGap*)b;
+  if( x->len!=y->len ) return x->len > y->len ? -1 : 1;   /* larger first */
+  return x->idx - y->idx;
+}
+
+int httpvfs_plan(int m, const sqlite3_int64 *rs, const sqlite3_int64 *re,
+                 int bs, int max_req, double rtt_ms, double bw_Bpms,
+                 sqlite3_int64 max_blocks, int multipart, int max_parts,
+                 int *grp){
+  int i, g;
+  if( m<=0 ) return 0;
+  if( max_req<=0 || m<=max_req ){
+    for(i=0; i<m; i++) grp[i] = i;
+    return m;
+  }
+  if( multipart ){
+    double total = 0, acc = 0;
+    int k = 0, cnt = 0;
+    if( max_parts<=0 ) max_parts = m;
+    g = max_req;
+    if( (m + max_parts - 1)/max_parts > g ) g = (m + max_parts - 1)/max_parts;
+    for(i=0; i<m; i++) total += (double)(re[i]-rs[i]);
+    for(i=0; i<m; i++){
+      /* Close the current request when it is full, when it has its share
+      ** of the bytes and the rest still fits into the remaining requests,
+      ** or when every remaining request needs at least one range. */
+      if( cnt>0 && ( cnt>=max_parts
+                  || (k<g-1 && ((acc >= total*(k+1)/g
+                                 && m-i <= (sqlite3_int64)(g-1-k)*max_parts)
+                                || m-i <= g-1-k)) ) ){
+        k++; cnt = 0;
+      }
+      grp[i] = k;
+      acc += (double)(re[i]-rs[i]);
+      cnt++;
+    }
+    return k+1;
+  }else{
+    HvGap *gap;
+    sqlite3_int64 span = re[m-1] - rs[0], cutsum = 0, bytes;
+    char *cut;
+    int best_g = m, c;
+    double best_t, t;
+    gap = (HvGap*)malloc(sizeof(HvGap)*(size_t)m + (size_t)m);
+    if( !gap ){ for(i=0; i<m; i++) grp[i] = i; return m; }
+    cut = (char*)(gap + m);
+    for(i=0; i<m-1; i++){ gap[i].len = rs[i+1]-re[i]; gap[i].idx = i; }
+    qsort(gap, (size_t)(m-1), sizeof(HvGap), hvGapCmp);
+    if( rtt_ms<0 ) rtt_ms = 0;
+    if( bw_Bpms<=0 ) bw_Bpms = 1e-9;
+    /* g = m: every gap cut. */
+    for(i=0; i<m-1; i++) cutsum += gap[i].len;
+    bytes = (span - cutsum) * (sqlite3_int64)bs;
+    best_t = (double)((m + max_req - 1)/max_req) * rtt_ms + (double)bytes/bw_Bpms;
+    /* g = c*max_req < m: cut the g-1 largest gaps. */
+    cutsum = 0;
+    for(c=1, i=0; c*max_req < m; c++){
+      g = c*max_req;
+      while( i<g-1 ){ cutsum += gap[i].len; i++; }
+      if( max_blocks>0 && span - cutsum > max_blocks ) continue;
+      bytes = (span - cutsum) * (sqlite3_int64)bs;
+      t = (double)c * rtt_ms + (double)bytes/bw_Bpms;
+      if( t < best_t ){ best_t = t; best_g = g; }
+    }
+    memset(cut, 0, (size_t)m);
+    for(i=0; i<best_g-1; i++) cut[gap[i].idx] = 1;
+    for(g=0, i=0; i<m; i++){
+      grp[i] = g;
+      if( i<m-1 && cut[i] ) g++;
+    }
+    free(gap);
+    return best_g;
+  }
+}
+
+/*
+** Network parameters of one file: the request budget, the cost model's
+** latency and bandwidth, and a small estimator that refits them from the
+** rounds actually observed (only rounds of at most max_req requests, which
+** run without client-side queueing): T = rtt + bytes/bw.
+*/
+#define HV_NET_WIN 64
+typedef struct HvNet {
+  int max_req;                /* request budget per round (0: unlimited) */
+  int multipart;              /* 1: may send multi-range requests */
+  int max_parts;              /* ranges per multi-range request */
+  int autoest;                /* refit rtt/bw from observations */
+  double rtt_ms;              /* estimated request latency */
+  double bw_Bpms;             /* estimated bandwidth, bytes per ms */
+  double wB[HV_NET_WIN], wT[HV_NET_WIN];   /* observed rounds: bytes, ms */
+  int wn, wi;
+  sqlite3_int64 overfetch;    /* bytes fetched that were not asked for */
+  sqlite3_int64 planned_rounds;   /* rounds the planner changed */
+  sqlite3_int64 mp_requests;  /* multi-range requests sent */
+  int mp_failed;              /* the server does not do multi-range */
+} HvNet;
+
+static void hvNetResetCounters(HvNet *nt){
+  nt->overfetch = 0; nt->planned_rounds = 0; nt->mp_requests = 0;
+}
+
+static int hvDblCmp(const void *a, const void *b){
+  double x = *(const double*)a, y = *(const double*)b;
+  return x<y ? -1 : x>y;
+}
+static int hvSampleCmp(const void *a, const void *b){
+  return hvDblCmp(a, b);   /* by bytes, the first member */
+}
+static double hvMedian(double *v, int n){
+  qsort(v, n, sizeof(double), hvDblCmp);
+  return n%2 ? v[n/2] : 0.5*(v[n/2-1] + v[n/2]);
+}
+
+/*
+** Record one round (B bytes in T ms by n requests) and refit rtt and bw.
+** The samples are split at the median byte count; the bandwidth is the slope
+** between the medians of the two halves (when their sizes differ by 2x or
+** more, otherwise the bandwidth cannot be told apart from the latency and
+** keeps its value), and the latency is a low quartile of T - B/bw over the
+** smaller half, but at least half of that half's low-quartile T.
+*/
+static void hvNetObserve(HvNet *nt, int n, double B, double T){
+  double s[HV_NET_WIN][2], v[HV_NET_WIN], mBlo, mBhi, mTlo, mThi, L, W, Tq;
+  int i, h, m;
+  if( !nt->autoest || !(T>0) || !(B>0) ) return;
+  if( nt->max_req>0 && n>nt->max_req ) return;   /* queued: not a clean sample */
+  nt->wB[nt->wi] = B; nt->wT[nt->wi] = T;
+  nt->wi = (nt->wi+1) % HV_NET_WIN;
+  if( nt->wn<HV_NET_WIN ) nt->wn++;
+  m = nt->wn;
+  if( m<4 ) return;
+  for(i=0; i<m; i++){ s[i][0] = nt->wB[i]; s[i][1] = nt->wT[i]; }
+  qsort(s, m, sizeof(s[0]), hvSampleCmp);
+  h = m/2;
+  for(i=0; i<h; i++) v[i] = s[i][0];
+  mBlo = hvMedian(v, h);
+  for(i=0; i<h; i++) v[i] = s[i][1];
+  mTlo = hvMedian(v, h);
+  Tq = v[h/4];
+  for(i=h; i<m; i++) v[i-h] = s[i][0];
+  mBhi = hvMedian(v, m-h);
+  for(i=h; i<m; i++) v[i-h] = s[i][1];
+  mThi = hvMedian(v, m-h);
+  W = nt->bw_Bpms;
+  if( mBhi >= 2*mBlo && mThi > mTlo ) W = (mBhi - mBlo)/(mThi - mTlo);
+  if( W<1 ) W = 1;             /* 8 kbit/s */
+  if( W>1e6 ) W = 1e6;         /* 8 Gbit/s */
+  for(i=0; i<h; i++) v[i] = s[i][1] - s[i][0]/W;
+  qsort(v, h, sizeof(double), hvDblCmp);
+  L = v[h/4];
+  if( L<0.5*Tq ) L = 0.5*Tq;
+  if( L<0.1 ) L = 0.1;
+  nt->rtt_ms = L; nt->bw_Bpms = W;
+}
+
+/* ------------------------------------------------------------------------ */
 /* File                                                                      */
 
 typedef struct HvLogEntry {
   double off;
   int len;
   int round;
+  int req;                    /* request number within the round */
   double t0, t1;
 } HvLogEntry;
 
@@ -268,6 +468,7 @@ typedef struct HvFile {
   HvLogEntry *log;
   int nlog, alog, log_max;
   HttpvfsStats st;
+  HvNet net;
 } HvFile;
 
 typedef struct HvGlobal {
@@ -284,8 +485,8 @@ static sqlite3_int64 hvNumBlocks(HvFile *f){
   return (f->size + f->cache.bs - 1) / f->cache.bs;
 }
 
-static void hvLog(HvFile *f, double off, int len, int round, double t0,
-                  double t1){
+static void hvLog(HvFile *f, double off, int len, int round, int req,
+                  double t0, double t1){
   if( f->nlog>=f->log_max ) return;
   if( f->nlog>=f->alog ){
     int na = f->alog ? f->alog*2 : 256;
@@ -298,6 +499,7 @@ static void hvLog(HvFile *f, double off, int len, int round, double t0,
   f->log[f->nlog].off = off;
   f->log[f->nlog].len = len;
   f->log[f->nlog].round = round;
+  f->log[f->nlog].req = req;
   f->log[f->nlog].t0 = t0;
   f->log[f->nlog].t1 = t1;
   f->nlog++;
@@ -306,67 +508,116 @@ static void hvLog(HvFile *f, double off, int len, int round, double t0,
 /*
 ** Fetch the sorted, distinct, uncached blocks blk[0..n-1] in one round and
 ** insert them into the cache. Blocks closer than the merge gap share a
-** request (the blocks in the gap are fetched and cached too). If out is not
-** NULL, the bytes [out_off, out_off+out_len) are also copied into it straight
-** from the fetched data, so that a read larger than the cache still works.
+** request (the blocks in the gap are fetched and cached too). If the round
+** then needs more requests than net.max_req, httpvfs_plan() merges nearby
+** ranges (again caching the blocks in between) or groups them into
+** multi-range requests. If out is not NULL, the bytes [out_off,
+** out_off+out_len) are also copied into it straight from the fetched data,
+** so that a read larger than the cache still works.
 */
+static int hvWanted(const sqlite3_int64 *blk, int n, sqlite3_int64 b){
+  int lo = 0, hi = n-1;
+  while( lo<=hi ){
+    int mid = (lo+hi)/2;
+    if( blk[mid]==b ) return 1;
+    if( blk[mid]<b ) lo = mid+1; else hi = mid-1;
+  }
+  return 0;
+}
+
 static int hvFetchBlocks(HvFile *f, const sqlite3_int64 *blk, int n,
                          unsigned char *out, sqlite3_int64 out_off,
                          int out_len){
   int bs = f->cache.bs;
-  int nr = 0, i, j, rc;
+  int nr = 0, i, j, k, rc, pass, flags = 0, nreq;
   double *off, *t0, *t1;
-  int *len;
+  int *len, *grp;
   unsigned char **dest;
-  sqlite3_int64 *first;
-  sqlite3_int64 size = f->size;
+  sqlite3_int64 *first, *rend;
+  sqlite3_int64 size = f->size, B = 0;
+  const int *pgrp = 0;
   double tmin, tmax;
 
   if( n<=0 ) return SQLITE_OK;
   off = sqlite3_malloc64(sizeof(double)*n*3);
-  len = sqlite3_malloc64(sizeof(int)*n);
+  len = sqlite3_malloc64(sizeof(int)*n*2);
   dest = sqlite3_malloc64(sizeof(unsigned char*)*n);
-  first = sqlite3_malloc64(sizeof(sqlite3_int64)*n);
+  first = sqlite3_malloc64(sizeof(sqlite3_int64)*n*2);
   if( !off || !len || !dest || !first ){ rc = SQLITE_NOMEM; goto done; }
   memset(dest, 0, sizeof(unsigned char*)*n);
   t0 = off + n; t1 = off + 2*n;
+  grp = len + n;
+  rend = first + n;
 
-  /* Coalesce into ranges. */
+  /* Coalesce into ranges of blocks [first, rend). */
   for(i=0; i<n; i=j){
     sqlite3_int64 last = blk[i];
     for(j=i+1; j<n && blk[j]-last-1 <= f->gap; j++) last = blk[j];
     first[nr] = blk[i];
-    off[nr] = (double)(blk[i]*bs);
-    {
-      sqlite3_int64 end = (last+1)*bs;
-      if( size>=0 && end>size ) end = size;
-      len[nr] = (int)(end - blk[i]*bs);
-    }
-    if( len[nr]<=0 ){ continue; }
-    dest[nr] = sqlite3_malloc64(len[nr]);
-    if( !dest[nr] ){ rc = SQLITE_NOMEM; goto done; }
+    rend[nr] = last+1;
+    grp[nr] = nr;
     nr++;
   }
+
+  /* More requests than the budget: plan merges or multi-range requests. */
+  if( f->net.max_req>0 && nr>f->net.max_req ){
+    int mp = f->net.multipart && !f->net.mp_failed;
+    sqlite3_int64 maxb = f->cache.cap/2 > n ? f->cache.cap/2 : n;
+    int g = httpvfs_plan(nr, first, rend, bs, f->net.max_req, f->net.rtt_ms,
+                         f->net.bw_Bpms, maxb, mp, f->net.max_parts, grp);
+    if( g<nr ){
+      f->net.planned_rounds++;
+      if( mp ){
+        pgrp = grp;
+      }else{
+        for(k=0, i=0; i<nr; i=j){
+          for(j=i+1; j<nr && grp[j]==grp[i]; j++){}
+          first[k] = first[i]; rend[k] = rend[j-1]; grp[k] = k;
+          k++;
+        }
+        nr = k;
+      }
+    }
+  }
+
+  /* Byte ranges (the last one clipped to the file size). */
+  for(k=0, i=0; i<nr; i++){
+    sqlite3_int64 end = rend[i]*bs;
+    if( size>=0 && end>size ) end = size;
+    if( end - first[i]*bs <= 0 ) continue;
+    first[k] = first[i];
+    grp[k] = grp[i];
+    off[k] = (double)(first[i]*bs);
+    len[k] = (int)(end - first[i]*bs);
+    dest[k] = sqlite3_malloc64(len[k]);
+    if( !dest[k] ){ rc = SQLITE_NOMEM; goto done; }
+    k++;
+  }
+  nr = k;
   if( nr==0 ){ rc = SQLITE_OK; goto done; }
 
   f->st.rounds++;
-  rc = f->be->xFetch(f->be, nr, off, len, dest, t0, t1, &size);
+  rc = f->be->xFetch(f->be, nr, off, len, dest, t0, t1, &size, pgrp, &flags);
   if( rc!=SQLITE_OK ) goto done;
   if( f->size<0 ) f->size = size;
+  if( flags & HV_FLAG_NO_MULTIPART ){
+    f->net.mp_failed = 1;
+    pgrp = 0;              /* the backend fetched every range separately */
+  }
 
+  nreq = 0;
   tmin = t0[0]; tmax = t1[0];
   for(i=0; i<nr; i++){
-    sqlite3_int64 b;
-    int k;
+    int req = pgrp ? pgrp[i] : i;
+    if( i==0 || req!=(pgrp ? pgrp[i-1] : i-1) ){
+      nreq++;
+      if( pgrp && i+1<nr && pgrp[i+1]==req ) f->net.mp_requests++;
+    }
     if( t0[i]<tmin ) tmin = t0[i];
     if( t1[i]>tmax ) tmax = t1[i];
-    f->st.requests++;
     f->st.bytes += len[i];
-    hvLog(f, off[i], len[i], (int)f->st.rounds, t0[i], t1[i]);
-    for(k=0, b=first[i]; k<len[i]; k+=bs, b++){
-      int m = len[i]-k < bs ? len[i]-k : bs;
-      if( hvCacheGet(&f->cache, b, 0)<0 ) hvCachePut(&f->cache, b, dest[i]+k, m);
-    }
+    B += len[i];
+    hvLog(f, off[i], len[i], (int)f->st.rounds, req, t0[i], t1[i]);
     if( out ){
       /* Copy the overlap of this range with the output window. */
       sqlite3_int64 a0 = (sqlite3_int64)off[i], a1 = a0 + len[i];
@@ -375,7 +626,24 @@ static int hvFetchBlocks(HvFile *f, const sqlite3_int64 *blk, int n,
       if( lo<hi ) memcpy(out + (lo-o0), dest[i] + (lo-a0), (size_t)(hi-lo));
     }
   }
+  f->st.requests += nreq;
   f->st.net_ms += tmax - tmin;
+  hvNetObserve(&f->net, nreq, (double)B, tmax - tmin);
+
+  /* Into the cache: blocks nobody asked for first, then the requested ones,
+  ** so that the requested blocks are the most recently used. */
+  for(pass=0; pass<2; pass++){
+    for(i=0; i<nr; i++){
+      sqlite3_int64 b;
+      int kk;
+      for(kk=0, b=first[i]; kk<len[i]; kk+=bs, b++){
+        int m = len[i]-kk < bs ? len[i]-kk : bs;
+        if( hvWanted(blk, n, b)!=pass ) continue;
+        if( pass==0 ) f->net.overfetch += m;
+        if( hvCacheGet(&f->cache, b, 0)<0 ) hvCachePut(&f->cache, b, dest[i]+kk, m);
+      }
+    }
+  }
 
 done:
   if( dest ) for(i=0; i<n; i++) sqlite3_free(dest[i]);
@@ -559,6 +827,7 @@ static int hvFileControl(sqlite3_file *pFile, int op, void *pArg){
     }
     case HTTPVFS_FCNTL_RESET_STATS: {
       memset(&f->st, 0, sizeof(f->st));
+      hvNetResetCounters(&f->net);
       f->nlog = 0;
       return SQLITE_OK;
     }
@@ -610,14 +879,18 @@ static int hvFileControl(sqlite3_file *pFile, int op, void *pArg){
         a[0] = sqlite3_mprintf(
           "requests=%lld bytes=%lld rounds=%lld reads=%lld hits=%lld "
           "misses=%lld prefetch_calls=%lld prefetch_blocks=%lld net_ms=%.1f "
-          "cached_blocks=%d",
+          "cached_blocks=%d overfetch=%lld planned_rounds=%lld "
+          "multipart_requests=%lld max_req=%d rtt_ms=%.1f bw_kbps=%.0f",
           s->requests, s->bytes, s->rounds, s->reads, s->cache_hits,
           s->cache_misses, s->prefetch_calls, s->prefetch_blocks, s->net_ms,
-          f->cache.n);
+          f->cache.n, f->net.overfetch, f->net.planned_rounds,
+          f->net.mp_requests, f->net.max_req, f->net.rtt_ms,
+          f->net.bw_Bpms*8.0);
         return SQLITE_OK;
       }
       if( sqlite3_stricmp(a[1], "httpvfs_reset")==0 ){
         memset(&f->st, 0, sizeof(f->st));
+        hvNetResetCounters(&f->net);
         f->nlog = 0;
         if( a[2] && sqlite3_stricmp(a[2], "cache")==0 ) hvCacheClear(&f->cache);
         a[0] = sqlite3_mprintf("ok");   /* NULL would be a NULL column name */
@@ -681,6 +954,17 @@ static int hvOpen(sqlite3_vfs *pVfs, const char *zName, sqlite3_file *pFile,
   f->ra_max = (int)(((sqlite3_int64)ra_kb*1024)/bs);
   f->gap = (int)(((sqlite3_int64)gap_kb*1024)/bs);
   f->next_seq = -1;
+  f->net.max_req = (int)sqlite3_uri_int64(zName, "max_req", 0);
+  f->net.multipart = (int)sqlite3_uri_int64(zName, "multipart", 0);
+  f->net.max_parts = (int)sqlite3_uri_int64(zName, "max_parts", 100);
+  f->net.autoest = (int)sqlite3_uri_int64(zName, "net_auto", 1);
+  {
+    const char *z = sqlite3_uri_parameter(zName, "rtt_ms");
+    f->net.rtt_ms = z ? atof(z) : 100.0;
+    z = sqlite3_uri_parameter(zName, "bw_kbps");
+    f->net.bw_Bpms = (z ? atof(z) : 10000.0) / 8.0;   /* kbit/s -> bytes/ms */
+    if( f->net.bw_Bpms<=0 ) f->net.bw_Bpms = 1;
+  }
   {
     sqlite3_int64 cap = ((sqlite3_int64)cache_kb*1024)/bs;
     if( cap<16 ) cap = 16;
@@ -804,15 +1088,17 @@ int httpvfs_log_count(sqlite3 *db){
   HvFile *f = hvMainFile(db);
   return f ? f->nlog : 0;
 }
-/* Entry i as 5 doubles: offset, length, round, t_start, t_end. */
-int httpvfs_log_entry(sqlite3 *db, int i, double *out5){
+/* Entry i as 6 doubles: offset, length, round, t_start, t_end, request
+** (ranges of one multi-range request share it within their round). */
+int httpvfs_log_entry(sqlite3 *db, int i, double *out6){
   HvFile *f = hvMainFile(db);
   if( !f || i<0 || i>=f->nlog ) return SQLITE_RANGE;
-  out5[0] = f->log[i].off;
-  out5[1] = f->log[i].len;
-  out5[2] = f->log[i].round;
-  out5[3] = f->log[i].t0;
-  out5[4] = f->log[i].t1;
+  out6[0] = f->log[i].off;
+  out6[1] = f->log[i].len;
+  out6[2] = f->log[i].round;
+  out6[3] = f->log[i].t0;
+  out6[4] = f->log[i].t1;
+  out6[5] = f->log[i].req;
   return SQLITE_OK;
 }
 double httpvfs_now(void){ return hv_now(); }
@@ -852,13 +1138,15 @@ int httpvfs_reset(sqlite3 *db, int clear_cache){
   HvFile *f = hvMainFile(db);
   if( !f ) return SQLITE_NOTFOUND;
   memset(&f->st, 0, sizeof(f->st));
+  hvNetResetCounters(&f->net);
   f->nlog = 0;
   f->next_seq = -1;
   f->ra = 0;
   if( clear_cache ) hvCacheClear(&f->cache);
   return SQLITE_OK;
 }
-/* Copy up to n log entries starting at i0, 5 doubles each; returns count. */
+/* Copy up to n log entries starting at i0, 6 doubles each (as
+** httpvfs_log_entry); returns the count. */
 int httpvfs_log_copy(sqlite3 *db, int i0, int n, double *out){
   HvFile *f = hvMainFile(db);
   int i;
@@ -866,8 +1154,40 @@ int httpvfs_log_copy(sqlite3 *db, int i0, int n, double *out){
   if( i0+n>f->nlog ) n = f->nlog - i0;
   for(i=0; i<n; i++){
     const HvLogEntry *e = &f->log[i0+i];
-    out[5*i] = e->off; out[5*i+1] = e->len; out[5*i+2] = e->round;
-    out[5*i+3] = e->t0; out[5*i+4] = e->t1;
+    out[6*i] = e->off; out[6*i+1] = e->len; out[6*i+2] = e->round;
+    out[6*i+3] = e->t0; out[6*i+4] = e->t1; out[6*i+5] = e->req;
   }
   return n<0 ? 0 : n;
+}
+
+/*
+** Network parameters (JavaScript API). Arguments below 0 leave the current
+** value: max_req (0 = no request budget), rtt_ms, bw_kbps, multipart (0/1),
+** net_auto (0/1: refit rtt and bandwidth from observed rounds), max_parts.
+*/
+int httpvfs_net_config(sqlite3 *db, int max_req, double rtt_ms, double bw_kbps,
+                       int multipart, int autoest, int max_parts){
+  HvFile *f = hvMainFile(db);
+  if( !f ) return SQLITE_NOTFOUND;
+  if( max_req>=0 ) f->net.max_req = max_req;
+  if( rtt_ms>=0 ) f->net.rtt_ms = rtt_ms;
+  if( bw_kbps>0 ) f->net.bw_Bpms = bw_kbps/8.0;
+  if( multipart>=0 ){ f->net.multipart = multipart; f->net.mp_failed = 0; }
+  if( autoest>=0 ) f->net.autoest = autoest;
+  if( max_parts>0 ) f->net.max_parts = max_parts;
+  if( rtt_ms>=0 || bw_kbps>0 ) f->net.wn = f->net.wi = 0;   /* restart the fit */
+  return SQLITE_OK;
+}
+/* Network state as 10 doubles: max_req, rtt_ms, bw_kbps, multipart,
+** net_auto, overfetch bytes, planned rounds, multi-range requests,
+** multipart_failed, observed rounds in the estimator window. */
+int httpvfs_net_state(sqlite3 *db, double *out){
+  HvFile *f = hvMainFile(db);
+  if( !f ) return SQLITE_NOTFOUND;
+  out[0] = f->net.max_req;   out[1] = f->net.rtt_ms;
+  out[2] = f->net.bw_Bpms*8.0; out[3] = f->net.multipart;
+  out[4] = f->net.autoest;   out[5] = (double)f->net.overfetch;
+  out[6] = (double)f->net.planned_rounds; out[7] = (double)f->net.mp_requests;
+  out[8] = f->net.mp_failed; out[9] = f->net.wn;
+  return SQLITE_OK;
 }

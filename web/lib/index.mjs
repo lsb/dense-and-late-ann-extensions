@@ -153,6 +153,9 @@ export class SearchIndex {
  * opts:
  *   variant          SQLite WASM build: 'auto' (JSPI where supported, else Asyncify) | 'asyncify' | 'jspi'
  *   pageCacheBytes, blockSize, readaheadBytes, maxParallel   passed to wasm/pkg open()
+ *   maxRequests, multipart, rttMs, bandwidthKbps, netAutoEstimate   request planning under a
+ *                    per-round request budget (wasm/pkg open(); maxRequests 'auto' by default:
+ *                    6 over HTTP/1.x, 100 over HTTP/2)
  *   sqliteModule     URL of the SQLite module (default: see paths.mjs)
  *   ortBase          directory URL of onnxruntime-web's dist files (default: see paths.mjs)
  *   tokenizersModule URL of @huggingface/tokenizers' ES module (default: see paths.mjs)
@@ -167,17 +170,20 @@ export async function openIndex(url, opts = {}) {
   for (const w of opts.preload || []) ix.loadEncoder(w).catch(() => {});
   ix.sqliteWorker = new Worker(new URL('sqlite-worker.mjs', HERE), { type: 'module', name: 'sqlite' });
   ix.sql = client(ix.sqliteWorker);
-  const { variant = 'auto', pageCacheBytes = 16 << 20, blockSize, readaheadBytes, maxParallel } = opts;
+  const { variant = 'auto', pageCacheBytes = 16 << 20, blockSize, readaheadBytes, maxParallel,
+    maxRequests, multipart, rttMs, bandwidthKbps, netAutoEstimate } = opts;
   const info = await ix.sql('open', {
     url: new URL(url, globalThis.location?.href).href,
     sqliteModule: absUrl(opts.sqliteModule || PATHS.sqliteModule, 'sqliteModule'),
     variant, pageCacheBytes, blockSize, readaheadBytes, maxParallel,
+    maxRequests, multipart, rttMs, bandwidthKbps, netAutoEstimate,
   });
   ix.url = url;
   ix.indexes = info.indexes;
   ix.docs = info.docs;
   ix.variant = info.variant;
   ix.openStats = { ...info.stats, openMs: info.openMs };
+  ix.net = info.net;
   ix.systems = info.indexes.map((i) => ({
     id: i.table, kind: i.kind, layout: i.layout, table: i.table, label: label(i),
     encoder: i.kind === 'dense' ? 'minilm' : i.kind === 'late' ? 'lateon' : null,
