@@ -4,6 +4,8 @@ The benchmark matrix measures every retrieval configuration of the project end t
 
 **Encoders.** All results in `results/matrix/` use the weight-only int8 encoders (`models/*/model_w8.onnx`, the `enc/` defaults since commit 54a9095) for both the corpus embeddings and the queries. The earlier matrix, made with the dynamically quantised int8 files, was discarded; see RESEARCH_LOG.md, "The int8 encoders are wrong on CPUs without VNNI". `build/queries/<set>.json` records the model files used, and each database manifest records the embedding metadata.
 
+**Index formats.** The databases are built with the extensions as of commit 7c4270d: late_plaid format 3 (int8 centroids, varint list lengths) and dense_ann format 2 (int8 PQ codebook; IVF centroids `auto`, which means int8 below 1,024 lists and PQ above). Earlier late indexes were affected by a parser bug that ignored every space-separated option after the first. At 10k the defaults happened to equal the intended parameters, but at 1M they would not have. `build_db.py` now decodes each late index's header after building, records the stored parameters in the manifest (`ext_config.late`: format, K, nbits, layout, centroid type) and stops if they differ from the requested ones. The words-1m FTS5 database contains no vector index and was not rebuilt.
+
 ## Files
 
 | File | Purpose |
