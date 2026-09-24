@@ -194,9 +194,9 @@ export class SearchIndex {
  *   modelCache       keep model files in Cache Storage (default true)
  *   encoderThreads   ONNX Runtime threads (needs cross-origin isolation; default 1)
  *   warm             load indexes' static data in the background, while the
- *                    encoders load: 'auto' (default: FTS5 at once, and the
- *                    indexes of each encoder as soon as it starts loading,
- *                    e.g. through preload), true (every index at once),
+ *                    encoders load: 'auto' (default: the indexes of each
+ *                    encoder as soon as it starts loading, e.g. through
+ *                    preload), true (every index at once, FTS5 included),
  *                    false, or a list of systems / tables
  */
 export async function openIndex(url, opts = {}) {
@@ -223,9 +223,6 @@ export async function openIndex(url, opts = {}) {
   const w = opts.warm ?? 'auto';
   if (w === true) ix.warm();
   else if (Array.isArray(w)) ix.warm(w);
-  else if (w === 'auto') {
-    if (ix.indexes.some((i) => i.kind === 'fts')) ix.warm(['fts']);
-    for (const which of Object.keys(ix.encoders)) ix._autoWarm(which);
-  }
+  else if (w === 'auto') for (const which of Object.keys(ix.encoders)) ix._autoWarm(which);
   return ix;
 }

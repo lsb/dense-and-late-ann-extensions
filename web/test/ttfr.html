@@ -3,7 +3,8 @@
 <title>time to first result</title>
 <!-- Harness for web/test/ttfr.mjs: opens a database, starts loading the
      encoder the system needs, and searches as soon as the index is open.
-     ?db=URL&system=fts|dense|dense_ivf|late&q=TEXT&warm=auto|off -->
+     ?db=URL&system=fts|dense|dense_ivf|late&q=TEXT&warm=auto|off&delay=MS
+     delay: submit the query MS after the index is open (a user typing). -->
 <pre id="out">running…</pre>
 <script type="module">
 import { openIndex } from '../lib/index.mjs';
@@ -15,6 +16,9 @@ window.ttfr = (async () => {
   const marks = { start: performance.now() };
   const ix = await openIndex(p.get('db'), { preload: enc ? [enc] : [], warm: p.get('warm') === 'off' ? false : 'auto' });
   marks.open = performance.now();
+  const delay = Number(p.get('delay') || 0);
+  if (delay) await new Promise((r) => setTimeout(r, delay));
+  marks.submit = performance.now();
   const r = await ix.search(p.get('q') || 'volcanic eruption', { system });
   marks.result = performance.now();
   const encoder = enc ? await ix.loadEncoder(enc) : null;

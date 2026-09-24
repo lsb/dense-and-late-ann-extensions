@@ -29,6 +29,7 @@ const PROFILES = arg('profiles', '4g,h1;lte,h1;4g,h2;lte,h2').split(';');
 const VISITS = arg('visits', 'first,repeat').split(',');
 const REPS = Number(arg('reps', '3'));
 const QUERY = arg('q', 'volcanic eruption');
+const DELAYS = arg('delays', '0').split(',').map(Number);   // ms between index open and query submission
 const OUT = arg('out', path.join(ROOT, 'build/web/ttfr.json'));
 
 const require = createRequire(import.meta.url);
@@ -47,7 +48,7 @@ const browser = await pw.chromium.launch();
 async function run(ctx, base, v, system) {
   const page = await ctx.newPage();
   page.on('pageerror', (e) => console.log('# pageerror', e.message));
-  const q = new URLSearchParams({ db: `/${DBS[v.db]}`, system, q: QUERY, warm: v.warm });
+  const q = new URLSearchParams({ db: `/${DBS[v.db]}`, system, q: QUERY, warm: v.warm, delay: String(v.delay || 0) });
   await page.goto(`${base}/web/test/ttfr.html?${q}`);
   const r = await page.waitForFunction(() => window.ttfr, null, { timeout: 900000 })
     .then(() => page.evaluate(() => window.ttfr));
@@ -62,7 +63,7 @@ try {
     const base = prof.includes('h2') ? proxy.url : srv.url;
     for (const visit of VISITS) {
       for (const system of SYSTEMS) {
-        for (const v of VARIANTS) {
+        for (const delay of DELAYS) for (const v of VARIANTS) {
           const reps = visit === 'first' ? 1 : REPS;
           for (let rep = 0; rep < reps; rep++) {
             const ctx = await browser.newContext({ ignoreHTTPSErrors: true });
@@ -71,17 +72,18 @@ try {
               await run(ctx, base, v, system);
             }
             await setProfile(prof);
-            const r = await run(ctx, base, v, system);
+            const r = await run(ctx, base, { ...v, delay }, system);
             await ctx.close();
             const rec = {
-              profile: prof, visit, system, variant: v.id, rep, ttfr: r.marks.result, openAt: r.marks.open,
+              profile: prof, visit, system, variant: v.id, delay, rep, ttfr: r.marks.result, openAt: r.marks.open,
+              submitToResult: r.marks.result - r.marks.submit,
               encoderMs: r.encoder?.totalMs, encoderFromCache: r.encoder?.modelFromCache,
               encoderLoadWaitMs: r.stats.encoderLoadWaitMs, searchMs: r.stats.searchMs, docsMs: r.stats.docsMs,
               rounds: r.stats.rounds, bytes: r.stats.bytes, staticRounds: r.ext?.static_rounds ?? r.ext?.setup_rounds,
               warm: r.warm, rows: r.rows,
             };
             results.runs.push(rec);
-            console.log(`${prof} ${visit} ${system} ${v.id}#${rep}: first result at ${rec.ttfr.toFixed(0)} ms ` +
+            console.log(`${prof} ${visit} ${system} ${v.id} delay ${delay}#${rep}: first result at ${rec.ttfr.toFixed(0)} ms, ${rec.submitToResult.toFixed(0)} ms after submit ` +
               `(open ${rec.openAt.toFixed(0)}, encoder ${rec.encoderMs?.toFixed(0)} ms, waited ${rec.encoderLoadWaitMs?.toFixed(0)}, ` +
               `search ${rec.searchMs.toFixed(0)} ms / ${rec.rounds} rounds / ${(rec.bytes / 1024).toFixed(0)} KB, ` +
               `warm ${r.warm.map((w) => `${w.table} ${(w.ms || 0).toFixed(0)} ms ${((w.bytes || 0) / 1024).toFixed(0)} KB${w.skipped ? ' skipped' : ''}`).join(', ')})`);
@@ -100,12 +102,15 @@ try {
 }
 
 // Summary: median time to first result per profile / visit / system / variant.
+// Delay 0: from navigation start; delay > 0: from query submission.
 const groups = {};
-for (const r of results.runs) (groups[`${r.profile}|${r.visit}|${r.system}`] ||= {})[r.variant] ||= [];
-for (const r of results.runs) groups[`${r.profile}|${r.visit}|${r.system}`][r.variant].push(r.ttfr);
-console.log(`\n| Profile | Visit | System | ${VARIANTS.map((v) => v.id).join(' | ')} |`);
-console.log(`|---|---|---|${VARIANTS.map(() => '---').join('|')}|`);
+for (const r of results.runs) {
+  const g = (groups[`${r.profile}|${r.visit}|${r.system}|${r.delay}`] ||= {});
+  (g[r.variant] ||= []).push(r.delay ? r.submitToResult : r.ttfr);
+}
+console.log(`\n| Profile | Visit | System | Delay | ${VARIANTS.map((v) => v.id).join(' | ')} |`);
+console.log(`|---|---|---|---|${VARIANTS.map(() => '---').join('|')}|`);
 for (const [k, g] of Object.entries(groups)) {
-  const [p, vis, s] = k.split('|');
-  console.log(`| ${p} | ${vis} | ${s} | ${VARIANTS.map((v) => (g[v.id] ? (median(g[v.id]) / 1000).toFixed(2) + ' s' : '–')).join(' | ')} |`);
+  const [p, vis, s, d] = k.split('|');
+  console.log(`| ${p} | ${vis} | ${s} | ${d} | ${VARIANTS.map((v) => (g[v.id] ? (median(g[v.id]) / 1000).toFixed(2) + ' s' : '–')).join(' | ')} |`);
 }
