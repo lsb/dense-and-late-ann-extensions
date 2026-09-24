@@ -136,8 +136,10 @@ def build_db(path, X, params, page_size):
     db.execute("INSERT INTO v(v) VALUES ('finalize')")
     t_final = time.time() - t
     cfg = {k: v for k, v in db.execute("SELECT key, value FROM v_config") if not isinstance(v, bytes)}
+    free_pages = db.execute("PRAGMA freelist_count").fetchone()[0]
+    page_size = db.execute("PRAGMA page_size").fetchone()[0]
     db.close()
-    size = os.path.getsize(path)
+    size = os.path.getsize(path) - free_pages * page_size   # as after VACUUM
     return {
         "insert_s": t_insert, "build_s": t_build, "finalize_s": t_final,
         "db_bytes": size, "bytes_per_doc": size / len(X), "config": cfg,
@@ -157,18 +159,60 @@ def table_bytes(path):
 
 # -------------------------------------------------------------- queries
 
+DEFAULTS = {"ef": 64, "beam": 16, "rerank": 2, "nprobe": 32, "rk": 64}
 SQL = ("SELECT rowid, distance, stats FROM v WHERE embedding MATCH ?1 AND k = ?2 AND ef = ?3 "
-       "AND beam = ?4 AND rerank = ?5 AND trace = ?6")
+       "AND beam = ?4 AND rerank = ?5 AND trace = ?6 AND nprobe = ?7 AND rerank_k = ?8")
 
 
-def run_queries(db, Q, k, ef, beam, rerank, trace=False):
+def run_queries(db, Q, k, p, trace=False):
+    p = {**DEFAULTS, **p}
     ids, stats = [], []
     t = time.time()
     for q in Q:
-        rows = db.execute(SQL, (q.tobytes(), k, ef, beam, rerank, 1 if trace else 0)).fetchall()
+        rows = db.execute(SQL, (q.tobytes(), k, p["ef"], p["beam"], p["rerank"], 1 if trace else 0,
+                                p["nprobe"], p["rk"])).fetchall()
         ids.append([r[0] for r in rows])
         stats.append(json.loads(rows[0][2]) if rows else {})
     return ids, stats, time.time() - t
+
+
+# ------------------------------------------------------ network model
+
+_NETSIM = None
+
+
+def netsim():
+    global _NETSIM
+    if _NETSIM is None:
+        sys.path.insert(0, str(REPO))
+        from netsim import netmodel, simulate
+        _NETSIM = (netmodel, simulate)
+    return _NETSIM
+
+
+def net_ms(rounds_of_pages, page_size, profile, seeds=1):
+    """Simulated wall time (ms) of a sequence of rounds, each a list of page
+    numbers fetched in parallel; adjacent pages coalesce into one range."""
+    nm, sim = netsim()
+    rounds = [[((p - 1) * page_size, page_size) for p in rnd] for rnd in rounds_of_pages if rnd]
+    if not rounds:
+        return 0.0
+    tr = sim.make_trace(rounds).merged(0)
+    prof = nm.preset(profile)
+    return float(np.mean([sim.simulate(tr, prof, seed=s).total_ms for s in range(seeds)]))
+
+
+def setup_ms(setup_bytes, page_size, profile):
+    """Cold start: page 1, the schema/config page, then the head chunks
+    (written consecutively, so modelled as one range) in one round."""
+    nm, sim = netsim()
+    rounds = [[(0, page_size)], [(page_size, page_size)]]
+    if setup_bytes:
+        rounds.append([(10 * page_size, int(setup_bytes))])
+    return float(sim.simulate(sim.make_trace(rounds), nm.preset(profile)).total_ms)
+
+
+PROFILES = ("4g", "slow-4g")
 
 
 def recall(found, truth, k):
@@ -202,7 +246,7 @@ def warm_cache_sim(stats):
     return float(np.mean(miss_pages[h:])), float(np.mean(miss_rounds[h:]))
 
 
-def cold_query_pages(path, Q, k, ef, beam, rerank, nq=10):
+def cold_query_pages(path, Q, k, p, nq=10):
     """Distinct file pages read by a brand-new connection answering one
     query (schema, config, codebook, entry set, search), via the counting VFS."""
     boot = sqlite3.connect(":memory:")
@@ -213,20 +257,39 @@ def cold_query_pages(path, Q, k, ef, beam, rerank, nq=10):
         db = connect(path, vfs="countvfs")
         db.load_extension(COUNTVFS)          # registers the SQL functions here
         db.execute("SELECT countvfs_reset()")
-        db.execute(SQL, (q.tobytes(), k, ef, beam, rerank, 0)).fetchall()
+        p2 = {**DEFAULTS, **p}
+        db.execute(SQL, (q.tobytes(), k, p2["ef"], p2["beam"], p2["rerank"], 0, p2["nprobe"], p2["rk"])).fetchall()
         out.append(json.loads(db.execute("SELECT countvfs_stats()").fetchone()[0]))
         db.close()
     boot.close()
     return {key: float(np.mean([o[key] for o in out])) for key in out[0]}
 
 
+def _g(ef, beam, rr):
+    return {"ef": ef, "beam": beam, "rerank": rr}
+
+
+def _i(nprobe, rk, rr):
+    return {"nprobe": nprobe, "rk": rk, "rerank": rr}
+
+
 SWEEPS = {
-    "full": [(ef, beam, rr) for ef in (16, 32, 64, 128) for beam in (1, 4, 8) for rr in (0, 1, 2)],
-    "small": [(ef, beam, rr) for ef in (32, 64, 128) for beam in (4,) for rr in (0, 1, 2)] + [(64, 1, 2), (64, 8, 2)],
-    "main": [(ef, beam, rr) for ef in (32, 64, 128) for beam in (4, 8, 16) for rr in (0, 2)] + [(256, 16, 2)],
-    "wide": [(ef, beam, 2) for ef in (32, 64, 128) for beam in (8, 16, 32, 64)],
-    "rr": [(ef, 4, rr) for ef in (16, 32, 64, 128, 256) for rr in (0, 2, 3)],
+    "full": [_g(ef, beam, rr) for ef in (16, 32, 64, 128) for beam in (1, 4, 8) for rr in (0, 1, 2)],
+    "small": [_g(ef, 4, rr) for ef in (32, 64, 128) for rr in (0, 1, 2)] + [_g(64, 1, 2), _g(64, 8, 2)],
+    "main": [_g(ef, beam, rr) for ef in (32, 64, 128) for beam in (4, 8, 16) for rr in (0, 2)] + [_g(256, 16, 2)],
+    "wide": [_g(ef, beam, 2) for ef in (32, 64, 128) for beam in (8, 16, 32, 64)],
+    "graph": [_g(ef, beam, 2) for ef in (32, 64, 128, 256) for beam in (16, 32)] + [_g(512, 32, 2)],
+    "rr": [_g(ef, 4, rr) for ef in (16, 32, 64, 128, 256) for rr in (0, 2, 3)],
+    "ivf": ([_i(np_, 64, 0) for np_ in (8, 32, 128)]
+            + [_i(np_, rk, 2) for np_ in (4, 8, 16, 32, 64, 128, 256) for rk in (32, 64, 128)]
+            + [_i(512, 128, 2), _i(512, 256, 2)]),
 }
+
+
+def describe(p):
+    if "nprobe" in p:
+        return f"nprobe={p['nprobe']} R={p['rk']} rr={p['rerank']}"
+    return f"ef={p['ef']} W={p['beam']} rr={p['rerank']}"
 
 
 def main():
@@ -242,6 +305,7 @@ def main():
     ap.add_argument("--db", default=None, help="database path (default: ext/dense/build/<tag>.db)")
     ap.add_argument("--reuse", action="store_true", help="reuse an existing database")
     ap.add_argument("--tag", default=None)
+    ap.add_argument("--net-queries", type=int, default=50, help="queries per config simulated with netsim")
     args = ap.parse_args()
 
     tag = args.tag or f"{args.data}{'-' + str(args.n) if args.data == 'synth' else ''}-p{args.page_size}"
@@ -258,7 +322,7 @@ def main():
         info = build_db(path, X, args.params, args.page_size)
         c = info["config"]
         print(f"insert {info['insert_s']:.1f}s, build {info['build_s']:.1f}s "
-              f"(pq {c.get('build_ms_pq', 0) / 1e3:.1f}s, graph {c.get('build_ms_graph', 0) / 1e3:.1f}s, "
+              f"(coarse {c.get('build_ms_coarse', 0) / 1e3:.1f}s, pq {c.get('build_ms_pq', 0) / 1e3:.1f}s, graph {c.get('build_ms_graph', 0) / 1e3:.1f}s, "
               f"write {c.get('build_ms_write', 0) / 1e3:.1f}s), finalize {info['finalize_s']:.1f}s, "
               f"row {c.get('row_size')} B, avg degree {c.get('avg_degree', 0):.1f}", flush=True)
     del X
@@ -276,46 +340,54 @@ def main():
 
     rows = []
     groups = {"docs": slice(0, 200), "words": slice(200, 400)} if args.data.startswith("words-") else {}
-    hdr = ("| ef | W | rerank | recall@10 | vs PQ-exact | rounds | pages | KiB | expanded | dists "
-           "| warm miss pages | warm miss rounds | QPS |" + "".join(f" R@10 {g} |" for g in groups))
+    hdr = ("| config | recall@10 | vs PQ-exact | rounds | pages | KiB | expanded/scanned | "
+           "warm miss pages | warm miss rounds | 4g ms | slow-4g ms | QPS |" + "".join(f" R@10 {g} |" for g in groups))
     print(hdr)
     print("|---" * (hdr.count("|") - 1) + "|")
-    run_queries(db, Q[:5], args.k, 64, 4, 0)   # load codebook / entry set, warm caches
-    for ef, beam, rr in SWEEPS[args.sweep]:
-        ids, stats, secs = run_queries(db, Q, args.k, ef, beam, rr, trace=True)
+    _, st0, _ = run_queries(db, Q[:5], args.k, {})   # load the head, warm caches
+    setup_bytes = st0[0].get("setup_bytes", 0) if st0 else 0
+    pgsz = db.execute("PRAGMA page_size").fetchone()[0]
+    for p in SWEEPS[args.sweep]:
+        ids, stats, secs = run_queries(db, Q, args.k, p, trace=True)
         wp, wr = warm_cache_sim(stats)
+        sample = stats[:: max(1, len(stats) // args.net_queries)]
         r = {
-            "ef": ef, "beam": beam, "rerank": rr,
+            **p, "config": describe(p),
             "recall": recall(ids, gt, args.k), "recall_vs_pq": recall(ids, pq_ids, args.k),
             "rounds": float(np.mean([s["rounds"] for s in stats])),
             "pages": float(np.mean([s["pages"] for s in stats])),
             "kib": float(np.mean([s["bytes"] for s in stats])) / 1024,
-            "expanded": float(np.mean([s["expanded"] for s in stats])),
+            "expanded": float(np.mean([s["expanded"] + s.get("scanned", 0) for s in stats])),
             "dist": float(np.mean([s["dist"] for s in stats])),
             "fallback": float(np.mean([s["fallback"] for s in stats])),
             "warm_miss_pages": wp, "warm_miss_rounds": wr,
             "qps": len(Q) / secs, "ms_internal": float(np.mean([s["ms"] for s in stats])),
         }
+        for prof in PROFILES:
+            r["net_ms_" + prof] = float(np.mean([net_ms(s.get("trace", []), pgsz, prof) for s in sample]))
         for g, sl in groups.items():
             r["recall_" + g] = recall(ids[sl], gt[sl], args.k)
         rows.append(r)
-        print(f"| {ef} | {beam} | {rr} | {r['recall']:.3f} | {r['recall_vs_pq']:.3f} | {r['rounds']:.1f} "
-              f"| {r['pages']:.1f} | {r['kib']:.0f} | {r['expanded']:.1f} | {r['dist']:.0f} "
-              f"| {wp:.1f} | {wr:.1f} | {r['qps']:.0f} |"
+        print(f"| {r['config']} | {r['recall']:.3f} | {r['recall_vs_pq']:.3f} | {r['rounds']:.1f} "
+              f"| {r['pages']:.1f} | {r['kib']:.0f} | {r['expanded']:.0f} "
+              f"| {wp:.1f} | {wr:.1f} | {r['net_ms_4g']:.0f} | {r['net_ms_slow-4g']:.0f} | {r['qps']:.0f} |"
               + "".join(f" {r['recall_' + g]:.3f} |" for g in groups), flush=True)
         if r["fallback"]:
             print(f"  warning: {r['fallback']:.1f} SQL fallbacks per query (stale page hints?)")
     db.close()
 
-    cold = cold_query_pages(path, Q, args.k, 64, 16, 2)
-    print(f"cold connection, one query (ef=64, W=16, rerank=2): {cold['distinct']:.0f} distinct pages, "
+    cold = cold_query_pages(path, Q, args.k, {})
+    setup = {"setup_bytes": setup_bytes, **{"setup_ms_" + p: setup_ms(setup_bytes, pgsz, p) for p in PROFILES}}
+    print(f"setup (codebook + head): {setup_bytes / 1024:.0f} KiB, 4g {setup['setup_ms_4g']:.0f} ms, "
+          f"slow-4g {setup['setup_ms_slow-4g']:.0f} ms", flush=True)
+    print(f"cold connection, one query (defaults): {cold['distinct']:.0f} distinct pages, "
           f"{cold['reads']:.0f} reads, {cold['bytes'] / 1024:.0f} KiB", flush=True)
 
     out = HERE / "results"
     out.mkdir(exist_ok=True)
     with open(out / f"{tag}.json", "w") as f:
         json.dump({"tag": tag, "args": vars(args), "info": info, "pq_exact_recall": pq_recall,
-                   "cold_first_query": cold, "sweep": rows}, f, indent=1)
+                   "cold_first_query": cold, "setup": setup, "sweep": rows}, f, indent=1)
 
 
 if __name__ == "__main__":

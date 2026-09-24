@@ -18,8 +18,8 @@ ifeq ($(THREADS),1)
 CFLAGS  += -DDENSE_ANN_THREADS -pthread
 endif
 
-SRC = dense_ann.c pq.c hnsw.c rawpage.c
-HDR = dense_common.h pq.h hnsw.h rawpage.h
+SRC = dense_ann.c pq.c hnsw.c rawpage.c ivf.c
+HDR = dense_common.h pq.h hnsw.h rawpage.h ivf.h
 OUT = build
 
 all: $(OUT)/dense_ann.so $(OUT)/countvfs.so

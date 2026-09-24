@@ -39,16 +39,18 @@ SQLITE_EXTENSION_INIT1
 
 #include "dense_common.h"
 #include "hnsw.h"
+#include "ivf.h"
 #include "pq.h"
 #include "rawpage.h"
 
 /* ------------------------------------------------------------ constants */
 
 enum { VT_NONE = 0, VT_INT8 = 1, VT_F16 = 2, VT_F32 = 3 };
-enum { LAYOUT_COLOCATED = 0, LAYOUT_SEPARATE = 1 };
+enum { LAYOUT_COLOCATED = 0, LAYOUT_SEPARATE = 1, LAYOUT_IVF = 2 };
+enum { CENT_F16 = 0, CENT_INT8 = 1, CENT_PQ = 2 };
 enum { REORDER_AUTO = 0, REORDER_NONE = 1, REORDER_PACK = 2 };
-enum { T_NODES = 0, T_CODES = 1, T_VECS = 2, T_BLOBS = 3, T_COUNT = 4 };
-static const char *const TABLE_SUFFIX[T_COUNT] = { "nodes", "codes", "vectors", "blobs" };
+enum { T_NODES = 0, T_CODES = 1, T_VECS = 2, T_BLOBS = 3, T_LISTS = 4, T_COUNT = 5 };
+static const char *const TABLE_SUFFIX[T_COUNT] = { "nodes", "codes", "vectors", "blobs", "lists" };
 
 /* Blob chunks are kept below the 4 KiB-page local payload limit (4061 bytes)
 ** so they never need overflow pages. */
@@ -56,6 +58,8 @@ static const char *const TABLE_SUFFIX[T_COUNT] = { "nodes", "codes", "vectors", 
 #define CHUNK_ID_CODEBOOK 1
 #define CHUNK_ID_ENTRIES  1000000
 #define CHUNK_ID_ROTATION 2000000
+#define CHUNK_ID_IVF_HEAD 3000000
+#define CHUNK_ID_IVF_CPQ  4000000
 
 /* Node row header: u8 flags, u8 reserved, u16 degree, u32 vector-row page
 ** hint, i64 user rowid. */
@@ -65,7 +69,7 @@ static const char *const TABLE_SUFFIX[T_COUNT] = { "nodes", "codes", "vectors", 
 /* Virtual table columns. */
 enum {
   COL_EMBEDDING = 0, COL_DISTANCE, COL_K, COL_EF, COL_BEAM, COL_RERANK, COL_EXACT,
-  COL_TRACE, COL_STATS, COL_CMD, NCOL
+  COL_TRACE, COL_NPROBE, COL_RK, COL_STATS, COL_CMD, NCOL
 };
 
 /* xBestIndex flags, also the order in which xFilter consumes argv. */
@@ -78,6 +82,8 @@ enum {
 #define F_TRACE  0x040
 #define F_LIMIT  0x080
 #define F_ROWID  0x100
+#define F_NPROBE 0x200
+#define F_RK     0x400
 
 #ifndef SQLITE_INDEX_CONSTRAINT_LIMIT
 #define SQLITE_INDEX_CONSTRAINT_LIMIT 73
@@ -101,6 +107,11 @@ typedef struct DenseCfg {
   int page_hint;     /* page size assumed when packing nodes (0 = current) */
   int nthreads;
   int ef_default, beam_default, verbose;
+  /* IVF layout */
+  int nlist;         /* coarse lists (0 = 4 sqrt(n) at build) */
+  int ivf_residual;  /* 1: PQ-encode residuals x - centroid (IVFADC); 0: raw vectors */
+  int ivf_cent;      /* CENT_*: storage of the coarse centroids in the cached head */
+  int nprobe_default, rk_default;
 } DenseCfg;
 
 /* Byte layout of a node row, derived from the configuration. */
@@ -154,6 +165,14 @@ typedef struct DenseVtab {
   PQ pq;
   uint8_t *entries;  /* n_entry * (8 + m): u32 id, u32 page, code */
 
+  /* IVF head (loaded with the codebook) */
+  int nlist;
+  float *ivf_cent;   /* decoded centroids, nlist * dim */
+  float *ivf_cn;     /* squared norms */
+  uint8_t *ivf_head; /* stored head: centroids then directory */
+  uint8_t *ivf_dir;  /* nlist * 12 B: u32 nchunks, u32 first page, u32 last page */
+  PQ ivf_cpq;        /* PQ of the centroids (ivf_cent=pq only) */
+
   PageReader pr;
   int pr_state;      /* 0 = untried, 1 = ok, -1 = unavailable */
   sqlite3_stmt *st_get[T_COUNT];
@@ -162,7 +181,8 @@ typedef struct DenseVtab {
 typedef struct QStats {
   int rounds, pages, fallback, expanded, dist, entry_dist, rerank, rerank_rounds;
   int setup_rounds, setup_pages, raw, ann;
-  int64_t bytes;
+  int64_t bytes, setup_bytes;
+  int scanned, lists;
   double ms;
   sqlite3_str *trace;   /* JSON list of per-round page lists, or NULL */
   int ntrace;
@@ -176,7 +196,7 @@ typedef struct DenseCursor {
   Result *res; int nres, pos;
   sqlite3_stmt *scan;
   int scan_eof;
-  int64_t k, ef, beam, rerank, exact, trace;
+  int64_t k, ef, beam, rerank, exact, trace, nprobe, rk;
   char *stats;
 } DenseCursor;
 
@@ -335,6 +355,8 @@ static int save_params(DenseVtab *vt) {
   S("dnpq_train", c->train_max); S("kmeans_iters", c->iters); S("seed", c->seed); S("opq", c->opq);
   S("reorder", c->reorder); S("page_size_hint", c->page_hint); S("threads", c->nthreads);
   S("ef_search", c->ef_default); S("beam", c->beam_default); S("verbose", c->verbose);
+  S("nlist", c->nlist); S("ivf_residual", c->ivf_residual); S("ivf_centroids", c->ivf_cent);
+  S("nprobe", c->nprobe_default); S("rerank_k", c->rk_default);
 #undef S
   if (rc == SQLITE_OK) rc = CFG_DBL(vt, "alpha", c->alpha);
   return rc;
@@ -367,6 +389,8 @@ static int load_config(DenseVtab *vt) {
     G("dnpq_train", c->train_max); G("kmeans_iters", c->iters); G("seed", c->seed); G("opq", c->opq);
     G("reorder", c->reorder); G("page_size_hint", c->page_hint); G("threads", c->nthreads);
     G("ef_search", c->ef_default); G("beam", c->beam_default); G("verbose", c->verbose);
+    G("nlist", c->nlist); G("ivf_residual", c->ivf_residual); G("ivf_centroids", c->ivf_cent);
+    G("nprobe", c->nprobe_default); G("rerank_k", c->rk_default); G("ivf_nlist", vt->nlist);
     G("built", vt->built); G("n_nodes", vt->n_nodes); G("n_deleted", vt->n_deleted);
     G("next_id", vt->next_id); G("hints_valid", vt->hints_valid); G("n_entry", vt->n_entry);
     else if (strcmp(k, "alpha") == 0) c->alpha = sqlite3_column_double(st, 1);
@@ -384,6 +408,7 @@ static int parse_args(DenseCfg *c, int argc, const char *const *argv, char **pzE
   c->layout = LAYOUT_COLOCATED; c->n_entry = 1024; c->train_max = 65536; c->iters = 25;
   c->seed = 42; c->alpha = 1.0; c->reorder = REORDER_AUTO; c->nthreads = 4;
   c->ef_default = 64; c->beam_default = 16;
+  c->ivf_residual = 1; c->ivf_cent = CENT_F16; c->nprobe_default = 32; c->rk_default = 64;
   for (int i = 3; i < argc; i++) {
     char key[64], val[64];
     const char *a = argv[i], *eq = strchr(a, '=');
@@ -410,6 +435,16 @@ static int parse_args(DenseCfg *c, int argc, const char *const *argv, char **pzE
     else if (!strcmp(key, "page_size_hint")) c->page_hint = (int)iv;
     else if (!strcmp(key, "threads")) c->nthreads = (int)iv;
     else if (!strcmp(key, "verbose")) c->verbose = (int)iv;
+    else if (!strcmp(key, "nlist")) c->nlist = (int)iv;
+    else if (!strcmp(key, "nprobe")) c->nprobe_default = (int)iv;
+    else if (!strcmp(key, "rerank_k")) c->rk_default = (int)iv;
+    else if (!strcmp(key, "ivf_residual")) c->ivf_residual = (int)iv;
+    else if (!strcmp(key, "ivf_centroids")) {
+      if (!strcmp(val, "f16")) c->ivf_cent = CENT_F16;
+      else if (!strcmp(val, "int8")) c->ivf_cent = CENT_INT8;
+      else if (!strcmp(val, "pq")) c->ivf_cent = CENT_PQ;
+      else { *pzErr = sqlite3_mprintf("dense_ann: ivf_centroids must be f16, int8 or pq"); return SQLITE_ERROR; }
+    }
     else if (!strcmp(key, "metric")) {
       if (!strcmp(val, "cosine")) c->metric = METRIC_COSINE;
       else if (!strcmp(val, "ip")) c->metric = METRIC_IP;
@@ -428,7 +463,8 @@ static int parse_args(DenseCfg *c, int argc, const char *const *argv, char **pzE
     } else if (!strcmp(key, "layout")) {
       if (!strcmp(val, "colocated")) c->layout = LAYOUT_COLOCATED;
       else if (!strcmp(val, "separate")) c->layout = LAYOUT_SEPARATE;
-      else { *pzErr = sqlite3_mprintf("dense_ann: layout must be colocated or separate"); return SQLITE_ERROR; }
+      else if (!strcmp(val, "ivf")) c->layout = LAYOUT_IVF;
+      else { *pzErr = sqlite3_mprintf("dense_ann: layout must be colocated, separate or ivf"); return SQLITE_ERROR; }
     } else if (!strcmp(key, "reorder")) {
       if (!strcmp(val, "auto")) c->reorder = REORDER_AUTO;
       else if (!strcmp(val, "none")) c->reorder = REORDER_NONE;
@@ -447,6 +483,9 @@ static int parse_args(DenseCfg *c, int argc, const char *const *argv, char **pzE
   if (c->M0 > 255) { *pzErr = sqlite3_mprintf("dense_ann: M0 must be <= 255"); return SQLITE_ERROR; }
   if (c->efc < c->M) c->efc = c->M;
   if (c->vtype == VT_NONE) c->vinline = 0;
+  if (c->layout == LAYOUT_IVF) c->vinline = 0;   /* IVF keeps vectors in their own table */
+  if (c->nprobe_default < 1) c->nprobe_default = 1;
+  if (c->rk_default < 1) c->rk_default = 1;
   if (c->ef_default < 1) c->ef_default = 64;
   if (c->beam_default < 1) c->beam_default = 1;
   return SQLITE_OK;
@@ -536,6 +575,42 @@ static int cmp_u32(const void *a, const void *b) {
 ** direct reads, all uncached hinted pages are announced to the VFS together
 ** (so an HTTP VFS can fetch them in parallel), then read and parsed. Rows
 ** without a usable hint go through an SQL lookup (counted as fallbacks). */
+/* Announce and read pages (skipping ones already cached for this query) as
+** one round. Returns the number of pages actually read. */
+static int qc_load_pages(QCtx *qc, uint32_t *pages, int n, int *prc) {
+  DenseVtab *vt = qc->vt;
+  QStats *st = qc->st;
+  int m = 0;
+  for (int i = 0; i < n; i++) if (pages[i] && !pc_get(&qc->pc, pages[i])) pages[m++] = pages[i];
+  qsort(pages, m, sizeof(uint32_t), cmp_u32);
+  int u = 0;
+  for (int i = 0; i < m; i++) if (u == 0 || pages[i] != pages[u - 1]) pages[u++] = pages[i];
+  if (!u) return 0;
+  dnpr_prefetch(&vt->pr, pages, u);
+  if (st->trace) sqlite3_str_appendf(st->trace, "%s[", st->ntrace++ ? "," : "");
+  for (int i = 0; i < u; i++) {
+    uint8_t *buf = (uint8_t *)malloc(vt->pr.pgsz);
+    if (!buf) { *prc = SQLITE_NOMEM; break; }
+    if (dnpr_read(&vt->pr, pages[i], buf) != SQLITE_OK) { free(buf); continue; }
+    pc_put(&qc->pc, pages[i], buf);
+    st->pages++; st->bytes += vt->pr.pgsz;
+    if (st->trace) sqlite3_str_appendf(st->trace, "%s%u", i ? "," : "", pages[i]);
+  }
+  if (st->trace) sqlite3_str_appendf(st->trace, "]");
+  return u;
+}
+
+/* Look up row `id` of a table on page `page` in the query page cache. */
+static const uint8_t *qc_row_on_page(QCtx *qc, uint32_t page, int64_t id, int *len) {
+  const uint8_t *pg, *pl, *blob; int plen, blen;
+  if (!page || !(pg = pc_get(&qc->pc, page))) return NULL;
+  if (dnpr_leaf_find(&qc->vt->pr, pg, page, id, &pl, &plen) && dnpr_record_blob(pl, plen, 1, &blob, &blen)) {
+    *len = blen;
+    return blob;
+  }
+  return NULL;
+}
+
 static int q_fetch(QCtx *qc, int t, RowReq *r, int n) {
   DenseVtab *vt = qc->vt;
   QStats *st = qc->st;
@@ -546,25 +621,8 @@ static int q_fetch(QCtx *qc, int t, RowReq *r, int n) {
 
   if (qc->raw) {
     need = (uint32_t *)malloc(sizeof(uint32_t) * n);
-    for (int i = 0; i < n; i++)
-      if (r[i].page && !pc_get(&qc->pc, r[i].page)) need[nneed++] = r[i].page;
-    qsort(need, nneed, sizeof(uint32_t), cmp_u32);
-    int u = 0;
-    for (int i = 0; i < nneed; i++) if (u == 0 || need[i] != need[u - 1]) need[u++] = need[i];
-    nneed = u;
-    if (nneed) {
-      dnpr_prefetch(&vt->pr, need, nneed);
-      if (st->trace) sqlite3_str_appendf(st->trace, "%s[", st->ntrace++ ? "," : "");
-      for (int i = 0; i < nneed; i++) {
-        uint8_t *buf = (uint8_t *)malloc(vt->pr.pgsz);
-        if (!buf) { rc = SQLITE_NOMEM; break; }
-        if (dnpr_read(&vt->pr, need[i], buf) != SQLITE_OK) { free(buf); continue; }
-        pc_put(&qc->pc, need[i], buf);
-        st->pages++; st->bytes += vt->pr.pgsz;
-        if (st->trace) sqlite3_str_appendf(st->trace, "%s%u", i ? "," : "", need[i]);
-      }
-      if (st->trace) sqlite3_str_appendf(st->trace, "]");
-    }
+    for (int i = 0; i < n; i++) if (r[i].page) need[nneed++] = r[i].page;
+    nneed = qc_load_pages(qc, need, nneed, &rc);
     for (int i = 0; i < n; i++) {
       const uint8_t *page, *pl, *blob; int len, blen;
       if (!r[i].page || !(page = pc_get(&qc->pc, r[i].page))) continue;
@@ -625,67 +683,87 @@ static int write_chunks(DenseVtab *vt, int64_t first_id, const uint8_t *data, in
   return rc;
 }
 
-/* Load the codebook and entry set (once per connection). Both chunk lists
-** are fetched in a single round. */
+/* Chunked blobs that make up the cached index head, by config key. */
+static const char *const HEAD_LISTS[] = {
+  "codebook_chunks", "entry_chunks", "rotation_chunks", "ivf_head_chunks", "ivf_cpq_chunks"
+};
+#define NHEAD 5
+
+static size_t ivf_cent_bytes(const DenseCfg *c);
+static int ivf_decode_head(DenseVtab *vt);
+
+/* Load the index head (once per connection): PQ codebook, entry set or IVF
+** centroids and directory, optional rotation. All chunks of all parts are
+** fetched in a single round. */
 static int ensure_loaded(DenseVtab *vt, int raw, QStats *st) {
   if (vt->loaded) return SQLITE_OK;
-  uint8_t *cl = NULL, *el = NULL, *rl_ = NULL;
-  int ncl = 0, nel = 0, nrl = 0, rc;
-  rc = cfg_get_blob(vt, "codebook_chunks", &cl, &ncl);
-  if (rc == SQLITE_OK) rc = cfg_get_blob(vt, "entry_chunks", &el, &nel);
-  if (rc == SQLITE_OK) rc = cfg_get_blob(vt, "rotation_chunks", &rl_, &nrl);
-  int nc = ncl / 8, ne = nel / 8, nr = nrl / 8;
-  RowReq *req = (RowReq *)calloc(nc + ne + nr + 1, sizeof(RowReq));
-  for (int i = 0; i < nc; i++) { req[i].id = dn_rd32(cl + 8 * i); req[i].page = dn_rd32(cl + 8 * i + 4); }
-  for (int i = 0; i < ne; i++) { req[nc + i].id = dn_rd32(el + 8 * i); req[nc + i].page = dn_rd32(el + 8 * i + 4); }
-  for (int i = 0; i < nr; i++) { req[nc + ne + i].id = dn_rd32(rl_ + 8 * i); req[nc + ne + i].page = dn_rd32(rl_ + 8 * i + 4); }
+  const DenseCfg *c = &vt->cfg;
+  uint8_t *lists[NHEAD]; int nl[NHEAD], total = 0, rc = SQLITE_OK;
+  for (int h = 0; h < NHEAD; h++) {
+    lists[h] = NULL; nl[h] = 0;
+    if (rc == SQLITE_OK) rc = cfg_get_blob(vt, HEAD_LISTS[h], &lists[h], &nl[h]);
+    nl[h] /= 8; total += nl[h];
+  }
+  RowReq *req = (RowReq *)calloc(total + 1, sizeof(RowReq));
+  for (int h = 0, k = 0; h < NHEAD; h++)
+    for (int i = 0; i < nl[h]; i++, k++) { req[k].id = dn_rd32(lists[h] + 8 * i); req[k].page = dn_rd32(lists[h] + 8 * i + 4); }
 
   QStats lst; memset(&lst, 0, sizeof lst);
   QCtx qc; qc_init(&qc, vt, raw && vt->hints_valid && ensure_pr(vt), &lst);
-  if (rc == SQLITE_OK) rc = q_fetch(&qc, T_BLOBS, req, nc + ne + nr);
+  if (rc == SQLITE_OK) rc = q_fetch(&qc, T_BLOBS, req, total);
 
-  const DenseCfg *c = &vt->cfg;
+  /* Concatenate each part. */
+  uint8_t *part[NHEAD]; size_t plen[NHEAD];
+  for (int h = 0, k = 0; h < NHEAD; h++) {
+    plen[h] = 0;
+    for (int i = 0; i < nl[h]; i++) plen[h] += req[k + i].len;
+    part[h] = (uint8_t *)malloc(plen[h] ? plen[h] : 1);
+    size_t pos = 0;
+    for (int i = 0; i < nl[h]; i++, k++) {
+      if (!req[k].data) { if (rc == SQLITE_OK) rc = SQLITE_CORRUPT; continue; }
+      memcpy(part[h] + pos, req[k].data, req[k].len);
+      pos += req[k].len;
+    }
+  }
   size_t cb_vals = (size_t)c->m * PQ_KSUB * (c->dim / c->m);
   if (rc == SQLITE_OK) {
     dnpq_free(&vt->pq);
     if (dnpq_init(&vt->pq, c->dim, c->m)) rc = SQLITE_NOMEM;
   }
-  /* Concatenate the codebook chunks (float16 values). */
-  size_t pos = 0;
-  for (int i = 0; i < nc && rc == SQLITE_OK; i++) {
-    if (!req[i].data) { rc = SQLITE_CORRUPT; break; }
-    for (int j = 0; j + 1 < req[i].len && pos < cb_vals; j += 2)
-      vt->pq.cent[pos++] = dn_f16_to_f32(dn_rd16(req[i].data + j));
-  }
-  if (rc == SQLITE_OK && pos != cb_vals) rc = SQLITE_CORRUPT;
-  size_t esz = (size_t)vt->n_entry * (8 + c->m), epos = 0;
-  free(vt->entries);
-  vt->entries = (uint8_t *)malloc(esz ? esz : 1);
-  for (int i = 0; i < ne && rc == SQLITE_OK; i++) {
-    const RowReq *q = &req[nc + i];
-    if (!q->data || epos + q->len > esz) { rc = SQLITE_CORRUPT; break; }
-    memcpy(vt->entries + epos, q->data, q->len);
-    epos += q->len;
-  }
-  if (rc == SQLITE_OK && epos != esz) rc = SQLITE_CORRUPT;
-  if (rc == SQLITE_OK && nr > 0) {
-    /* OPQ rotation, float16. */
-    size_t nrot = (size_t)c->dim * c->dim, rpos = 0;
-    vt->pq.rot = (float *)malloc(sizeof(float) * nrot);
-    for (int i = 0; i < nr && rc == SQLITE_OK; i++) {
-      const RowReq *q = &req[nc + ne + i];
-      if (!q->data) { rc = SQLITE_CORRUPT; break; }
-      for (int j = 0; j + 1 < q->len && rpos < nrot; j += 2) vt->pq.rot[rpos++] = dn_f16_to_f32(dn_rd16(q->data + j));
+  if (rc == SQLITE_OK && plen[0] != cb_vals * 2) rc = SQLITE_CORRUPT;
+  for (size_t i = 0; rc == SQLITE_OK && i < cb_vals; i++) vt->pq.cent[i] = dn_f16_to_f32(dn_rd16(part[0] + 2 * i));
+  size_t esz = (size_t)vt->n_entry * (8 + c->m);
+  if (rc == SQLITE_OK && plen[1] != esz) rc = SQLITE_CORRUPT;
+  if (rc == SQLITE_OK) { free(vt->entries); vt->entries = part[1]; part[1] = NULL; }
+  if (rc == SQLITE_OK && plen[2] > 0) {
+    size_t nrot = (size_t)c->dim * c->dim;
+    if (plen[2] != nrot * 2) rc = SQLITE_CORRUPT;
+    else {
+      vt->pq.rot = (float *)malloc(sizeof(float) * nrot);
+      for (size_t i = 0; i < nrot; i++) vt->pq.rot[i] = dn_f16_to_f32(dn_rd16(part[2] + 2 * i));
     }
-    if (rc == SQLITE_OK && rpos != nrot) rc = SQLITE_CORRUPT;
   }
+  if (rc == SQLITE_OK && c->layout == LAYOUT_IVF) {
+    if (plen[3] != (size_t)vt->nlist * (ivf_cent_bytes(c) + 12)) rc = SQLITE_CORRUPT;
+    if (rc == SQLITE_OK && c->ivf_cent == CENT_PQ) {
+      dnpq_free(&vt->ivf_cpq);
+      if (dnpq_init(&vt->ivf_cpq, c->dim, c->m)) rc = SQLITE_NOMEM;
+      else if (plen[4] != cb_vals * 2) rc = SQLITE_CORRUPT;
+      else for (size_t i = 0; i < cb_vals; i++) vt->ivf_cpq.cent[i] = dn_f16_to_f32(dn_rd16(part[4] + 2 * i));
+    }
+    if (rc == SQLITE_OK) {
+      free(vt->ivf_head); vt->ivf_head = part[3]; part[3] = NULL;
+      rc = ivf_decode_head(vt);
+    }
+  }
+  for (int h = 0; h < NHEAD; h++) { free(part[h]); free(lists[h]); }
   qc_free(&qc);
-  free(req); free(cl); free(el); free(rl_);
+  free(req);
   if (rc == SQLITE_OK) {
     vt->loaded = 1;
-    if (st) { st->setup_rounds += lst.rounds; st->setup_pages += lst.pages; st->bytes += lst.bytes; }
+    if (st) { st->setup_rounds += lst.rounds; st->setup_pages += lst.pages; st->setup_bytes += lst.bytes; }
   } else {
-    set_err(vt, "dense_ann: could not load codebook / entry set");
+    set_err(vt, "dense_ann: could not load the index head (codebook, entry set / centroids)");
   }
   return rc;
 }
@@ -936,7 +1014,7 @@ static int exact_search(DenseVtab *vt, const float *q, int k, int mode, Result *
     rc = prep_fmt(vt->db, &s, "SELECT r.rowid, n.data FROM \"%w\".\"%w_rowids\" r JOIN \"%w\".\"%w_nodes\" n ON n.id = r.node",
                   vt->zDb, vt->zName, vt->zDb, vt->zName);
   } else {
-    rc = prep_fmt(vt->db, &s, "SELECT r.rowid, v.data FROM \"%w\".\"%w_rowids\" r JOIN \"%w\".\"%w_vectors\" v ON v.id = r.node",
+    rc = prep_fmt(vt->db, &s, "SELECT r.rowid, v.data FROM \"%w\".\"%w_rowids\" r JOIN \"%w\".\"%w_vectors\" v ON v.id = (r.node & 4294967295)",
                   vt->zDb, vt->zName, vt->zDb, vt->zName);
   }
   if (rc) { free(tab); return rc; }
@@ -1036,6 +1114,8 @@ static void order_nodes(const Hnsw *h, int per_page, uint32_t *perm) {
   free(lq); free(bfs); free(seen);
 }
 
+static int build_ivf(DenseVtab *vt, const float *X, const int64_t *rowids, int64_t n, double t0, double t_load);
+
 static int do_build(DenseVtab *vt) {
   DenseCfg *c = &vt->cfg;
   const RowLayout *rl = &vt->rl;
@@ -1066,9 +1146,20 @@ static int do_build(DenseVtab *vt) {
   }
   sqlite3_finalize(st); st = 0;
   if (rc == SQLITE_OK && i != n) rc = SQLITE_CORRUPT;
-  if (rc == SQLITE_OK) rc = exec_fmt(vt->db, "DELETE FROM \"%w\".\"%w_buffer\"", vt->zDb, vt->zName);
+  /* The graph layout frees the buffer first so its pages are reused. The IVF
+  ** layout frees it afterwards: reusing scattered freelist pages would break
+  ** the contiguous page ranges of the posting lists (VACUUM reclaims it). */
+  if (rc == SQLITE_OK && c->layout != LAYOUT_IVF)
+    rc = exec_fmt(vt->db, "DELETE FROM \"%w\".\"%w_buffer\"", vt->zDb, vt->zName);
   if (rc) { free(X); free(rowids); set_err(vt, "dense_ann: build: %s", sqlite3_errmsg(vt->db)); return rc; }
   double t_load = now_ms();
+
+  if (c->layout == LAYOUT_IVF) {
+    rc = build_ivf(vt, X, rowids, n, t0, t_load);
+    free(X); free(rowids);
+    if (rc == SQLITE_OK) rc = exec_fmt(vt->db, "DELETE FROM \"%w\".\"%w_buffer\"", vt->zDb, vt->zName);
+    return rc;
+  }
 
   /* 2. Train PQ and encode everything. The codebook is rounded to float16
   **    first, because that is what is stored. */
@@ -1234,13 +1325,33 @@ static void walk_map_cb(void *ctx, int64_t rowid, uint32_t pgno, int overflow) {
   if (rowid >= 0 && (uint64_t)rowid < w->n) w->pages[rowid] = pgno;
 }
 
-typedef struct { uint8_t *lists[3]; int n[3]; int64_t overflow; } BlobMap;
+typedef struct { uint8_t *lists[NHEAD]; int n[NHEAD]; int64_t overflow; } BlobMap;
 static void walk_blob_cb(void *ctx, int64_t rowid, uint32_t pgno, int overflow) {
   BlobMap *b = (BlobMap *)ctx;
   if (overflow) { b->overflow++; return; }
-  for (int l = 0; l < 3; l++)
+  for (int l = 0; l < NHEAD; l++)
     for (int i = 0; i < b->n[l]; i++)
       if (dn_rd32(b->lists[l] + 8 * i) == (uint32_t)rowid) dn_wr32(b->lists[l] + 8 * i + 4, pgno);
+}
+
+static int table_root(DenseVtab *vt, const char *suffix, uint32_t *root);
+static int update_chunks(DenseVtab *vt, int64_t first_id, const uint8_t *data, int64_t len);
+static int finalize_ivf(DenseVtab *vt);
+
+/* Record the pages of all head chunks in their config lists. */
+static int finalize_blob_lists(DenseVtab *vt, int rc) {
+  BlobMap bm; memset(&bm, 0, sizeof bm);
+  for (int h = 0; h < NHEAD && rc == SQLITE_OK; h++) {
+    rc = cfg_get_blob(vt, HEAD_LISTS[h], &bm.lists[h], &bm.n[h]);
+    bm.n[h] /= 8;
+  }
+  uint32_t broot;
+  if (rc == SQLITE_OK) rc = table_root(vt, "blobs", &broot);
+  if (rc == SQLITE_OK) rc = dnpr_walk_table(&vt->pr, broot, walk_blob_cb, &bm);
+  for (int h = 0; h < NHEAD && rc == SQLITE_OK; h++)
+    if (bm.n[h]) rc = CFG_BLOB(vt, HEAD_LISTS[h], bm.lists[h], bm.n[h] * 8);
+  for (int h = 0; h < NHEAD; h++) free(bm.lists[h]);
+  return rc;
 }
 
 static int table_root(DenseVtab *vt, const char *suffix, uint32_t *root) {
@@ -1283,6 +1394,18 @@ static int do_finalize(DenseVtab *vt) {
   }
   rc = ensure_loaded(vt, 0, NULL);
   if (rc) return rc;
+
+  if (c->layout == LAYOUT_IVF) {
+    rc = finalize_ivf(vt);
+    if (rc == SQLITE_OK) {
+      vt->hints_valid = 1;
+      rc = save_state(vt);
+      if (rc == SQLITE_OK) rc = CFG_INT(vt, "finalize_page_size", vt->pr.pgsz);
+    }
+    vt->loaded = 0;
+    if (rc && !vt->base.zErrMsg) set_err(vt, "dense_ann: finalize failed: %s", sqlite3_errmsg(vt->db));
+    return rc;
+  }
 
   uint32_t n = vt->next_id;
   WalkMap wn = { (uint32_t *)calloc(n ? n : 1, 4), n, 0, 0 };
@@ -1348,22 +1471,11 @@ static int do_finalize(DenseVtab *vt) {
       uint32_t id = dn_rd32(p);
       dn_wr32(p + 4, id < n ? wn.pages[id] : 0);
     }
-    rc = write_chunks(vt, CHUNK_ID_ENTRIES, vt->entries, (int64_t)vt->n_entry * estride, &list, &nlist);
-    free(list);
+    rc = update_chunks(vt, CHUNK_ID_ENTRIES, vt->entries, (int64_t)vt->n_entry * estride);
+    (void)list; (void)nlist;
   }
-  /* Blob chunk pages (codebook and entries) go into the config. */
-  BlobMap bm; memset(&bm, 0, sizeof bm);
-  if (rc == SQLITE_OK) rc = cfg_get_blob(vt, "codebook_chunks", &bm.lists[0], &bm.n[0]);
-  if (rc == SQLITE_OK) rc = cfg_get_blob(vt, "entry_chunks", &bm.lists[1], &bm.n[1]);
-  if (rc == SQLITE_OK) rc = cfg_get_blob(vt, "rotation_chunks", &bm.lists[2], &bm.n[2]);
-  bm.n[0] /= 8; bm.n[1] /= 8; bm.n[2] /= 8;
-  uint32_t broot;
-  if (rc == SQLITE_OK) rc = table_root(vt, "blobs", &broot);
-  if (rc == SQLITE_OK) rc = dnpr_walk_table(&vt->pr, broot, walk_blob_cb, &bm);
-  if (rc == SQLITE_OK) rc = CFG_BLOB(vt, "codebook_chunks", bm.lists[0], bm.n[0] * 8);
-  if (rc == SQLITE_OK) rc = CFG_BLOB(vt, "entry_chunks", bm.lists[1], bm.n[1] * 8);
-  if (rc == SQLITE_OK && bm.n[2]) rc = CFG_BLOB(vt, "rotation_chunks", bm.lists[2], bm.n[2] * 8);
-  free(bm.lists[0]); free(bm.lists[1]); free(bm.lists[2]);
+  /* Blob chunk pages (every part of the head) go into the config. */
+  rc = finalize_blob_lists(vt, rc);
 
   if (rc == SQLITE_OK) {
     vt->hints_valid = 1;
@@ -1567,9 +1679,11 @@ static int insert_built(DenseVtab *vt, int64_t rowid, const float *x) {
 
 /* Delete: before build, drop from the buffer. After build, the node stays in
 ** the graph as a routing node, flagged deleted, and leaves the rowid map. */
+static int delete_ivf(DenseVtab *vt, int64_t rowid);
 static int delete_row(DenseVtab *vt, int64_t rowid) {
   if (!vt->built)
     return exec_fmt(vt->db, "DELETE FROM \"%w\".\"%w_buffer\" WHERE rowid = %lld", vt->zDb, vt->zName, (long long)rowid);
+  if (vt->cfg.layout == LAYOUT_IVF) return delete_ivf(vt, rowid);
   sqlite3_stmt *s = 0;
   int64_t node = -1;
   int rc = PREP(vt, &s, "SELECT node FROM \"%w\".\"%w_rowids\" WHERE rowid = ?1");
@@ -1603,6 +1717,628 @@ static int delete_row(DenseVtab *vt, int64_t rowid) {
   return rc;
 }
 
+/* ================================================================== IVF
+**
+** layout=ivf: an IVF-PQ index (IVFADC). The coarse centroids and a list
+** directory form the cached head, loaded once with the PQ codebook. Each
+** list is stored as consecutive rows of <name>_lists keyed (list << 20 | j),
+** each row ("chunk") at most IVF_CHUNK_BYTES so it never overflows a 4 KiB
+** page. Because the lists are written list by list, each occupies a
+** contiguous page range; the directory records it, so probing nprobe lists
+** is one round of nprobe range requests. The top rerank_k candidates are then
+** rescored with stored vectors (a second round).
+**
+** Chunk: u16 count | u16 reserved | u32 first slot | u32 first vector page
+**        count x { u32 rowid | u8 page delta | PQ code (m bytes) }
+** Entry i refers to vector row (slot) first_slot + i, stored on page
+** first_vector_page + delta (delta 0xFF = unknown, 0xFE = deleted).
+** Directory entry per list: u32 nchunks | u32 first page | u32 last page.
+** The rowid map stores node = (list << 32) | slot.
+*/
+#define IVF_CHUNK_BYTES 4000
+#define IVF_CHUNK_HDR 12
+#define IVF_LIST_SHIFT 20
+#define IVF_DELTA_UNKNOWN 0xFF
+#define IVF_DELTA_DELETED 0xFE
+
+static int ivf_entry_bytes(const DenseCfg *c) { return 5 + c->m; }
+static int ivf_chunk_cap(const DenseCfg *c) { return (IVF_CHUNK_BYTES - IVF_CHUNK_HDR) / ivf_entry_bytes(c); }
+
+static size_t ivf_cent_bytes(const DenseCfg *c) {
+  if (c->ivf_cent == CENT_PQ) return (size_t)c->m;
+  if (c->ivf_cent == CENT_INT8) return (size_t)vec_bytes_for(VT_INT8, c->dim);
+  return (size_t)vec_bytes_for(VT_F16, c->dim);
+}
+
+static DenseCfg ivf_cent_cfg(const DenseCfg *c) {
+  DenseCfg tc = *c;
+  tc.vtype = c->ivf_cent == CENT_INT8 ? VT_INT8 : VT_F16;
+  return tc;
+}
+
+/* Decode centroids from the stored head into vt->ivf_cent / ivf_cn. */
+static int ivf_decode_head(DenseVtab *vt) {
+  const DenseCfg *c = &vt->cfg;
+  int nl = vt->nlist, dim = c->dim;
+  size_t cb = ivf_cent_bytes(c);
+  DenseCfg tc = ivf_cent_cfg(c);
+  free(vt->ivf_cent); free(vt->ivf_cn);
+  vt->ivf_cent = (float *)malloc(sizeof(float) * (size_t)nl * dim);
+  vt->ivf_cn = (float *)malloc(sizeof(float) * (nl ? nl : 1));
+  if (!vt->ivf_cent || !vt->ivf_cn) return SQLITE_NOMEM;
+  for (int j = 0; j < nl; j++) {
+    const uint8_t *src = vt->ivf_head + (size_t)j * cb;
+    float *dst = vt->ivf_cent + (size_t)j * dim;
+    if (c->ivf_cent == CENT_PQ) dnpq_decode(&vt->ivf_cpq, src, dst);
+    else vec_decode(&tc, src, dst);
+    vt->ivf_cn[j] = dn_dot(dst, dst, dim);
+  }
+  vt->ivf_dir = vt->ivf_head + (size_t)nl * cb;
+  return SQLITE_OK;
+}
+
+static int ivf_head_len(const DenseVtab *vt) { return (int)((size_t)vt->nlist * (ivf_cent_bytes(&vt->cfg) + 12)); }
+
+/* Overwrite existing chunk rows in place (same sizes as when written). */
+static int update_chunks(DenseVtab *vt, int64_t first_id, const uint8_t *data, int64_t len) {
+  sqlite3_stmt *st = 0;
+  int rc = PREP(vt, &st, "UPDATE \"%w\".\"%w_blobs\" SET data = ?2 WHERE id = ?1");
+  int nchunks = (int)((len + CHUNK_BYTES - 1) / CHUNK_BYTES);
+  for (int i = 0; i < nchunks && rc == SQLITE_OK; i++) {
+    int64_t off = (int64_t)i * CHUNK_BYTES;
+    int sz = (int)(len - off < CHUNK_BYTES ? len - off : CHUNK_BYTES);
+    sqlite3_bind_int64(st, 1, first_id + i);
+    sqlite3_bind_blob(st, 2, data + off, sz, SQLITE_STATIC);
+    rc = sqlite3_step(st) == SQLITE_DONE ? SQLITE_OK : SQLITE_ERROR;
+    sqlite3_reset(st);
+  }
+  sqlite3_finalize(st);
+  return rc;
+}
+
+static int write_named_chunks(DenseVtab *vt, const char *key, int64_t first_id, const uint8_t *data, int64_t len) {
+  uint8_t *list = NULL; int nlist = 0;
+  int rc = write_chunks(vt, first_id, data, len, &list, &nlist);
+  if (rc == SQLITE_OK) rc = CFG_BLOB(vt, key, list, nlist);
+  free(list);
+  return rc;
+}
+
+static int build_ivf(DenseVtab *vt, const float *X, const int64_t *rowids, int64_t n, double t0, double t_load) {
+  DenseCfg *c = &vt->cfg;
+  const int dim = c->dim, m = c->m;
+  int rc = SQLITE_OK;
+  sqlite3_stmt *st = 0;
+  for (int64_t i = 0; i < n; i++)
+    if (rowids[i] < 0 || rowids[i] > 0xFFFFFFFFLL) { set_err(vt, "dense_ann: layout=ivf needs rowids in [0, 2^32)"); return SQLITE_ERROR; }
+  int nlist = c->nlist > 0 ? c->nlist : (int)(4 * sqrt((double)n));
+  if (nlist < 1) nlist = 1;
+  if (nlist > n) nlist = (int)n;
+
+  /* 1. Coarse k-means (10 iterations on a sample of up to 64 points/list). */
+  float *C = (float *)malloc(sizeof(float) * (size_t)nlist * dim);
+  int64_t sample = (int64_t)nlist * 64 > 65536 ? (int64_t)nlist * 64 : 65536;
+  dnivf_kmeans(X, n, dim, nlist, sample, 10, (uint64_t)c->seed, c->nthreads, c->verbose, C);
+
+  /* 2. Store centroids in the head format and use the decoded ones from here on. */
+  size_t cb = ivf_cent_bytes(c);
+  uint8_t *head = (uint8_t *)calloc((size_t)nlist * (cb + 12), 1);
+  PQ cpq; memset(&cpq, 0, sizeof cpq);
+  if (c->ivf_cent == CENT_PQ) {
+    dnpq_train(&cpq, C, nlist, dim, m, nlist, 25, 0, (uint64_t)c->seed ^ 0xC0A5, c->nthreads);
+    dnpq_round_f16(&cpq);
+    dnpq_encode_many(&cpq, C, nlist, head, c->nthreads);   /* codes are contiguous: stride m = cb */
+  } else {
+    DenseCfg tc = ivf_cent_cfg(c);
+    for (int j = 0; j < nlist; j++) vec_encode(&tc, C + (size_t)j * dim, head + (size_t)j * cb);
+  }
+  free(C);
+  vt->nlist = nlist;
+  vt->ivf_head = head;
+  dnpq_free(&vt->ivf_cpq); vt->ivf_cpq = cpq;
+  rc = ivf_decode_head(vt);
+  double t_coarse = now_ms();
+  if (c->verbose) fprintf(stderr, "dense_ann: coarse quantiser (%d lists) in %.1fs\n", nlist, (t_coarse - t_load) / 1e3);
+
+  /* 3. Assign, form residuals, train PQ on them and encode. */
+  int32_t *assign = (int32_t *)malloc(sizeof(int32_t) * n);
+  dnivf_assign(X, n, dim, vt->ivf_cent, nlist, c->nthreads, assign);
+  const float *Rx = X;
+  float *Rbuf = NULL;
+  if (c->ivf_residual) {
+    Rbuf = (float *)malloc(sizeof(float) * (size_t)n * dim);
+    for (int64_t i = 0; i < n; i++) {
+      const float *x = X + (size_t)i * dim, *cc = vt->ivf_cent + (size_t)assign[i] * dim;
+      float *r = Rbuf + (size_t)i * dim;
+      for (int t = 0; t < dim; t++) r[t] = x[t] - cc[t];
+    }
+    Rx = Rbuf;
+  }
+  PQ pq;
+  if (dnpq_train(&pq, Rx, n, dim, m, c->train_max, c->iters, c->opq, (uint64_t)c->seed, c->nthreads)) {
+    free(assign); free(Rbuf); return SQLITE_NOMEM;
+  }
+  dnpq_round_f16(&pq);
+  uint8_t *codes = (uint8_t *)malloc((size_t)n * m);
+  dnpq_encode_many(&pq, Rx, n, codes, c->nthreads);
+  free(Rbuf);
+  double t_pq = now_ms();
+  if (c->verbose) fprintf(stderr, "dense_ann: pq trained+encoded in %.1fs\n", (t_pq - t_coarse) / 1e3);
+
+  /* 4. Order by (list, rowid): slots are positions in that order. */
+  int64_t *start = (int64_t *)calloc((size_t)nlist + 1, sizeof(int64_t));
+  for (int64_t i = 0; i < n; i++) start[assign[i] + 1]++;
+  for (int j = 0; j < nlist; j++) start[j + 1] += start[j];
+  int64_t *fill = (int64_t *)malloc(sizeof(int64_t) * (nlist ? nlist : 1));
+  memcpy(fill, start, sizeof(int64_t) * nlist);
+  uint32_t *order = (uint32_t *)malloc(sizeof(uint32_t) * n), *slot_of = (uint32_t *)malloc(sizeof(uint32_t) * n);
+  for (int64_t i = 0; i < n; i++) { int64_t s = fill[assign[i]]++; order[s] = (uint32_t)i; slot_of[i] = (uint32_t)s; }
+  free(fill);
+
+  /* 5. Posting lists, list by list, so each list is a contiguous page range. */
+  const int eb = ivf_entry_bytes(c), cap = ivf_chunk_cap(c);
+  uint8_t *chunk = (uint8_t *)malloc(IVF_CHUNK_BYTES);
+  uint8_t *dir = head + (size_t)nlist * cb;
+  int64_t nchunks_total = 0;
+  if (rc == SQLITE_OK) rc = PREP(vt, &st, "INSERT INTO \"%w\".\"%w_lists\"(id, data) VALUES (?1, ?2)");
+  for (int L = 0; L < nlist && rc == SQLITE_OK; L++) {
+    int64_t s0 = start[L], s1 = start[L + 1];
+    uint32_t nch = 0;
+    for (int64_t s = s0; s < s1 && rc == SQLITE_OK; s += cap, nch++) {
+      int cnt = (int)(s1 - s < cap ? s1 - s : cap);
+      memset(chunk, 0, IVF_CHUNK_HDR);
+      dn_wr16(chunk, (uint16_t)cnt);
+      dn_wr32(chunk + 4, (uint32_t)s);
+      for (int e = 0; e < cnt; e++) {
+        uint32_t o = order[s + e];
+        uint8_t *ent = chunk + IVF_CHUNK_HDR + (size_t)e * eb;
+        dn_wr32(ent, (uint32_t)rowids[o]);
+        ent[4] = IVF_DELTA_UNKNOWN;
+        memcpy(ent + 5, codes + (size_t)o * m, m);
+      }
+      sqlite3_bind_int64(st, 1, ((int64_t)L << IVF_LIST_SHIFT) | nch);
+      sqlite3_bind_blob(st, 2, chunk, IVF_CHUNK_HDR + cnt * eb, SQLITE_STATIC);
+      if (sqlite3_step(st) != SQLITE_DONE) rc = SQLITE_ERROR;
+      sqlite3_reset(st);
+    }
+    dn_wr32(dir + (size_t)L * 12, nch);
+    nchunks_total += nch;
+  }
+  sqlite3_finalize(st); st = 0;
+  free(chunk);
+
+  /* 6. Stored vectors by slot, and the rowid map (in rowid order). */
+  if (rc == SQLITE_OK && c->vtype != VT_NONE) {
+    uint8_t *vb = (uint8_t *)malloc(vt->rl.vec_bytes);
+    rc = PREP(vt, &st, "INSERT INTO \"%w\".\"%w_vectors\"(id, data) VALUES (?1, ?2)");
+    for (int64_t s = 0; s < n && rc == SQLITE_OK; s++) {
+      vec_encode(c, X + (size_t)order[s] * dim, vb);
+      sqlite3_bind_int64(st, 1, s);
+      sqlite3_bind_blob(st, 2, vb, vt->rl.vec_bytes, SQLITE_STATIC);
+      if (sqlite3_step(st) != SQLITE_DONE) rc = SQLITE_ERROR;
+      sqlite3_reset(st);
+    }
+    sqlite3_finalize(st); st = 0;
+    free(vb);
+  }
+  if (rc == SQLITE_OK) rc = PREP(vt, &st, "INSERT INTO \"%w\".\"%w_rowids\"(rowid, node) VALUES (?1, ?2)");
+  for (int64_t i = 0; i < n && rc == SQLITE_OK; i++) {
+    sqlite3_bind_int64(st, 1, rowids[i]);
+    sqlite3_bind_int64(st, 2, ((int64_t)assign[i] << 32) | slot_of[i]);
+    if (sqlite3_step(st) != SQLITE_DONE) rc = SQLITE_ERROR;
+    sqlite3_reset(st);
+  }
+  sqlite3_finalize(st); st = 0;
+
+  /* 7. Head parts: PQ codebook, rotation, centroids + directory, centroid PQ. */
+  size_t cb_vals = (size_t)m * PQ_KSUB * pq.dsub;
+  uint8_t *buf = (uint8_t *)malloc(cb_vals * 2 > (size_t)dim * dim * 2 ? cb_vals * 2 : (size_t)dim * dim * 2);
+  for (size_t j = 0; j < cb_vals; j++) dn_wr16(buf + 2 * j, dn_f32_to_f16(pq.cent[j]));
+  if (rc == SQLITE_OK) rc = write_named_chunks(vt, "codebook_chunks", CHUNK_ID_CODEBOOK, buf, (int64_t)cb_vals * 2);
+  if (rc == SQLITE_OK && pq.rot) {
+    for (size_t j = 0; j < (size_t)dim * dim; j++) dn_wr16(buf + 2 * j, dn_f32_to_f16(pq.rot[j]));
+    rc = write_named_chunks(vt, "rotation_chunks", CHUNK_ID_ROTATION, buf, (int64_t)dim * dim * 2);
+  }
+  if (rc == SQLITE_OK && c->ivf_cent == CENT_PQ) {
+    for (size_t j = 0; j < cb_vals; j++) dn_wr16(buf + 2 * j, dn_f32_to_f16(vt->ivf_cpq.cent[j]));
+    rc = write_named_chunks(vt, "ivf_cpq_chunks", CHUNK_ID_IVF_CPQ, buf, (int64_t)cb_vals * 2);
+  }
+  free(buf);
+  if (rc == SQLITE_OK) rc = write_named_chunks(vt, "ivf_head_chunks", CHUNK_ID_IVF_HEAD, head, ivf_head_len(vt));
+  if (rc == SQLITE_OK) rc = CFG_BLOB(vt, "entry_chunks", "", 0);
+
+  if (rc == SQLITE_OK) {
+    vt->built = 1; vt->n_nodes = n; vt->n_deleted = 0; vt->next_id = (uint32_t)n;
+    vt->hints_valid = 0; vt->n_entry = 0;
+    dnpq_free(&vt->pq); vt->pq = pq; memset(&pq, 0, sizeof pq);
+    free(vt->entries); vt->entries = NULL;
+    vt->loaded = 1;
+    double t_write = now_ms();
+    rc = save_state(vt);
+    if (rc == SQLITE_OK) rc = CFG_INT(vt, "ivf_nlist", nlist);
+    if (rc == SQLITE_OK) rc = CFG_INT(vt, "ivf_chunks", nchunks_total);
+    if (rc == SQLITE_OK) rc = CFG_INT(vt, "ivf_head_bytes", ivf_head_len(vt));
+    if (rc == SQLITE_OK) rc = CFG_DBL(vt, "build_ms_load", t_load - t0);
+    if (rc == SQLITE_OK) rc = CFG_DBL(vt, "build_ms_coarse", t_coarse - t_load);
+    if (rc == SQLITE_OK) rc = CFG_DBL(vt, "build_ms_pq", t_pq - t_coarse);
+    if (rc == SQLITE_OK) rc = CFG_DBL(vt, "build_ms_graph", 0);
+    if (rc == SQLITE_OK) rc = CFG_DBL(vt, "build_ms_write", t_write - t_pq);
+    if (c->verbose) fprintf(stderr, "dense_ann: wrote ivf index in %.1fs\n", (t_write - t_pq) / 1e3);
+  }
+  dnpq_free(&pq);
+  free(assign); free(codes); free(start); free(order); free(slot_of);
+  if (rc && !vt->base.zErrMsg) set_err(vt, "dense_ann: ivf build failed: %s", sqlite3_errmsg(vt->db));
+  return rc;
+}
+
+typedef struct IvfCand { float d; uint32_t rowid, slot, vpage; } IvfCand;
+
+static void ivfc_insert(IvfCand *R, int *n, int cap, const IvfCand *x) {
+  if (*n == cap && x->d >= R[cap - 1].d) return;
+  int i = (*n < cap) ? (*n)++ : cap - 1;
+  while (i > 0 && R[i - 1].d > x->d) { R[i] = R[i - 1]; i--; }
+  R[i] = *x;
+}
+
+/* Score every live entry of one chunk into the candidate list. */
+static void ivf_scan_chunk(const DenseVtab *vt, const uint8_t *data, int len, const float *tab, float off,
+                           IvfCand *R, int *nR, int cap, QStats *st) {
+  const int m = vt->cfg.m, eb = ivf_entry_bytes(&vt->cfg);
+  if (len < IVF_CHUNK_HDR) return;
+  int cnt = dn_rd16(data);
+  if (IVF_CHUNK_HDR + cnt * eb > len) cnt = (len - IVF_CHUNK_HDR) / eb;
+  uint32_t first_slot = dn_rd32(data + 4), fvp = dn_rd32(data + 8);
+  for (int e = 0; e < cnt; e++) {
+    const uint8_t *ent = data + IVF_CHUNK_HDR + (size_t)e * eb;
+    uint8_t delta = ent[4];
+    if (delta == IVF_DELTA_DELETED) continue;
+    IvfCand x;
+    x.d = dnpq_adc(tab, ent + 5, m) - off;
+    st->scanned++;
+    if (*nR == cap && x.d >= R[cap - 1].d) continue;
+    x.rowid = dn_rd32(ent);
+    x.slot = first_slot + (uint32_t)e;
+    x.vpage = (fvp && delta < IVF_DELTA_DELETED) ? fvp + delta : 0;
+    ivfc_insert(R, nR, cap, &x);
+  }
+}
+
+/* ADC table and additive offset for list L (see ivf_search). */
+static void ivf_list_table(const DenseVtab *vt, const float *q, int L, float *tab, float *off, float *qbuf) {
+  const DenseCfg *c = &vt->cfg;
+  const float *cent = vt->ivf_cent + (size_t)L * c->dim;
+  if (c->metric == METRIC_L2 && c->ivf_residual) {
+    for (int t = 0; t < c->dim; t++) qbuf[t] = q[t] - cent[t];
+    dnpq_adc_table(&vt->pq, qbuf, c->metric, tab);
+    *off = 0;
+  } else {
+    *off = (c->ivf_residual && c->metric != METRIC_L2) ? dn_dot(q, cent, c->dim) : 0;
+  }
+}
+
+/* IVF-PQ search. Distances: for cosine/IP with residuals,
+**   1 - <q, c + r> = (1 - <q, r>) - <q, c> = ADC(r) - <q, c>,
+** so one ADC table serves all lists; for L2 with residuals, a table per list. */
+static int ivf_search(DenseVtab *vt, const float *q, int k, int nprobe, int R, int rerank, int raw,
+                      Result **pres, int *pn, QStats *st) {
+  const DenseCfg *c = &vt->cfg;
+  int rc = ensure_loaded(vt, raw, st);
+  if (rc) return rc;
+  raw = raw && vt->hints_valid && ensure_pr(vt);
+  st->raw = raw; st->ann = 1;
+  if (nprobe > vt->nlist) nprobe = vt->nlist;
+  if (nprobe < 1) nprobe = 1;
+  if (R < k) R = k;
+  if (c->vtype == VT_NONE || !rerank) R = k;
+
+  int32_t *probe = (int32_t *)malloc(sizeof(int32_t) * nprobe);
+  float *pd = (float *)malloc(sizeof(float) * nprobe);
+  int np = dnivf_probe(q, c->dim, vt->ivf_cent, vt->ivf_cn, vt->nlist, nprobe, probe, pd);
+  st->lists = np;
+  st->entry_dist = vt->nlist;
+
+  float *tab = (float *)malloc(sizeof(float) * c->m * PQ_KSUB);
+  float *qbuf = (float *)malloc(sizeof(float) * c->dim);
+  int per_list_tab = (c->metric == METRIC_L2 && c->ivf_residual);
+  if (!per_list_tab) dnpq_adc_table(&vt->pq, q, c->metric, tab);
+
+  QCtx qc; qc_init(&qc, vt, raw, st);
+  /* Round 1: every page of every probed list, announced together. */
+  if (raw) {
+    int npages = 0, cap = 0;
+    uint32_t *pages = NULL;
+    for (int p = 0; p < np; p++) {
+      const uint8_t *d = vt->ivf_dir + (size_t)probe[p] * 12;
+      uint32_t first = dn_rd32(d + 4), last = dn_rd32(d + 8);
+      if (!first || last < first || last - first > 65536) continue;
+      for (uint32_t g = first; g <= last; g++) {
+        if (npages == cap) { cap = cap ? 2 * cap : 256; pages = (uint32_t *)realloc(pages, sizeof(uint32_t) * cap); }
+        pages[npages++] = g;
+      }
+    }
+    if (qc_load_pages(&qc, pages, npages, &rc) > 0) st->rounds++;
+    free(pages);
+  }
+  IvfCand *cand = (IvfCand *)malloc(sizeof(IvfCand) * R);
+  int ncand = 0;
+  for (int p = 0; p < np && rc == SQLITE_OK; p++) {
+    int L = probe[p];
+    const uint8_t *d = vt->ivf_dir + (size_t)L * 12;
+    uint32_t nch = dn_rd32(d), first = dn_rd32(d + 4), last = dn_rd32(d + 8), g = first;
+    float off;
+    ivf_list_table(vt, q, L, tab, &off, qbuf);
+    for (uint32_t j = 0; j < nch && rc == SQLITE_OK; j++) {
+      int64_t id = ((int64_t)L << IVF_LIST_SHIFT) | j;
+      const uint8_t *data = NULL; int len = 0;
+      if (raw && first) {
+        /* Chunks appear in ascending page order within the list's range. */
+        while (g <= last && !(data = qc_row_on_page(&qc, g, id, &len))) g++;
+      }
+      if (!data) {
+        RowReq r = { (uint32_t)id, 0, NULL, 0 };
+        rc = q_fetch(&qc, T_LISTS, &r, 1);
+        data = r.data; len = r.len;
+        if (raw && first) g = first;
+      }
+      if (data) ivf_scan_chunk(vt, data, len, tab, off, cand, &ncand, R, st);
+    }
+  }
+  st->dist = st->scanned;
+
+  Result *res = (Result *)malloc(sizeof(Result) * (ncand ? ncand : 1));
+  for (int i = 0; i < ncand; i++) { res[i].rowid = cand[i].rowid; res[i].d = cand[i].d; }
+  if (rc == SQLITE_OK && rerank && c->vtype != VT_NONE && ncand > 0) {
+    /* Round 2: the stored vectors of all candidates, in parallel. */
+    RowReq *vr = (RowReq *)malloc(sizeof(RowReq) * ncand);
+    for (int i = 0; i < ncand; i++) { vr[i].id = cand[i].slot; vr[i].page = cand[i].vpage; }
+    int before = st->rounds;
+    rc = q_fetch(&qc, T_VECS, vr, ncand);
+    st->rerank_rounds += st->rounds - before;
+    for (int i = 0; i < ncand && rc == SQLITE_OK; i++) {
+      if (!vr[i].data || vr[i].len < vt->rl.vec_bytes) { res[i].d = FLT_MAX; continue; }
+      vec_decode(c, vr[i].data, qbuf);
+      res[i].d = dn_distance(c->metric, q, qbuf, c->dim);
+      st->rerank++;
+    }
+    qsort(res, ncand, sizeof(Result), cmp_result);
+    free(vr);
+  }
+  int nres = ncand < k ? ncand : k;
+  qc_free(&qc);
+  free(cand); free(tab); free(qbuf); free(probe); free(pd);
+  *pres = res; *pn = nres;
+  return rc;
+}
+
+/* Brute force over all PQ codes of an IVF index (exact=2). */
+static int ivf_exact_pq(DenseVtab *vt, const float *q, int k, Result **pres, int *pn, QStats *st) {
+  const DenseCfg *c = &vt->cfg;
+  int rc = ensure_loaded(vt, 0, st);
+  if (rc) return rc;
+  float *tab = (float *)malloc(sizeof(float) * c->m * PQ_KSUB);
+  float *qbuf = (float *)malloc(sizeof(float) * c->dim);
+  if (!(c->metric == METRIC_L2 && c->ivf_residual)) dnpq_adc_table(&vt->pq, q, c->metric, tab);
+  IvfCand *cand = (IvfCand *)malloc(sizeof(IvfCand) * k);
+  int ncand = 0, lastL = -1;
+  float off = 0;
+  sqlite3_stmt *s = 0;
+  rc = PREP(vt, &s, "SELECT id, data FROM \"%w\".\"%w_lists\" ORDER BY id");
+  while (rc == SQLITE_OK && sqlite3_step(s) == SQLITE_ROW) {
+    int L = (int)(sqlite3_column_int64(s, 0) >> IVF_LIST_SHIFT);
+    if (L != lastL) { ivf_list_table(vt, q, L, tab, &off, qbuf); lastL = L; }
+    ivf_scan_chunk(vt, (const uint8_t *)sqlite3_column_blob(s, 1), sqlite3_column_bytes(s, 1), tab, off, cand, &ncand, k, st);
+  }
+  if (s) rc = sqlite3_finalize(s);
+  Result *res = (Result *)malloc(sizeof(Result) * (k ? k : 1));
+  for (int i = 0; i < ncand; i++) { res[i].rowid = cand[i].rowid; res[i].d = cand[i].d; }
+  st->dist = st->scanned;
+  free(cand); free(tab); free(qbuf);
+  *pres = res; *pn = ncand;
+  return rc;
+}
+
+typedef struct { uint8_t *dir; int nlist; uint32_t *prev; uint8_t *bad; } ListWalk;
+static void walk_list_cb(void *ctx, int64_t rowid, uint32_t pgno, int overflow) {
+  ListWalk *w = (ListWalk *)ctx;
+  int L = (int)(rowid >> IVF_LIST_SHIFT);
+  uint32_t j = (uint32_t)(rowid & ((1 << IVF_LIST_SHIFT) - 1));
+  if (L < 0 || L >= w->nlist) return;
+  uint8_t *d = w->dir + (size_t)L * 12;
+  if (overflow) w->bad[L] = 1;
+  if (j == 0) dn_wr32(d + 4, pgno);
+  else if (pgno < w->prev[L]) w->bad[L] = 1;
+  w->prev[L] = pgno;
+  dn_wr32(d + 8, pgno);
+}
+
+/* finalize for IVF: page range of each list (directory), vector pages of
+** each chunk's slots. Walks happen before any write (they read the file). */
+static int finalize_ivf(DenseVtab *vt) {
+  const DenseCfg *c = &vt->cfg;
+  const int eb = ivf_entry_bytes(c);
+  uint32_t n = vt->next_id;
+  int rc = SQLITE_OK;
+  WalkMap wv = { NULL, n, 0, 0 };
+  if (c->vtype != VT_NONE) {
+    wv.pages = (uint32_t *)calloc(n ? n : 1, 4);
+    rc = walk_ids(vt, "vectors", &wv);
+  }
+  ListWalk lw = { vt->ivf_dir, vt->nlist, (uint32_t *)calloc(vt->nlist, 4), (uint8_t *)calloc(vt->nlist, 1) };
+  uint32_t root;
+  if (rc == SQLITE_OK) rc = table_root(vt, "lists", &root);
+  if (rc == SQLITE_OK) rc = dnpr_walk_table(&vt->pr, root, walk_list_cb, &lw);
+  int nbad = 0;
+  for (int L = 0; L < vt->nlist; L++)
+    if (lw.bad[L]) { nbad++; dn_wr32(vt->ivf_dir + (size_t)L * 12 + 4, 0); dn_wr32(vt->ivf_dir + (size_t)L * 12 + 8, 0); }
+  if (rc == SQLITE_OK) rc = finalize_blob_lists(vt, rc);
+
+  /* Patch vector-page hints into the chunks (same-size rewrites). */
+  sqlite3_stmt *sel = 0, *upd = 0;
+  if (rc == SQLITE_OK) rc = PREP(vt, &sel, "SELECT id, data FROM \"%w\".\"%w_lists\" WHERE id >= ?1 AND id < ?2");
+  if (rc == SQLITE_OK) rc = PREP(vt, &upd, "UPDATE \"%w\".\"%w_lists\" SET data = ?2 WHERE id = ?1");
+  uint8_t *buf = (uint8_t *)malloc(IVF_CHUNK_BYTES + 64);
+  for (int L = 0; L < vt->nlist && rc == SQLITE_OK && wv.pages; L++) {
+    sqlite3_bind_int64(sel, 1, (int64_t)L << IVF_LIST_SHIFT);
+    sqlite3_bind_int64(sel, 2, (int64_t)(L + 1) << IVF_LIST_SHIFT);
+    /* Collect the list's chunks first; the updates happen after the scan. */
+    int64_t *ids = NULL; uint8_t **rows = NULL; int *lens = NULL; int nr = 0, capr = 0;
+    while (sqlite3_step(sel) == SQLITE_ROW) {
+      if (nr == capr) {
+        capr = capr ? 2 * capr : 16;
+        ids = (int64_t *)realloc(ids, sizeof(int64_t) * capr);
+        rows = (uint8_t **)realloc(rows, sizeof(uint8_t *) * capr);
+        lens = (int *)realloc(lens, sizeof(int) * capr);
+      }
+      lens[nr] = sqlite3_column_bytes(sel, 1);
+      rows[nr] = (uint8_t *)malloc(lens[nr] ? lens[nr] : 1);
+      memcpy(rows[nr], sqlite3_column_blob(sel, 1), lens[nr]);
+      ids[nr++] = sqlite3_column_int64(sel, 0);
+    }
+    sqlite3_reset(sel);
+    for (int r = 0; r < nr; r++) {
+      uint8_t *data = rows[r];
+      if (lens[r] >= IVF_CHUNK_HDR && rc == SQLITE_OK) {
+        int cnt = dn_rd16(data);
+        if (IVF_CHUNK_HDR + cnt * eb > lens[r]) cnt = (lens[r] - IVF_CHUNK_HDR) / eb;
+        uint32_t fs = dn_rd32(data + 4);
+        uint32_t fvp = fs < n ? wv.pages[fs] : 0;
+        dn_wr32(data + 8, fvp);
+        for (int e = 0; e < cnt; e++) {
+          uint8_t *ent = data + IVF_CHUNK_HDR + (size_t)e * eb;
+          if (ent[4] == IVF_DELTA_DELETED) continue;
+          uint32_t s = fs + (uint32_t)e, pg = s < n ? wv.pages[s] : 0;
+          ent[4] = (fvp && pg >= fvp && pg - fvp < IVF_DELTA_DELETED) ? (uint8_t)(pg - fvp) : IVF_DELTA_UNKNOWN;
+        }
+        sqlite3_bind_int64(upd, 1, ids[r]);
+        sqlite3_bind_blob(upd, 2, data, lens[r], SQLITE_STATIC);
+        if (sqlite3_step(upd) != SQLITE_DONE) rc = SQLITE_ERROR;
+        sqlite3_reset(upd);
+      }
+      free(rows[r]);
+    }
+    free(ids); free(rows); free(lens);
+  }
+  sqlite3_finalize(sel); sqlite3_finalize(upd);
+  free(buf);
+  if (rc == SQLITE_OK) rc = update_chunks(vt, CHUNK_ID_IVF_HEAD, vt->ivf_head, ivf_head_len(vt));
+  if (rc == SQLITE_OK) rc = CFG_INT(vt, "ivf_lists_without_range", nbad);
+  free(wv.pages); free(lw.prev); free(lw.bad);
+  return rc;
+}
+
+/* Incremental insert into a built IVF index: the vector goes to its nearest
+** list as a new one-entry chunk (keeping slot numbering consecutive within
+** each chunk). Such chunks are found through SQL until the next 'finalize';
+** many inserts fragment lists, so rebuild after large changes. */
+static int insert_ivf(DenseVtab *vt, int64_t rowid, const float *x) {
+  const DenseCfg *c = &vt->cfg;
+  int rc = ensure_loaded(vt, 0, NULL);
+  if (rc) return rc;
+  if (rowid < 0 || rowid > 0xFFFFFFFFLL) { set_err(vt, "dense_ann: layout=ivf needs rowids in [0, 2^32)"); return SQLITE_CONSTRAINT; }
+  if (row_exists(vt, "SELECT 1 FROM \"%w\".\"%w_rowids\" WHERE rowid = ?1", rowid)) {
+    set_err(vt, "dense_ann: rowid %lld already exists", (long long)rowid);
+    return SQLITE_CONSTRAINT;
+  }
+  int32_t L; float dL;
+  dnivf_probe(x, c->dim, vt->ivf_cent, vt->ivf_cn, vt->nlist, 1, &L, &dL);
+  float *r = (float *)malloc(sizeof(float) * c->dim);
+  const float *cent = vt->ivf_cent + (size_t)L * c->dim;
+  for (int t = 0; t < c->dim; t++) r[t] = c->ivf_residual ? x[t] - cent[t] : x[t];
+  int eb = ivf_entry_bytes(c);
+  uint8_t *chunk = (uint8_t *)calloc(IVF_CHUNK_HDR + eb, 1);
+  uint32_t slot = vt->next_id;
+  dn_wr16(chunk, 1);
+  dn_wr32(chunk + 4, slot);
+  dn_wr32(chunk + IVF_CHUNK_HDR, (uint32_t)rowid);
+  chunk[IVF_CHUNK_HDR + 4] = IVF_DELTA_UNKNOWN;
+  dnpq_encode(&vt->pq, r, chunk + IVF_CHUNK_HDR + 5);
+  free(r);
+  uint8_t *d = vt->ivf_dir + (size_t)L * 12;
+  uint32_t nch = dn_rd32(d);
+  sqlite3_stmt *s = 0;
+  rc = PREP(vt, &s, "INSERT INTO \"%w\".\"%w_lists\"(id, data) VALUES (?1, ?2)");
+  if (rc == SQLITE_OK) {
+    sqlite3_bind_int64(s, 1, ((int64_t)L << IVF_LIST_SHIFT) | nch);
+    sqlite3_bind_blob(s, 2, chunk, IVF_CHUNK_HDR + eb, SQLITE_STATIC);
+    rc = sqlite3_step(s) == SQLITE_DONE ? SQLITE_OK : SQLITE_ERROR;
+  }
+  sqlite3_finalize(s); s = 0;
+  free(chunk);
+  if (rc == SQLITE_OK && c->vtype != VT_NONE) {
+    uint8_t *vb = (uint8_t *)malloc(vt->rl.vec_bytes);
+    vec_encode(c, x, vb);
+    rc = PREP(vt, &s, "INSERT INTO \"%w\".\"%w_vectors\"(id, data) VALUES (?1, ?2)");
+    if (rc == SQLITE_OK) {
+      sqlite3_bind_int64(s, 1, slot); sqlite3_bind_blob(s, 2, vb, vt->rl.vec_bytes, SQLITE_STATIC);
+      rc = sqlite3_step(s) == SQLITE_DONE ? SQLITE_OK : SQLITE_ERROR;
+    }
+    sqlite3_finalize(s); s = 0;
+    free(vb);
+  }
+  if (rc == SQLITE_OK) rc = PREP(vt, &s, "INSERT INTO \"%w\".\"%w_rowids\"(rowid, node) VALUES (?1, ?2)");
+  if (rc == SQLITE_OK) {
+    sqlite3_bind_int64(s, 1, rowid); sqlite3_bind_int64(s, 2, ((int64_t)L << 32) | slot);
+    rc = sqlite3_step(s) == SQLITE_DONE ? SQLITE_OK : SQLITE_ERROR;
+  }
+  sqlite3_finalize(s);
+  if (rc == SQLITE_OK) {
+    dn_wr32(d, nch + 1);
+    rc = update_chunks(vt, CHUNK_ID_IVF_HEAD, vt->ivf_head, ivf_head_len(vt));
+  }
+  if (rc == SQLITE_OK) { vt->next_id++; vt->n_nodes++; rc = save_state(vt); }
+  if (rc && !vt->base.zErrMsg) set_err(vt, "dense_ann: insert failed: %s", sqlite3_errmsg(vt->db));
+  return rc;
+}
+
+/* Delete from a built IVF index: mark the entry deleted in its chunk. */
+static int delete_ivf(DenseVtab *vt, int64_t rowid) {
+  const DenseCfg *c = &vt->cfg;
+  sqlite3_stmt *s = 0;
+  int64_t node = -1;
+  int rc = PREP(vt, &s, "SELECT node FROM \"%w\".\"%w_rowids\" WHERE rowid = ?1");
+  if (rc) return rc;
+  sqlite3_bind_int64(s, 1, rowid);
+  if (sqlite3_step(s) == SQLITE_ROW) node = sqlite3_column_int64(s, 0);
+  sqlite3_finalize(s); s = 0;
+  if (node < 0) return SQLITE_OK;
+  int L = (int)(node >> 32);
+  uint32_t slot = (uint32_t)(node & 0xFFFFFFFF);
+  int eb = ivf_entry_bytes(c), done = 0;
+  rc = PREP(vt, &s, "SELECT id, data FROM \"%w\".\"%w_lists\" WHERE id >= ?1 AND id < ?2");
+  int64_t hit = -1; uint8_t *row = NULL; int len = 0;
+  if (rc == SQLITE_OK) {
+    sqlite3_bind_int64(s, 1, (int64_t)L << IVF_LIST_SHIFT);
+    sqlite3_bind_int64(s, 2, (int64_t)(L + 1) << IVF_LIST_SHIFT);
+    while (!done && sqlite3_step(s) == SQLITE_ROW) {
+      const uint8_t *data = (const uint8_t *)sqlite3_column_blob(s, 1);
+      int dl = sqlite3_column_bytes(s, 1);
+      if (dl < IVF_CHUNK_HDR) continue;
+      uint32_t fs = dn_rd32(data + 4), cnt = dn_rd16(data);
+      if (slot < fs || slot >= fs + cnt) continue;
+      len = dl; row = (uint8_t *)malloc(len); memcpy(row, data, len);
+      hit = sqlite3_column_int64(s, 0); done = 1;
+    }
+  }
+  sqlite3_finalize(s); s = 0;
+  if (row) {
+    uint8_t *ent = row + IVF_CHUNK_HDR + (size_t)(slot - dn_rd32(row + 4)) * eb;
+    if (IVF_CHUNK_HDR + (size_t)(slot - dn_rd32(row + 4) + 1) * eb <= (size_t)len && dn_rd32(ent) == (uint32_t)rowid) {
+      ent[4] = IVF_DELTA_DELETED;
+      rc = PREP(vt, &s, "UPDATE \"%w\".\"%w_lists\" SET data = ?2 WHERE id = ?1");
+      if (rc == SQLITE_OK) {
+        sqlite3_bind_int64(s, 1, hit); sqlite3_bind_blob(s, 2, row, len, SQLITE_STATIC);
+        rc = sqlite3_step(s) == SQLITE_DONE ? SQLITE_OK : SQLITE_ERROR;
+      }
+      sqlite3_finalize(s);
+    }
+    free(row);
+  }
+  if (rc == SQLITE_OK)
+    rc = exec_fmt(vt->db, "DELETE FROM \"%w\".\"%w_rowids\" WHERE rowid = %lld", vt->zDb, vt->zName, (long long)rowid);
+  if (rc == SQLITE_OK) { vt->n_nodes--; vt->n_deleted++; rc = save_state(vt); }
+  return rc;
+}
+
 /* ------------------------------------------------------ vtab methods */
 
 static int dense_connect_common(sqlite3 *db, int argc, const char *const *argv, sqlite3_vtab **ppVtab,
@@ -1626,6 +2362,7 @@ static int dense_connect_common(sqlite3 *db, int argc, const char *const *argv, 
         "CREATE TABLE \"%w\".\"%w_vectors\"(id INTEGER PRIMARY KEY, data BLOB)",
         "CREATE TABLE \"%w\".\"%w_rowids\"(rowid INTEGER PRIMARY KEY, node INTEGER)",
         "CREATE TABLE \"%w\".\"%w_buffer\"(rowid INTEGER PRIMARY KEY, vec BLOB)",
+        "CREATE TABLE \"%w\".\"%w_lists\"(id INTEGER PRIMARY KEY, data BLOB)",
       };
       for (size_t i = 0; i < sizeof tpl / sizeof tpl[0] && rc == SQLITE_OK; i++)
         rc = exec_fmt(db, tpl[i], vt->zDb, vt->zName);
@@ -1640,7 +2377,7 @@ static int dense_connect_common(sqlite3 *db, int argc, const char *const *argv, 
   if (rc == SQLITE_OK) {
     char *schema = sqlite3_mprintf(
         "CREATE TABLE x(embedding, distance, k HIDDEN, ef HIDDEN, beam HIDDEN, rerank HIDDEN, "
-        "exact HIDDEN, trace HIDDEN, stats HIDDEN, \"%w\" HIDDEN)", argv[2]);
+        "exact HIDDEN, trace HIDDEN, nprobe HIDDEN, rerank_k HIDDEN, stats HIDDEN, \"%w\" HIDDEN)", argv[2]);
     rc = sqlite3_declare_vtab(db, schema);
     sqlite3_free(schema);
   }
@@ -1666,7 +2403,9 @@ static int dense_disconnect(sqlite3_vtab *pVtab) {
   DenseVtab *vt = (DenseVtab *)pVtab;
   for (int t = 0; t < T_COUNT; t++) sqlite3_finalize(vt->st_get[t]);
   dnpq_free(&vt->pq);
+  dnpq_free(&vt->ivf_cpq);
   free(vt->entries);
+  free(vt->ivf_cent); free(vt->ivf_cn); free(vt->ivf_head);
   sqlite3_free(vt->zDb); sqlite3_free(vt->zName);
   sqlite3_free(vt);
   return SQLITE_OK;
@@ -1674,7 +2413,7 @@ static int dense_disconnect(sqlite3_vtab *pVtab) {
 
 static int dense_destroy(sqlite3_vtab *pVtab) {
   DenseVtab *vt = (DenseVtab *)pVtab;
-  static const char *const sfx[] = { "config", "blobs", "nodes", "codes", "vectors", "rowids", "buffer" };
+  static const char *const sfx[] = { "config", "blobs", "nodes", "codes", "vectors", "rowids", "buffer", "lists" };
   int rc = SQLITE_OK;
   for (size_t i = 0; i < sizeof sfx / sizeof sfx[0] && rc == SQLITE_OK; i++)
     rc = exec_fmt(vt->db, "DROP TABLE IF EXISTS \"%w\".\"%w_%s\"", vt->zDb, vt->zName, sfx[i]);
@@ -1684,8 +2423,8 @@ static int dense_destroy(sqlite3_vtab *pVtab) {
 
 static int dense_best_index(sqlite3_vtab *pVtab, sqlite3_index_info *info) {
   (void)pVtab;
-  int idx[9];
-  for (int i = 0; i < 9; i++) idx[i] = -1;
+  int idx[11];
+  for (int i = 0; i < 11; i++) idx[i] = -1;
   for (int i = 0; i < info->nConstraint; i++) {
     const struct sqlite3_index_constraint *c = &info->aConstraint[i];
     if (!c->usable) continue;
@@ -1700,6 +2439,8 @@ static int dense_best_index(sqlite3_vtab *pVtab, sqlite3_index_info *info) {
         case COL_RERANK: slot = 4; break;
         case COL_EXACT: slot = 5; break;
         case COL_TRACE: slot = 6; break;
+        case COL_NPROBE: slot = 9; break;
+        case COL_RK: slot = 10; break;
         case -1: slot = 8; break;
       }
       if (slot >= 0 && idx[slot] < 0) idx[slot] = i;
@@ -1707,8 +2448,9 @@ static int dense_best_index(sqlite3_vtab *pVtab, sqlite3_index_info *info) {
   }
   int flags = 0, argn = 1;
   if (idx[0] >= 0) {
-    static const int bits[8] = { F_MATCH, F_K, F_EF, F_BEAM, F_RERANK, F_EXACT, F_TRACE, F_LIMIT };
-    for (int s = 0; s < 8; s++) {
+    static const int bits[11] = { F_MATCH, F_K, F_EF, F_BEAM, F_RERANK, F_EXACT, F_TRACE, F_LIMIT, 0, F_NPROBE, F_RK };
+    for (int s = 0; s < 11; s++) {
+      if (s == 8) continue;
       if (idx[s] < 0) continue;
       flags |= bits[s];
       info->aConstraintUsage[idx[s]].argvIndex = argn++;
@@ -1759,9 +2501,10 @@ static char *stats_json(const QStats *st) {
   return sqlite3_mprintf(
       "{\"ann\":%d,\"raw\":%d,\"rounds\":%d,\"pages\":%d,\"bytes\":%lld,\"fallback\":%d,"
       "\"expanded\":%d,\"dist\":%d,\"entry_dist\":%d,\"rerank\":%d,\"rerank_rounds\":%d,"
-      "\"setup_rounds\":%d,\"setup_pages\":%d,\"ms\":%.3f",
+      "\"setup_rounds\":%d,\"setup_pages\":%d,\"setup_bytes\":%lld,\"lists\":%d,\"scanned\":%d,\"ms\":%.3f",
       st->ann, st->raw, st->rounds, st->pages, (long long)st->bytes, st->fallback, st->expanded,
-      st->dist, st->entry_dist, st->rerank, st->rerank_rounds, st->setup_rounds, st->setup_pages, st->ms);
+      st->dist, st->entry_dist, st->rerank, st->rerank_rounds, st->setup_rounds, st->setup_pages,
+      (long long)st->setup_bytes, st->lists, st->scanned, st->ms);
 }
 
 static int dense_filter(sqlite3_vtab_cursor *pCur, int idxNum, const char *idxStr, int argc, sqlite3_value **argv) {
@@ -1785,6 +2528,10 @@ static int dense_filter(sqlite3_vtab_cursor *pCur, int idxNum, const char *idxSt
     if (idxNum & F_EXACT) cur->exact = sqlite3_value_int64(argv[a++]);
     if (idxNum & F_TRACE) cur->trace = sqlite3_value_int64(argv[a++]);
     if (idxNum & F_LIMIT) { int64_t lim = sqlite3_value_int64(argv[a++]); if (!have_k || lim < cur->k) cur->k = lim; }
+    cur->nprobe = vt->cfg.nprobe_default; cur->rk = vt->cfg.rk_default;
+    if (idxNum & F_NPROBE) cur->nprobe = sqlite3_value_int64(argv[a++]);
+    if (idxNum & F_RK) cur->rk = sqlite3_value_int64(argv[a++]);
+    if (cur->rk > 100000) cur->rk = 100000;
     if (cur->k < 1) { cur->mode = 0; return SQLITE_OK; }
     if (cur->k > 100000) cur->k = 100000;
     if (cur->ef > 100000) cur->ef = 100000;
@@ -1806,7 +2553,11 @@ static int dense_filter(sqlite3_vtab_cursor *pCur, int idxNum, const char *idxSt
     if (cur->trace) st.trace = sqlite3_str_new(vt->db);
     double t0 = now_ms();
     int raw = sqlite3_get_autocommit(vt->db);
-    if (cur->exact) rc = exact_search(vt, q, (int)cur->k, (int)cur->exact, &cur->res, &cur->nres, &st);
+    if (cur->exact == 2 && vt->built && vt->cfg.layout == LAYOUT_IVF)
+      rc = ivf_exact_pq(vt, q, (int)cur->k, &cur->res, &cur->nres, &st);
+    else if (cur->exact) rc = exact_search(vt, q, (int)cur->k, (int)cur->exact, &cur->res, &cur->nres, &st);
+    else if (vt->cfg.layout == LAYOUT_IVF)
+      rc = ivf_search(vt, q, (int)cur->k, (int)cur->nprobe, (int)cur->rk, (int)cur->rerank, raw, &cur->res, &cur->nres, &st);
     else rc = ann_search(vt, q, (int)cur->k, (int)cur->ef, (int)cur->beam, (int)cur->rerank, raw, &cur->res, &cur->nres, &st);
     st.ms = now_ms() - t0;
     free(q);
@@ -1874,7 +2625,7 @@ static void result_embedding(DenseVtab *vt, sqlite3_context *ctx, int64_t rowid)
   int rc = c->vinline
     ? prep_fmt(vt->db, &s, "SELECT n.data FROM \"%w\".\"%w_rowids\" r JOIN \"%w\".\"%w_nodes\" n ON n.id = r.node WHERE r.rowid = ?1",
                vt->zDb, vt->zName, vt->zDb, vt->zName)
-    : prep_fmt(vt->db, &s, "SELECT v.data FROM \"%w\".\"%w_rowids\" r JOIN \"%w\".\"%w_vectors\" v ON v.id = r.node WHERE r.rowid = ?1",
+    : prep_fmt(vt->db, &s, "SELECT v.data FROM \"%w\".\"%w_rowids\" r JOIN \"%w\".\"%w_vectors\" v ON v.id = (r.node & 4294967295) WHERE r.rowid = ?1",
                vt->zDb, vt->zName, vt->zDb, vt->zName);
   if (rc == SQLITE_OK) {
     sqlite3_bind_int64(s, 1, rowid);
@@ -1908,6 +2659,8 @@ static int dense_column(sqlite3_vtab_cursor *pCur, sqlite3_context *ctx, int i) 
     case COL_RERANK: sqlite3_result_int64(ctx, cur->rerank); break;
     case COL_EXACT: sqlite3_result_int64(ctx, cur->exact); break;
     case COL_TRACE: sqlite3_result_int64(ctx, cur->trace); break;
+    case COL_NPROBE: sqlite3_result_int64(ctx, cur->nprobe); break;
+    case COL_RK: sqlite3_result_int64(ctx, cur->rk); break;
     case COL_STATS: if (cur->stats) sqlite3_result_text(ctx, cur->stats, -1, SQLITE_TRANSIENT); break;
     default: break;   /* embedding is not returned by searches */
   }
@@ -1955,6 +2708,8 @@ static int dense_update(sqlite3_vtab *pVtab, int argc, sqlite3_value **argv, sql
       if (rc) set_err(vt, "dense_ann: %s", sqlite3_errmsg(vt->db));
     }
     sqlite3_finalize(s);
+  } else if (c->layout == LAYOUT_IVF) {
+    rc = insert_ivf(vt, rowid, x);
   } else {
     rc = insert_built(vt, rowid, x);
   }
@@ -1964,7 +2719,7 @@ static int dense_update(sqlite3_vtab *pVtab, int argc, sqlite3_value **argv, sql
 }
 
 static int dense_shadow_name(const char *zName) {
-  static const char *const sfx[] = { "config", "blobs", "nodes", "codes", "vectors", "rowids", "buffer" };
+  static const char *const sfx[] = { "config", "blobs", "nodes", "codes", "vectors", "rowids", "buffer", "lists" };
   for (size_t i = 0; i < sizeof sfx / sizeof sfx[0]; i++) if (!sqlite3_stricmp(zName, sfx[i])) return 1;
   return 0;
 }

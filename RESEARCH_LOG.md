@@ -159,3 +159,37 @@ Co-location halves the rounds and cuts bytes about 9×. 64 KiB pages cut rounds 
 **Real MiniLM embeddings (words-10k).** Exhaustive search over the 64-byte PQ codes reaches only recall@10 = 0.57, and faiss `IndexPQ(384, 64, 8)` gives the same 0.567, so the codec is behaving as expected. Random-word documents are nearly tied (cosine similarity of the 1st, 10th and 100th neighbours: 0.686, 0.655, 0.620). The true top 10 is almost always inside the PQ top 100 (0.98), so reranking with stored vectors recovers quality: recall@10 = 0.81 / 0.89 / 0.95 at ef = 64 / 128 / 256, costing 6.7 / 9.9 / 17.3 rounds. In faiss, an OPQ rotation raises exhaustive PQ-64 recall to 0.650 (top 10 within the top 100: 0.998); the extension's own OPQ option reaches 0.614.
 
 **Observation on size.** The PQ code is 64 bytes, but co-location and inline vectors make the stored row about 4 KB per document, 64 times more. This buys fewer rounds, since one page read gives the distances to all 32 neighbours. For a strict size budget, the alternative is an IVF-PQ layout (≈70 bytes per document plus centroids, with posting lists clustered on contiguous pages), which also needs only one or two dependent rounds after the centroids are cached. It is scheduled as a comparison.
+
+## 2026-09-24 — Late-interaction extension, first version (`ext/late/`)
+
+**Design.** `late_plaid` is a virtual table implementing PLAID-style retrieval with LateOn-Code-edge's 48-dimensional token vectors. The residual codec follows fast-plaid exactly (quantile cutoffs and weights, same bit order); ids and codes are bit-packed to ⌈log₂N⌉ and ⌈log₂K⌉ bits, following Omar Khattab's note. Two storage layouts can be built side by side:
+- *plaid*: an IVF from centroid to bit-packed document ids, plus one row per document holding its codes and residuals;
+- *warp* (centroid-major, after WARP): each centroid's posting list holds document ids followed by their packed residuals, so after choosing centroids one parallel round yields every token score needed. Documents missing from a query token's probed lists get an imputed score.
+
+Lists are stored as *paged streams*: rows of exactly `page_size − 39` bytes, one per page, so nothing spills into overflow chains. Page hints make any set of lists one round with no b-tree walk. Six tests pass, including a pure-Python decoder that must reproduce the C exact scores. The page trace matches an APSW counting VFS page for page.
+
+**Results on words-10k** (nbits = 2, K = 16,384 centroids, 2,000 queries; simulated p50 network time with HTTP/2-like concurrency; fp16 exhaustive MaxSim scores nDCG@10 = 0.359):
+
+| Configuration | Rounds | nDCG@10 | KB read | `4g` ms | `slow-4g` ms |
+|---|---|---|---|---|---|
+| exhaustive over decompressed vectors | 1 | 0.357 | 20,000 | 20,392 | 114,340 |
+| faithful fast-plaid (nprobe 8) | 2 | 0.357 | 16,803 | 17,436 | 97,347 |
+| plaid, approximate scores from IVF only, nprobe 8, 64 docs | 2 | 0.327 | 351 | 682 | 3,105 |
+| warp, nprobe 8 | 1 | 0.259 | 158 | 315 | 1,404 |
+| warp, nprobe 32 | 1 | 0.329 | 510 | 673 | 3,418 |
+| warp, nprobe 8, rerank 64 | 2 | 0.350 | 413 | 739 | 3,423 |
+
+The warp rows use the stoplist described below. Faithful PLAID needs only two rounds but reads every candidate document, 4–17 MB per query, which is far too much for a phone. The warp layout plus a rerank round gets within 0.01 nDCG of exhaustive search for 0.4 MB. At nbits = 2 the codec itself costs only 0.002 nDCG; nbits 1 / 2 / 4 give 0.328 / 0.350 / 0.353 after reranking, at 7.9 / 13.9 / 26.1 bytes per token in warp postings.
+
+**Findings.**
+- *Stop vectors.* The query's `[SEP]` vector probes lists containing nearly every document, and it accounted for about 75 % of fetched posting entries. Skipping any query vector whose probed lists average more than 2 % of the corpus (`stoplist=0.02`) and giving it a constant score leaves rankings unchanged and cuts bytes by a third. At 1M documents this is required.
+- *Session setup.* Loading the static data costs 1.7 MB in 2 rounds with K = 16,384 (2.0 s on `4g`); with K = 4,096 it is 0.43 MB. A two-level centroid scheme shrinks this to 15–60 KB but currently loses 0.05–0.09 nDCG.
+- *Pages dominate at small scale.* Warp at nprobe 8 needs 29 KB of posting data but reads 152 KB of 4 KiB pages. Sub-page range reads would help.
+- *HTTP/1.1.* With 6 connections one warp round becomes several latency steps (923 ms against 315 ms on `4g`).
+- *The model is weak on random words.* LateOn-Code-edge reaches exhaustive nDCG@10 of only 0.12 on single-word queries over random-word documents, which compresses the differences between methods. The LLM-paragraph corpus is the more meaningful test.
+
+**Projected 1M index.**
+- *Centroids.* K = 65,536, rather than fast-plaid's formula value of 131,072, to keep the build tractable and the static data at 6.8 MB.
+- *Build.* About 3 hours and 2.5 GB RAM.
+- *Size.* The warp layout would take 0.96 / 1.63 / 2.98 GB at nbits 1 / 2 / 4.
+- *Query cost.* Roughly 0.65 MB in one round per query. Recall at that scale is still to be measured.
