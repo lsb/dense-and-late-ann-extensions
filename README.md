@@ -1,35 +1,73 @@
 # dense-and-late-ann-extensions
 
-**dense-and-late-ann-extensions** is a research project that builds SQLite extensions for approximate nearest-neighbour (ANN) search over text embeddings, designed to run in a web browser against a database fetched over HTTP range requests (the "httpvfs" technique). It covers two retrieval families:
+**dense-and-late-ann-extensions** is a research project that builds SQLite extensions for approximate nearest-neighbour (ANN) search over text embeddings. They are designed to run in a web browser against a read-only database fetched lazily with HTTP range requests, the technique popularised by sql.js-httpvfs. The project covers two retrieval families:
 
-- **Dense retrieval**: one vector per document, from [all-MiniLM-L6-v2](https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2) (384 dimensions), indexed with a graph index (HNSW / DiskANN style) over product-quantized (PQ) codes of 64 bytes per document.
-- **Late interaction**: one vector per token, from [LateOn-Code-edge](https://huggingface.co/lightonai/LateOn-Code-edge) (48 dimensions per token), indexed with a PLAID-style centroid-and-residual index following [fast-plaid](https://github.com/lightonai/fast-plaid).
+- **Dense retrieval**: one vector per document, from [all-MiniLM-L6-v2](https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2) (384 dimensions), compressed with product quantization (PQ, 64 bytes per vector) and indexed either as a graph (HNSW-built, DiskANN-style co-located neighbour codes) or as an inverted file (IVF-PQ).
+- **Late interaction**: one vector per token, from [LateOn-Code-edge](https://huggingface.co/lightonai/LateOn-Code-edge) (48 dimensions), indexed in the style of PLAID, following [fast-plaid](https://github.com/lightonai/fast-plaid), with an alternative centroid-major ("warp") layout.
 
-SQLite's own full-text search (FTS5) is the lexical baseline.
+SQLite's full-text search (FTS5) is the lexical baseline. Everything is measured end to end: the same C code runs natively and in WebAssembly, and queries are timed against an HTTP server that simulates phone networks.
 
-## Status
+The central design constraint is that on a mobile connection each *dependent* round trip costs 70–600 ms, while several independent requests can be in flight at once. The indexes are therefore laid out so that a query needs few sequential rounds, and the WebAssembly runtime lets C code fetch many byte ranges in parallel.
 
-Work in progress. See [RESEARCH_LOG.md](RESEARCH_LOG.md) for a dated record of decisions and measurements.
+A dated record of every decision and measurement is in [RESEARCH_LOG.md](RESEARCH_LOG.md).
 
-## Repository layout
+## Results in brief
+
+Full tables and charts: [results/matrix/README.md](results/matrix/README.md) and `results/matrix/index.html`. The table below uses the LLM-generated corpus of 10,000 paragraphs, with latencies simulated for Chrome's "Fast 4G" profile (165 ms, 8.1 Mbit/s) and HTTP/2-like concurrency.
+
+| Method | Index size | nDCG@10 | Query within a session | First query of a session |
+|---|---|---|---|---|
+| FTS5 bm25 (OR) | 1.8 MB | 0.456 | ≈0 s (cached) | 2.7 s |
+| Dense graph (ef 64) | 41.5 MB | 0.585 | 1.2 s | 2.3 s |
+| Dense IVF-PQ (nprobe 128) | 9.9 MB | 0.567 | 0.4 s | 2.0 s |
+| Late interaction, warp (nprobe 8) | 19.5 MB | 0.431 | ≈0 s (cached) | 1.6 s |
+
+- **Model quality.** On this corpus MiniLM is the strongest model: exhaustive MiniLM search reaches nDCG@10 0.586, against 0.519 for exhaustive LateOn-Code-edge, a code-retrieval model. The ANN indexes lose little against exhaustive search.
+- **Random-word corpora.** On documents made of random dictionary words, FTS5 is essentially perfect and the neural models are much weaker, as expected.
+- **Where the time goes.** The first query of a session is dominated by per-connection static data such as centroids and codebooks. Within a session, the number of dependent round trips and the browser's limit of six connections per host under HTTP/1.1 dominate.
+
+## Components
 
 | Path | Contents |
 |---|---|
-| `models/minilm-l6-v2/` | all-MiniLM-L6-v2 ONNX (qint8) and tokenizer |
-| `models/lateon-code-edge/` | LateOn-Code-edge ONNX (int8) and tokenizer |
-| `models/lfm2.5-350m/` | LiquidAI LFM2.5-350M q4f16 ONNX, weights split into four chunks; run `scripts/assemble_lfm.py` before use |
-| `data/words/` | Word list (Debian `wamerican`) and its deterministic shuffle |
-| `data/corpora/` | Random-word corpora of 50-word documents (the 1M corpus is regenerated, not checked in) |
-| `data/llm/` | LLM-generated paragraphs and queries ("LLM slop") |
-| `scripts/` | Data generation scripts |
+| `ext/dense/` | `dense_ann` virtual table: PQ-64, HNSW-built graph with co-located neighbour codes, IVF-PQ layout, page hints, parallel prefetch |
+| `ext/late/` | `late_plaid` virtual table: fast-plaid residual codec, PLAID and centroid-major layouts, bit-packed ids |
+| `wasm/` | SQLite 3.53.4 build (native and WebAssembly), HTTP VFS with parallel range fetching (Asyncify, JSPI or SharedArrayBuffer variants) |
+| `web/` | Browser client library and demo page with in-browser query encoding (onnxruntime-web) |
+| `netsim/` | Byte-range HTTP server with configurable latency, bandwidth and concurrency, and a matching simulator |
+| `enc/` | Query and document encoders for both models (Python, onnxruntime) |
+| `tools/` | Builder for deployable databases containing documents, FTS5 and all vector indexes |
+| `bench/` | FTS5 baseline, metrics (recall, MRR, nDCG, AUC) and the benchmark matrix |
+| `models/` | all-MiniLM-L6-v2 (qint8), LateOn-Code-edge (int8) and LFM2.5-350M (q4f16, in four chunks) |
+| `data/` | Word list, corpora, LLM-generated paragraphs and queries, query sets with relevance labels |
+| `docs/` | Specifications, including the PLAID write-up (`docs/plaid.md`) |
 
-## Reproducing the data
+## Datasets
+
+- **Random-word corpora** (`words-100`, `words-10k`, `words-1m`): 50-word documents drawn from a deterministic shuffle of the Debian `wamerican` word list. Queries are single words and three-word known-item queries. The 1M corpus is regenerated by `scripts/make_corpora.py`, not checked in.
+- **LLM corpora** (`llm-100`, `llm-10k`): LiquidAI LFM2.5-350M was asked to "please write a paragraph about *w*" for each of the first 10,000 shuffled words; a document is the first 50 words of the reply. Queries are the word itself and the model's own search query for it (`data/llm/`).
+
+## Quick start
 
 ```sh
-pip install onnxruntime tokenizers numpy
-python3 scripts/make_corpora.py            # words-100, words-10k, words-1m
-python3 scripts/assemble_lfm.py            # rebuild LFM external-data files
+pip install onnxruntime tokenizers numpy apsw
+make native                      # sqlite3 CLI and loadable extensions in build/native
+make wasm                        # WebAssembly builds (needs emsdk; see wasm/NOTES.md)
+make test                        # native, Node and Chromium tests
+make web                         # demo database and browser test
+make serve PRESET=4g             # then open http://localhost:8000/web/
+```
+
+Reproducing the data and the benchmarks:
+
+```sh
+python3 scripts/make_corpora.py && python3 scripts/make_queries.py
+python3 scripts/assemble_lfm.py  # restore the LFM weights from their chunks
 python3 scripts/llm_generate.py paragraphs 10000 data/llm/paragraphs-10k.jsonl 32
+python3 scripts/make_llm_corpus.py
+python3 enc/encode_corpus.py --model both data/corpora/llm-10k.txt
+python3 tools/build_db.py llm-10k && python3 tools/encode_queries.py llm-10k
+python3 bench/matrix.py all llm-10k
 ```
 
 ## License
