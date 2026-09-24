@@ -28,11 +28,11 @@ INDEXES = {
     "fts": {"kind": "fts5", "table": "fts"},
     "dense_graph": {"kind": "dense_ann", "table": "dense_graph", "embedding": "minilm",
                     "params": "dim=384, layout=colocated, vectors=inline, store_vectors=f16, M=16, "
-                              "ef_construction=200, threads=2"},
+                              "ef_construction=200, threads=2, codebook=int8"},
     "dense_ivf": {"kind": "dense_ann", "table": "dense_ivf", "embedding": "minilm",
-                  "params": "dim=384, layout=ivf, store_vectors=f16, threads=2"},
+                  "params": "dim=384, layout=ivf, store_vectors=f16, threads=2, ivf_centroids=auto, codebook=int8"},
     "late": {"kind": "late_plaid", "table": "late", "embedding": "lateon",
-             "params": "dim=48 nbits=2 centroids=0 layout=both order=1 threads=2 input=f16"},
+             "params": "dim=48 nbits=2 centroids=0 layout=both order=1 threads=2 input=f16 centroid_type=int8"},
 }
 PAGE_SIZE = 4096
 
