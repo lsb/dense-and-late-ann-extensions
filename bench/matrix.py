@@ -87,6 +87,9 @@ def configs_for(cfg, man):
             continue
         if c.get("exhaustive") and ccfg.get("skip_exhaustive"):
             continue
+        if man["corpus"] in c.get("skip_corpora", ()) or \
+                ("only_corpora" in c and man["corpus"] not in c["only_corpora"]):
+            continue
         layout = re.search(r"layout=(\w+)", spec.get("params_used") or "")
         if c.get("needs_layout") and layout and layout.group(1) not in (c["needs_layout"], "both"):
             continue

@@ -102,7 +102,10 @@
       "index": "dense_graph",
       "input": "minilm",
       "label": "graph ef 32, W 16",
-      "sql": "SELECT rowid AS id, stats FROM {table} WHERE embedding MATCH :q AND k = :k AND ef = 32 AND beam = 16 AND rerank = 2"
+      "sql": "SELECT rowid AS id, stats FROM {table} WHERE embedding MATCH :q AND k = :k AND ef = 32 AND beam = 16 AND rerank = 2",
+      "skip_corpora": [
+        "words-1m"
+      ]
     },
     {
       "id": "graph-ef64",
@@ -116,7 +119,10 @@
       "index": "dense_graph",
       "input": "minilm",
       "label": "graph ef 128, W 16",
-      "sql": "SELECT rowid AS id, stats FROM {table} WHERE embedding MATCH :q AND k = :k AND ef = 128 AND beam = 16 AND rerank = 2"
+      "sql": "SELECT rowid AS id, stats FROM {table} WHERE embedding MATCH :q AND k = :k AND ef = 128 AND beam = 16 AND rerank = 2",
+      "skip_corpora": [
+        "words-1m"
+      ]
     },
     {
       "id": "graph-ef128-w64",
@@ -126,18 +132,34 @@
       "sql": "SELECT rowid AS id, stats FROM {table} WHERE embedding MATCH :q AND k = :k AND ef = 128 AND beam = 64 AND rerank = 2"
     },
     {
+      "id": "graph-ef256-w64",
+      "index": "dense_graph",
+      "input": "minilm",
+      "label": "graph ef 256, W 64",
+      "sql": "SELECT rowid AS id, stats FROM {table} WHERE embedding MATCH :q AND k = :k AND ef = 256 AND beam = 64 AND rerank = 2",
+      "only_corpora": [
+        "words-1m"
+      ]
+    },
+    {
       "id": "ivf-np16",
       "index": "dense_ivf",
       "input": "minilm",
       "label": "IVF nprobe 16, rerank 64",
-      "sql": "SELECT rowid AS id, stats FROM {table} WHERE embedding MATCH :q AND k = :k AND nprobe = 16 AND rerank_k = 64 AND rerank = 2"
+      "sql": "SELECT rowid AS id, stats FROM {table} WHERE embedding MATCH :q AND k = :k AND nprobe = 16 AND rerank_k = 64 AND rerank = 2",
+      "skip_corpora": [
+        "words-1m"
+      ]
     },
     {
       "id": "ivf-np64",
       "index": "dense_ivf",
       "input": "minilm",
       "label": "IVF nprobe 64, rerank 64",
-      "sql": "SELECT rowid AS id, stats FROM {table} WHERE embedding MATCH :q AND k = :k AND nprobe = 64 AND rerank_k = 64 AND rerank = 2"
+      "sql": "SELECT rowid AS id, stats FROM {table} WHERE embedding MATCH :q AND k = :k AND nprobe = 64 AND rerank_k = 64 AND rerank = 2",
+      "skip_corpora": [
+        "words-1m"
+      ]
     },
     {
       "id": "ivf-np128",
@@ -145,6 +167,16 @@
       "input": "minilm",
       "label": "IVF nprobe 128, rerank 128",
       "sql": "SELECT rowid AS id, stats FROM {table} WHERE embedding MATCH :q AND k = :k AND nprobe = 128 AND rerank_k = 128 AND rerank = 2"
+    },
+    {
+      "id": "ivf-np512",
+      "index": "dense_ivf",
+      "input": "minilm",
+      "label": "IVF nprobe 512, rerank 128",
+      "sql": "SELECT rowid AS id, stats FROM {table} WHERE embedding MATCH :q AND k = :k AND nprobe = 512 AND rerank_k = 128 AND rerank = 2",
+      "only_corpora": [
+        "words-1m"
+      ]
     },
     {
       "id": "dense-exact",
