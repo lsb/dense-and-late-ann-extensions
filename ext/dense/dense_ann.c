@@ -1815,9 +1815,9 @@ static int build_ivf(DenseVtab *vt, const float *X, const int64_t *rowids, int64
   if (nlist < 1) nlist = 1;
   if (nlist > n) nlist = (int)n;
 
-  /* 1. Coarse k-means (10 iterations on a sample of up to 64 points/list). */
+  /* 1. Coarse k-means (10 iterations on a sample of 40 points per list, at least 65,536). */
   float *C = (float *)malloc(sizeof(float) * (size_t)nlist * dim);
-  int64_t sample = (int64_t)nlist * 64 > 65536 ? (int64_t)nlist * 64 : 65536;
+  int64_t sample = (int64_t)nlist * 40 > 65536 ? (int64_t)nlist * 40 : 65536;
   dnivf_kmeans(X, n, dim, nlist, sample, 10, (uint64_t)c->seed, c->nthreads, c->verbose, C);
 
   /* 2. Store centroids in the head format and use the decoded ones from here on. */

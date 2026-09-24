@@ -194,6 +194,49 @@ class DenseAnnTest(unittest.TestCase):
         self.assertEqual(c["prefetch_calls"], st["rounds"] + st["setup_rounds"])
         self.assertGreaterEqual(c["distinct"], st["pages"] + st["setup_pages"])
 
+    # ------------------------------------------------------------ IVF layout
+
+    def test_ivf_two_rounds(self):
+        db, _ = self.open("ivf.db", params="layout=ivf, nlist=50")
+        r = self.recall(db, "AND nprobe = 25 AND rerank_k = 64")
+        self.assertGreater(r, 0.95)
+        _, _, st = self.search(db, self.Q[0], "AND nprobe = 8 AND rerank_k = 32")
+        self.assertEqual((st["raw"], st["fallback"], st["rounds"]), (1, 0, 2))   # lists, then vectors
+        self.assertEqual(st["lists"], 8)
+        _, _, st = self.search(db, self.Q[0], "AND nprobe = 8 AND rerank = 0")
+        self.assertEqual(st["rounds"], 1)
+        # exact PQ over all lists equals a full probe without rerank.
+        a = self.search(db, self.Q[1], "AND exact = 2")[0]
+        b = self.search(db, self.Q[1], "AND nprobe = 50 AND rerank = 0")[0]
+        self.assertEqual(a, b)
+        self.assertEqual(self.search(db, self.Q[1], "AND exact = 1")[0], exact(self.X, self.Q[1], 10))
+
+    def test_ivf_variants(self):
+        for params in ("ivf_residual=0", "ivf_centroids=int8", "ivf_centroids=pq", "store_vectors=int8",
+                       "store_vectors=none"):
+            db, _ = self.open("ivfv.db", params="layout=ivf, nlist=30, " + params, n=1500)
+            ids, _, st = self.search(db, self.X[7], "AND nprobe = 30 AND rerank_k = 32")
+            self.assertEqual(ids[0], 8, params)
+            self.assertEqual(st["fallback"], 0, params)
+
+    def test_ivf_insert_delete(self):
+        db, _ = self.open("ivfi.db", params="layout=ivf, nlist=40", n=2000)
+        new = self.X[2000:2100]
+        db.execute("BEGIN")
+        for i, x in enumerate(new):
+            db.execute("INSERT INTO v(rowid, embedding) VALUES (?, ?)", (50000 + i, x.tobytes()))
+        db.execute("COMMIT")
+        hits = sum(self.search(db, x, "AND nprobe = 8")[0][:1] == [50000 + i] for i, x in enumerate(new))
+        self.assertGreater(hits, 95)
+        db.execute("DELETE FROM v WHERE rowid = 50003")
+        db.execute("DELETE FROM v WHERE rowid = 17")
+        self.assertNotIn(50003, self.search(db, new[3], "AND nprobe = 8")[0])
+        self.assertNotIn(17, self.search(db, self.X[16], "AND nprobe = 8")[0])
+        db.execute("INSERT INTO v(v) VALUES ('finalize')")
+        ids, _, st = self.search(db, new[5], "AND nprobe = 8")
+        self.assertEqual(ids[0], 50005)
+        self.assertEqual(st["rounds"], 2)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

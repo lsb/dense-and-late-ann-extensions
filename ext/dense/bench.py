@@ -258,8 +258,12 @@ def cold_query_pages(path, Q, k, p, nq=10):
         db.load_extension(COUNTVFS)          # registers the SQL functions here
         db.execute("SELECT countvfs_reset()")
         p2 = {**DEFAULTS, **p}
-        db.execute(SQL, (q.tobytes(), k, p2["ef"], p2["beam"], p2["rerank"], 0, p2["nprobe"], p2["rk"])).fetchall()
-        out.append(json.loads(db.execute("SELECT countvfs_stats()").fetchone()[0]))
+        rows = db.execute(SQL, (q.tobytes(), k, p2["ef"], p2["beam"], p2["rerank"], 0, p2["nprobe"], p2["rk"])).fetchall()
+        o = json.loads(db.execute("SELECT countvfs_stats()").fetchone()[0])
+        st = json.loads(rows[0][2]) if rows else {}
+        o["setup_bytes"] = st.get("setup_bytes", 0)
+        o["setup_pages"] = st.get("setup_pages", 0)
+        out.append(o)
         db.close()
     boot.close()
     return {key: float(np.mean([o[key] for o in out])) for key in out[0]}
@@ -283,6 +287,7 @@ SWEEPS = {
     "ivf": ([_i(np_, 64, 0) for np_ in (8, 32, 128)]
             + [_i(np_, rk, 2) for np_ in (4, 8, 16, 32, 64, 128, 256) for rk in (32, 64, 128)]
             + [_i(512, 128, 2), _i(512, 256, 2)]),
+    "ivfs": [_i(8, 64, 0), _i(32, 64, 0)] + [_i(np_, rk, 2) for np_ in (8, 16, 32, 64, 128, 256) for rk in (32, 64, 128)],
 }
 
 
@@ -344,8 +349,7 @@ def main():
            "warm miss pages | warm miss rounds | 4g ms | slow-4g ms | QPS |" + "".join(f" R@10 {g} |" for g in groups))
     print(hdr)
     print("|---" * (hdr.count("|") - 1) + "|")
-    _, st0, _ = run_queries(db, Q[:5], args.k, {})   # load the head, warm caches
-    setup_bytes = st0[0].get("setup_bytes", 0) if st0 else 0
+    run_queries(db, Q[:5], args.k, {})   # load the head, warm caches
     pgsz = db.execute("PRAGMA page_size").fetchone()[0]
     for p in SWEEPS[args.sweep]:
         ids, stats, secs = run_queries(db, Q, args.k, p, trace=True)
@@ -377,6 +381,7 @@ def main():
     db.close()
 
     cold = cold_query_pages(path, Q, args.k, {})
+    setup_bytes = cold["setup_bytes"]
     setup = {"setup_bytes": setup_bytes, **{"setup_ms_" + p: setup_ms(setup_bytes, pgsz, p) for p in PROFILES}}
     print(f"setup (codebook + head): {setup_bytes / 1024:.0f} KiB, 4g {setup['setup_ms_4g']:.0f} ms, "
           f"slow-4g {setup['setup_ms_slow-4g']:.0f} ms", flush=True)
