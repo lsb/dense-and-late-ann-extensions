@@ -44,8 +44,8 @@ QUERY_DEFAULTS = {
 }
 
 MODEL_FILES = {
-    "minilm": ("minilm-l6-v2", "model_qint8_arm64.onnx", "tokenizer.json"),
-    "lateon": ("lateon-code-edge", "model_int8.onnx", "tokenizer.json"),
+    "minilm": ("minilm-l6-v2", "model_w8.onnx", "tokenizer.json"),
+    "lateon": ("lateon-code-edge", "model_w8.onnx", "tokenizer.json"),
 }
 
 
@@ -65,8 +65,8 @@ def models_dir(arg):
         if c and any((Path(c) / sub).is_dir() for sub, _, _ in MODEL_FILES.values()):
             return Path(c)
     sys.exit("models not found: pass --models DIR or set DENSE_LATE_ANN_MODELS to a directory holding "
-             "minilm-l6-v2/{model_qint8_arm64.onnx,tokenizer.json} and "
-             "lateon-code-edge/{model_int8.onnx,tokenizer.json} (see docs/INSTALL.md)")
+             "minilm-l6-v2/{model_w8.onnx,tokenizer.json} and "
+             "lateon-code-edge/{model_w8.onnx,tokenizer.json} (see docs/INSTALL.md)")
 
 
 def encoder(which, mdir, threads):

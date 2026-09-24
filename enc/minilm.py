@@ -27,7 +27,7 @@ import onnxruntime as ort
 from tokenizers import Tokenizer
 
 REPO = Path(__file__).resolve().parent.parent
-DEFAULT_MODEL = REPO / "models" / "minilm-l6-v2" / "model_qint8_arm64.onnx"
+DEFAULT_MODEL = REPO / "models" / "minilm-l6-v2" / "model_w8.onnx"  # weight-only int8; see scripts/dequantize_activations.py
 DEFAULT_TOKENIZER = REPO / "models" / "minilm-l6-v2" / "tokenizer.json"
 MAX_SEQ_LENGTH = 256
 DIM = 384

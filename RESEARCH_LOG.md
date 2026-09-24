@@ -325,3 +325,33 @@ The project is distributed through two packages that share one database format, 
 - `.github/workflows/release.yml` builds wheels (cibuildwheel for Linux and macOS), the sdist and the npm tarball on version tags. Publishing stays off until credentials are configured and `PUBLISH_PACKAGES` is set. Neither workflow has been run on GitHub yet.
 
 Windows is unsupported because index building uses pthreads.
+
+## 2026-09-24 — The int8 encoders are wrong on CPUs without VNNI; switch to weight-only int8
+
+**Symptom.** The first GitHub Actions run failed a packaging test: for a query copied from document 3, the late index did not return document 3 at all. Locally it ranked first. A build with AddressSanitizer and UndefinedBehaviorSanitizer found nothing wrong in the C code.
+
+**Cause.** Both published int8 ONNX exports use onnxruntime's *dynamic* quantization: each matrix product becomes `DynamicQuantizeLinear(x) → MatMulInteger(x_q, W_q) → Cast → Mul(scale)`, with uint8 activations and int8 weights. On x86 CPUs without AVX-512 VNNI or AVX-VNNI (GitHub's runners are AMD EPYC with AVX2 only), onnxruntime's u8s8 kernel sums pairs of products in saturating 16-bit integers. Running the encoder under `qemu-x86_64 -cpu Haswell`, which emulates an AVX2-only CPU, reproduced this. LateOn-Code-edge's token vectors on such a CPU have a mean cosine similarity of only 0.24–0.40 with those computed on a VNNI CPU; MiniLM drifts less (0.985–0.994 against fp32). The same mechanism also explains the batch dependence recorded earlier, because the activation scale is computed over the whole batch.
+
+**Fix.** `scripts/dequantize_activations.py` rewrites each chain as `MatMul(x, DequantizeLinear(W_q, W_scale, W_zero_point))`, or as a plain float `MatMul` where both operands are activations (MiniLM's attention products). The weights stay int8 in the file, so the sizes are unchanged (17.2 MB and 23.0 MB); onnxruntime constant-folds the dequantization when the session is created and computes in float32. The results are `models/*/model_w8.onnx` ("w8"), now the default in `enc/`, `web/lib/` and the Python package.
+
+| Check | Original int8 | w8 |
+|---|---|---|
+| LateOn, VNNI CPU vs emulated AVX2 CPU (per-token cosine) | 0.24–0.40 | 0.9999 |
+| MiniLM, VNNI vs AVX2 | 0.985–0.995 (vs fp32) | 0.9999 |
+| Batch of 4 vs one at a time | 0.99 | 1.0 (identical) |
+| MiniLM vs fp32 model | 0.991–0.995 | 0.998–0.999 |
+| Browser (onnxruntime-web) vs Python, share of vectors with cosine ≥ 0.999 | 84 % / 91 % | 100 % / 99.9 % |
+
+**Quality**, exhaustive search, nDCG@10 on 500 word queries and 500 llmq queries of llm-10k:
+
+| Model | Variant | Word queries | Paraphrase queries |
+|---|---|---|---|
+| MiniLM | int8 | 0.853 | 0.288 |
+| MiniLM | w8 | 0.854 | 0.288 |
+| MiniLM | fp32 | 0.854 | 0.287 |
+| LateOn | int8 | 0.803 | 0.199 |
+| LateOn | w8 | 0.816 | 0.211 |
+
+Dynamic activation quantization cost LateOn about 0.012 nDCG even on VNNI hardware. The price of w8 is speed: native encoding one document at a time falls from 177 to 93 documents/s (MiniLM) and from 224 to 150 (LateOn) on the shared CPU. In the browser a short query now takes about 30 ms (MiniLM) and 13 ms (LateOn) to encode, instead of 7–11 ms and 3.5–4 ms.
+
+**Consequence.** All corpora are re-encoded with the w8 models, and the benchmark matrix is rebuilt. The dense words-1m ANN comparison that was already running uses int8 MiniLM embeddings. Its conclusions about recall against exact search, rounds and bytes do not depend on the encoder variant, so it is left to finish.

@@ -47,7 +47,7 @@ def default_threads() -> int:
 
 
 class LateOn:
-    def __init__(self, model_path=MODEL_DIR / "model_int8.onnx",
+    def __init__(self, model_path=MODEL_DIR / "model_w8.onnx",  # weight-only int8; see scripts/dequantize_activations.py
                  tokenizer_path=MODEL_DIR / "tokenizer.json", config_path=CONFIG_PATH,
                  threads: int | None = None, **overrides):
         cfg = json.loads(Path(config_path).read_text())

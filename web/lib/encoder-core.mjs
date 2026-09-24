@@ -10,8 +10,8 @@
 import { makeTokenizers } from './tokenize.mjs';
 
 export const MODELS = {
-  minilm: { onnx: 'models/minilm-l6-v2/model_qint8_arm64.onnx', tokenizer: 'models/minilm-l6-v2/tokenizer.json', dim: 384 },
-  lateon: { onnx: 'models/lateon-code-edge/model_int8.onnx', tokenizer: 'models/lateon-code-edge/tokenizer.json', dim: 48 },
+  minilm: { onnx: 'models/minilm-l6-v2/model_w8.onnx', tokenizer: 'models/minilm-l6-v2/tokenizer.json', dim: 384 },
+  lateon: { onnx: 'models/lateon-code-edge/model_w8.onnx', tokenizer: 'models/lateon-code-edge/tokenizer.json', dim: 48 },
 };
 
 function int64Tensor(ort, ids) {

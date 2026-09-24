@@ -29,8 +29,8 @@ function absUrl(v, name) {
 }
 
 export const MODEL_FILES = {
-  minilm: { model: 'models/minilm-l6-v2/model_qint8_arm64.onnx', tokenizer: 'models/minilm-l6-v2/tokenizer.json' },
-  lateon: { model: 'models/lateon-code-edge/model_int8.onnx', tokenizer: 'models/lateon-code-edge/tokenizer.json' },
+  minilm: { model: 'models/minilm-l6-v2/model_w8.onnx', tokenizer: 'models/minilm-l6-v2/tokenizer.json' },
+  lateon: { model: 'models/lateon-code-edge/model_w8.onnx', tokenizer: 'models/lateon-code-edge/tokenizer.json' },
 };
 
 function label(ix) {
