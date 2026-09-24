@@ -383,3 +383,30 @@ With the default 4√N ≈ 4,000 lists, 0.922 needs 29 MB per query (30 s on `4g
 - *Coarse clustering does not follow the data.* IVF's clusters do not line up with query neighbourhoods, so recall grows only slowly as more lists are probed.
 
 The same code on synthetic clustered 1M data reaches recall 0.97–0.995 in 2–8 rounds and 0.4–0.6 MB. And on llm-10k the graph matches exhaustive MiniLM search (nDCG 0.585 against 0.586). Recall against exact search at 1M random words is therefore a stress test rather than a prediction for real text. A realistic 1M-scale dense evaluation would need a realistic 1M-document corpus: generating one with the local LLM would take about 10 days on this machine, so it is out of scope.
+
+## 2026-09-24 — Ranked FTS5 over httpvfs (`docs/fts5-httpvfs.md`, `ext/fts5rank/`)
+
+**Problem.** FTS5's `bm25()` reads one `fts_docsize` row per matching document. Over httpvfs each read is a separate round trip, because SQLite's synchronous VFS asks for them one at a time.
+
+**Fix.** The new extension `ext/fts5rank` adds `bm25c()`: bm25 with every document treated as having the average length, so ranking reads nothing per document. It is now the client's default (`rank: 'bm25c'` in `web/lib/search-core.mjs`); `rank: 'bm25'` restores the old behaviour. Two exact alternatives are also available:
+- `bm25-rerank` re-scores bm25c's top 50 with their stored lengths (3 more rounds, about 200 KB at 1M; its top 10 matches bm25's 97.5–100 % of the time).
+- `bm25-prefetch` fetches every matching `fts_docsize` row in one `httpvfs_warm` batch (13 rounds, but still 2.7 MB at 1M).
+
+**Results through the WASM client.** Cold queries on words-1m, simulated on `4g`:
+
+| Query | bm25 | bm25c |
+|---|---|---|
+| Single word | 685 rounds, 2.9 MB, 115 s | 10 rounds, 39 KB, 1.7 s |
+| Three-word OR | 1,092 rounds, 191 s | 17 rounds, 3.0 s |
+
+Real shaped runs agree with the simulation: bm25 took 51 s on `lte` and bm25c 1.71 s on `4g`.
+
+**Quality.** Unchanged on words-10k, words-1m and llm-10k, whose documents have (nearly) equal lengths. On untruncated LLM paragraphs (11–205 words), bm25c loses 0.008 nDCG@10 on word queries, and rerank recovers it.
+
+**Alternatives that did not help.**
+- Reading the whole `fts_docsize` table costs 9.6 MB per session at 1M.
+- The FTS5 options `columnsize=0` and `detail=column`/`none` make ranking re-tokenise the matching documents (about 1,000 pages), so none of them helps.
+
+After this fix, a cold FTS5 query still costs 6–17 rounds. Those come from FTS5's own chain of dependent lookups (structure record, `%_idx`, leaves), so prefetching the structure pages when the database opens is the next lever.
+
+**Caveat for the matrix.** Ties are broken by rowid, and in the LLM query sets query *i* is about document *i*. A subset of the first 1,000 queries therefore favours methods with many ties; over all 10,000 queries this washes out.
