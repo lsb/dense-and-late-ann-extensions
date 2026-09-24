@@ -22,7 +22,7 @@ window.run = async () => {
       const r = {};
       for (const t of SYSTEMS) {
         const vector = t === 'late' ? Float32Array.from(q.lateon) : t === 'fts' ? undefined : Float32Array.from(q.minilm);
-        r[t] = (await s.search({ table: t, text: q.text, vector, k: 10 })).rows.map((x) => x.id);
+        r[t] = (await s.search({ table: t, text: q.text, vector, k: 10, params: t === 'fts' ? { rank: 'bm25' } : {} })).rows.map((x) => x.id);
       }
       exact[variant].push(r);
     }
@@ -33,7 +33,7 @@ window.run = async () => {
   const encoded = [];
   for (const q of ref.queries) {
     const r = {};
-    for (const t of SYSTEMS) r[t] = (await ix.search(q.text, { system: t, k: 10 })).rows.map((x) => x.id);
+    for (const t of SYSTEMS) r[t] = (await ix.search(q.text, { system: t, k: 10, ...(t === 'fts' ? { rank: 'bm25' } : {}) })).rows.map((x) => x.id);
     encoded.push(r);
   }
   const variant = ix.variant;

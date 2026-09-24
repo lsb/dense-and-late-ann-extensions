@@ -48,7 +48,8 @@ try {
     for (const q of ref.queries) {
       for (const table of SYSTEMS) {
         const vector = table === 'late' ? Float32Array.from(q.lateon) : table === 'fts' ? undefined : Float32Array.from(q.minilm);
-        const r = await s.search({ table, text: q.text, vector, k: 10 });
+        // The native reference ranks FTS5 with plain bm25; the client default is bm25c.
+        const r = await s.search({ table, text: q.text, vector, k: 10, params: table === 'fts' ? { rank: 'bm25' } : {} });
         assert.deepEqual(r.rows.map((x) => x.id), q.expected[table], `${variant} ${table} "${q.text}"`);
         assert.ok(r.rows.every((x) => typeof x.text === 'string' && x.text.length > 0));
       }

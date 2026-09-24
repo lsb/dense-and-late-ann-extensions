@@ -61,6 +61,9 @@ SQLITE_EXTENSION_INIT1
 #define LT_MAGIC 0x3150544cu   /* "LTP1" */
 #define LT_VERSION 3          /* 3: centroid storage type, varint list lengths */
 #define LT_VERSION_MAX 3
+/* A query token is a stop token only if its probed lists average more than
+** this many entries, whatever stoplist * N is (see the stop-token code in the query path). */
+#define LATE_STOPLIST_MIN_ENTRIES 64.0
 
 enum { CQ_F16 = 0, CQ_INT8 = 1, CQ_INT4 = 2 };
 
@@ -1528,7 +1531,7 @@ static int q_probe(Query *q) {
   }
   free(bs); free(F);
   /* "Stop" query tokens: a token whose probed lists hold on average more
-  ** than stoplist * N entries matches very many documents, like a stop word;
+  ** than max(stoplist * N, LATE_STOPLIST_MIN_ENTRIES) entries matches very many documents, like a stop word;
   ** its lists are not fetched and every document gets its best centroid
   ** score for it (the same value for all, so the ranking is unaffected). */
   char *stop = (char *)calloc(nq, 1);
@@ -1539,7 +1542,11 @@ static int q_probe(Query *q) {
     for (int i = 0; i < nq; i++) {
       double tot = 0;
       for (int j = 0; j < np; j++) tot += cnt[q->probe[(size_t)i * np + j]];
-      if (tot / np > q->o.stoplist * (double)ix->N) { stop[i] = 1; nstop++; }
+      /* The floor keeps tiny corpora (N < 3200) from treating every token
+      ** as a stop token, which would leave fewer than k candidates. */
+      double limit = q->o.stoplist * (double)ix->N;
+      if (limit < LATE_STOPLIST_MIN_ENTRIES) limit = LATE_STOPLIST_MIN_ENTRIES;
+      if (tot / np > limit) { stop[i] = 1; nstop++; }
     }
     if (nstop == nq) memset(stop, 0, nq);
     else {

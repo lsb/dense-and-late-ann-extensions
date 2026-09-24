@@ -468,3 +468,10 @@ A *lazy cells* mode stores the flat centroids in cells fetched on demand, and it
 - *First visit.* The roughly 37 MB download of ONNX Runtime and the models dominates (28–44 s), and the gain is 0.5–1.2 s.
 
 **Parser bug.** `late_plaid` ignored every option after the first when options were space-separated, which is how `tools/build_db.py` writes them. Earlier matrix late indexes were therefore built with default parameters. At 10k these equal the intended ones; at 1M they would have meant 131,072 centroids. The bug is fixed (with a test), and all matrix databases are being rebuilt.
+
+## 2026-09-24 — CI fixes after the round-2 merges
+
+CI on GitHub had been red since the FTS5 merge, for two reasons.
+
+1. **npm package test.** It compared the WASM client's FTS5 results, now ranked with `bm25c` by default, against a native reference ranked with plain `bm25`. The test now asks for `rank: 'bm25'` explicitly.
+2. **Stoplist on tiny corpora.** Once the late option parser was fixed, the stoplist (`stoplist=0.02`) actually took effect. At N = 100, 2 % of N is 2 entries, so nearly every query token counted as a stop token and a top-10 query returned only 6 documents. A stop token must now also exceed a floor of 64 list entries (`LATE_STOPLIST_MIN_ENTRIES`). This changes nothing at 10k (where 2 % is 200) or at 1M, and only affects corpora below 3,200 documents.
