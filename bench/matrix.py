@@ -8,6 +8,7 @@ Steps (each writes build/matrix/<corpus>.<step>.*; `all` runs them in order):
   quality   native SQLite (build/native) runs every query of every config at
             k = 10 and at k = 100 (for AUC), and computes recall@10, success@1,
             MRR@10, nDCG@10, AUC and recall@10 against the system's exact search
+  metrics   recompute the metrics from the stored result lists
   trace     Node + WASM (Asyncify) against the unshaped server: every query in
             the warm regime (one connection), a subset in the cold regime (new
             connection per query); records VFS counters and the request log
@@ -95,10 +96,19 @@ def interleave_kinds(meta, per_kind=None):
     return out
 
 
+def kind_cap(cfg, meta):
+    """Queries per kind evaluated for this corpus (matrix_config corpora.*.max_per_kind)."""
+    return cfg["corpora"].get(meta.get("name", ""), {}).get("max_per_kind")
+
+
+def all_queries(cfg, meta):
+    return interleave_kinds(meta, kind_cap(cfg, meta))
+
+
 def query_set(cfg, meta, c):
     if c.get("exhaustive"):
         return interleave_kinds(meta, cfg["run"]["exhaustive_max_queries"] // 2)
-    return interleave_kinds(meta)
+    return all_queries(cfg, meta)
 
 
 # ================================================================ quality
@@ -202,9 +212,35 @@ def per_query_metrics(ids10, ids100, rel, n_docs, ref10):
         "ndcg@10": M.ndcg_at(ids10, rel, 10),
         "auc@100": M.auc(ids100, rel, n_docs) if ids100 is not None else float("nan"),
     }
-    if ref10 is not None:
+    if ref10:   # undefined when the exact search returns nothing (e.g. an AND query with no match)
         m["r10_vs_exact"] = len(set(ids10[:10]) & set(ref10[:10])) / max(1, min(10, len(ref10)))
     return m
+
+
+def compute_metrics(out, all_confs, meta, n_docs):
+    default_ref = {"minilm": "exact:minilm", "lateon": "exact:lateon"}
+    for cid, r in out["configs"].items():
+        c = next((x for x in all_confs if x["id"] == cid), None)
+        ref_key = (c.get("ref") or default_ref.get(c["input"]) or cid) if c else cid
+        ref = out["configs"].get(ref_key)
+        refmap = dict(zip(ref["qidx"], ref["ids10"])) if ref else {}
+        rows = []
+        for qi, a, b in zip(r["qidx"], r["ids10"], r["ids100"]):
+            m = per_query_metrics(a, b, meta["relevant"][qi], n_docs, refmap.get(qi))
+            m["kind"] = meta["kinds"][qi]
+            rows.append(m)
+        r["ref"] = ref_key if ref else None
+        r["metrics"] = summarize_metrics(rows)
+
+
+def step_metrics(cfg, corpus, args):
+    """Recompute metrics from the stored result lists (no queries are run)."""
+    man, meta = manifest(corpus), qmeta(corpus)
+    qpath = BUILD / f"{corpus}.quality.json"
+    out = json.loads(qpath.read_text())
+    compute_metrics(out, configs_for(cfg, man), meta, man["n_docs"])
+    qpath.write_text(json.dumps(out))
+    print(f"[{corpus}] metrics recomputed")
 
 
 def step_quality(cfg, corpus, args):
@@ -215,7 +251,7 @@ def step_quality(cfg, corpus, args):
     db = native_db(BUILD / man["file"])
     n_docs = man["n_docs"]
     k, kd = cfg["run"]["k"], cfg["run"]["k_deep"]
-    all_q = interleave_kinds(meta)
+    all_q = all_queries(cfg, meta)
     t = time.time()
     refs = {}
     if any(c["input"] == "minilm" for c in all_confs):
@@ -256,20 +292,7 @@ def step_quality(cfg, corpus, args):
     # exact references as pseudo-configs (no network cost)
     for key, g in refs.items():
         out["configs"][key] = {"qidx": all_q, "ids10": [g[q][:k] for q in all_q], "ids100": [g[q] for q in all_q]}
-    # metrics
-    default_ref = {"minilm": "exact:minilm", "lateon": "exact:lateon"}
-    for cid, r in out["configs"].items():
-        c = next((x for x in all_confs if x["id"] == cid), None)
-        ref_key = (c.get("ref") or default_ref.get(c["input"]) or cid) if c else cid
-        ref = out["configs"].get(ref_key)
-        refmap = dict(zip(ref["qidx"], ref["ids10"])) if ref else {}
-        rows = []
-        for qi, a, b in zip(r["qidx"], r["ids10"], r["ids100"]):
-            m = per_query_metrics(a, b, meta["relevant"][qi], n_docs, refmap.get(qi))
-            m["kind"] = meta["kinds"][qi]
-            rows.append(m)
-        r["ref"] = ref_key if ref else None
-        r["metrics"] = summarize_metrics(rows)
+    compute_metrics(out, all_confs, meta, n_docs)
     qpath.write_text(json.dumps(out))
     print(f"[{corpus}] wrote {BUILD / f'{corpus}.quality.json'}")
 
@@ -461,7 +484,7 @@ def step_real(cfg, corpus, args):
             if c.get("exhaustive") and p not in fast:
                 continue
             qs = interleave_kinds(meta, 5 if c.get("exhaustive") else per_kind)
-            warm_up = [interleave_kinds(meta)[-1]]
+            warm_up = [all_queries(cfg, meta)[-1]]
             runs.append(node_run(c, k, "warm", qs, warm_up))
             runs.append(node_run(c, k, "cold", interleave_kinds(meta, 2 if c.get("exhaustive") else max(2, per_kind // 5)), []))
         jobs.append((spec, runs))
@@ -514,7 +537,9 @@ def aggregate(cfg, corpus):
            "sizes": {k: v["bytes"] for k, v in man["sizes"].items()}, "tables": man["tables"],
            "index_params": {k: v.get("params_used") for k, v in man["indexes"].items()},
            "build_seconds": man["build_seconds"], "k": qual["k"], "k_deep": qual["k_deep"],
-           "n_queries": meta["n"], "query_kinds": {k: meta["kinds"].count(k) for k in sorted(set(meta["kinds"]))},
+           "n_queries": len(all_queries(cfg, meta)), "n_queries_in_set": meta["n"],
+           "query_kinds": {k: [meta["kinds"][i] for i in all_queries(cfg, meta)].count(k)
+                           for k in sorted(set(meta["kinds"]))},
            "encode_ms": {m: {"p50": pct(meta[m]["encode_ms"], 50), "p95": pct(meta[m]["encode_ms"], 95),
                              "threads": meta["threads"]} for m in ("minilm", "lateon")},
            "profiles": specs, "configs": [], "references": []}
@@ -638,7 +663,9 @@ def md_corpus(cfg, r):
     L = []
     prof = cfg["profiles"]
     L.append(f"## {r['corpus']}\n")
-    L.append(f"{r['n_docs']:,} documents; {r['n_queries']:,} queries ("
+    sub = (f" evaluated, the first of each kind out of {r['n_queries_in_set']:,}"
+           if r.get("n_queries_in_set", r["n_queries"]) > r["n_queries"] else "")
+    L.append(f"{r['n_docs']:,} documents; {r['n_queries']:,} queries{sub} ("
              + ", ".join(f"{v:,} {k}" for k, v in r["query_kinds"].items())
              + f"). Database `{r['db_file']}`: {r['db_bytes'] / 1e6:.2f} MB.\n")
     agr = [c.get("wasm_native_agreement") for c in r["configs"] if c.get("wasm_native_agreement") is not None]
@@ -733,7 +760,7 @@ def step_report(cfg, corpora, args):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("step", choices=["quality", "trace", "sim", "real", "report", "all"])
+    ap.add_argument("step", choices=["quality", "metrics", "trace", "sim", "real", "report", "all"])
     ap.add_argument("corpora", nargs="*")
     ap.add_argument("--configs", default="", help="comma-separated config ids (default: all applicable)")
     ap.add_argument("--profiles", default="", help="real: comma-separated profiles (default: all)")
@@ -749,7 +776,7 @@ def main():
     for corpus in corpora:
         steps = ["quality", "trace", "sim", "real"] if args.step == "all" else [args.step]
         for s in steps:
-            {"quality": step_quality, "trace": step_trace, "sim": step_sim, "real": step_real}[s](cfg, corpus, args)
+            {"quality": step_quality, "metrics": step_metrics, "trace": step_trace, "sim": step_sim, "real": step_real}[s](cfg, corpus, args)
     if args.step == "all":
         step_report(cfg, corpora, args)
 

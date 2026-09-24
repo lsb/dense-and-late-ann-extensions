@@ -15,18 +15,19 @@
     "words-1m": {
       "text": "data/corpora/words-1m.txt",
       "queries": "data/queries/words-1m.jsonl",
-      "emb": "words-1m"
+      "emb": "words-1m",
+      "max_per_kind": 1000
     },
     "llm-100": {
       "text": "data/corpora/llm-100.txt",
       "queries": "data/queries/llm-100.jsonl",
-      "emb": "llm-10k",
-      "emb_prefix": 100
+      "emb": "llm-100"
     },
     "llm-10k": {
       "text": "data/corpora/llm-10k.txt",
       "queries": "data/queries/llm-10k.jsonl",
-      "emb": "llm-10k"
+      "emb": "llm-10k",
+      "max_per_kind": 1000
     }
   },
   "indexes": {
