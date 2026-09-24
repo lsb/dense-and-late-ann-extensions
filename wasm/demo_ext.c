@@ -9,6 +9,9 @@
 **                                fetched in about one round per uncached
 **                                B-tree level; returns the number of passes
 **                                that fetched something
+**   httpvfs_prefetch_pages(P, N) prefetch database pages P..P+N-1 as one
+**                                batch (pinned in the VFS cache until
+**                                read); returns the SQLite result code
 **   httpvfs_stats()              JSON text of the VFS counters for "main"
 **
 ** Loadable name: demo_ext.so, entry point sqlite3_demoext_init.
@@ -69,6 +72,21 @@ static void warmFunc(sqlite3_context *ctx, int argc, sqlite3_value **argv){
   sqlite3_result_int(ctx, passes);
 }
 
+static void prefetchPagesFunc(sqlite3_context *ctx, int argc,
+                              sqlite3_value **argv){
+  sqlite3_int64 first = sqlite3_value_int64(argv[0]);
+  int n = sqlite3_value_int(argv[1]), i, rc;
+  unsigned int *pg;
+  (void)argc;
+  if( first<1 || n<0 || n>(1<<24) ){ sqlite3_result_error_code(ctx, SQLITE_RANGE); return; }
+  pg = sqlite3_malloc64(sizeof(*pg)*(n>0 ? n : 1));
+  if( !pg ){ sqlite3_result_error_nomem(ctx); return; }
+  for(i=0; i<n; i++) pg[i] = (unsigned int)(first+i);
+  rc = httpvfs_prefetch_pages(sqlite3_context_db_handle(ctx), pg, n);
+  sqlite3_free(pg);
+  sqlite3_result_int(ctx, rc);
+}
+
 static void statsFunc(sqlite3_context *ctx, int argc, sqlite3_value **argv){
   HttpvfsStats s;
   (void)argc; (void)argv;
@@ -79,9 +97,13 @@ static void statsFunc(sqlite3_context *ctx, int argc, sqlite3_value **argv){
   sqlite3_result_text(ctx, sqlite3_mprintf(
     "{\"requests\":%lld,\"bytes\":%lld,\"rounds\":%lld,\"reads\":%lld,"
     "\"cache_hits\":%lld,\"cache_misses\":%lld,\"prefetch_calls\":%lld,"
-    "\"prefetch_blocks\":%lld,\"net_ms\":%.3f}",
+    "\"prefetch_blocks\":%lld,\"net_ms\":%.3f,\"cache_blocks\":%d,"
+    "\"cache_max_blocks\":%d,\"cached_blocks\":%d,\"pinned_blocks\":%d,"
+    "\"peak_blocks\":%d,\"pin_evictions\":%lld}",
     s.requests, s.bytes, s.rounds, s.reads, s.cache_hits, s.cache_misses,
-    s.prefetch_calls, s.prefetch_blocks, s.net_ms), -1, sqlite3_free);
+    s.prefetch_calls, s.prefetch_blocks, s.net_ms, s.cache_blocks,
+    s.cache_max_blocks, s.cached_blocks, s.pinned_blocks, s.peak_blocks,
+    s.pin_evictions), -1, sqlite3_free);
 }
 
 #ifdef _WIN32
@@ -98,6 +120,8 @@ int sqlite3_demoext_init(sqlite3 *db, char **pzErrMsg,
                                SQLITE_UTF8|SQLITE_DETERMINISTIC, 0, helloFunc, 0, 0);
   if( rc==SQLITE_OK ) rc = sqlite3_create_function(db, "httpvfs_warm", 2,
                                SQLITE_UTF8, 0, warmFunc, 0, 0);
+  if( rc==SQLITE_OK ) rc = sqlite3_create_function(db, "httpvfs_prefetch_pages", 2,
+                               SQLITE_UTF8, 0, prefetchPagesFunc, 0, 0);
   if( rc==SQLITE_OK ) rc = sqlite3_create_function(db, "httpvfs_stats", 0,
                                SQLITE_UTF8, 0, statsFunc, 0, 0);
   return rc;

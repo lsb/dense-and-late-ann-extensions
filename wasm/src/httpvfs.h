@@ -26,6 +26,7 @@
 #define HTTPVFS_FCNTL_RESET_STATS     0x48560004  /* NULL */
 #define HTTPVFS_FCNTL_SPECULATE       0x48560005  /* int* in: 1 begin, 0 end+fetch, -1 end+discard; out: #blocks */
 #define HTTPVFS_FCNTL_PAGE_SIZE       0x48560006  /* int* (out): VFS block size */
+#define HTTPVFS_FCNTL_RELEASE         0x48560007  /* NULL: end of statement */
 
 typedef struct HttpvfsRanges {
   const sqlite3_int64 *offsets;   /* byte offsets in the database file */
@@ -51,9 +52,13 @@ typedef struct HttpvfsStats {
   sqlite3_int64 spec_misses;      /* blocks recorded during speculation */
   sqlite3_int64 file_size;
   int block_size;                 /* VFS cache block size in bytes */
-  int cache_blocks;               /* capacity of the VFS cache, in blocks */
+  int cache_blocks;               /* budget of the VFS cache, in blocks */
   int cached_blocks;              /* blocks currently cached */
   double net_ms;                  /* wall time spent blocked on the network */
+  int cache_max_blocks;           /* hard limit while blocks are pinned */
+  int pinned_blocks;              /* blocks pinned now (prefetched, unread) */
+  int peak_blocks;                /* most blocks cached at once */
+  sqlite3_int64 pin_evictions;    /* pinned blocks evicted (hard limit) */
 } HttpvfsStats;
 
 /*
@@ -82,6 +87,17 @@ static inline int httpvfs_stats(sqlite3 *db, HttpvfsStats *out){
 
 static inline int httpvfs_reset_stats(sqlite3 *db){
   return sqlite3_file_control(db, "main", HTTPVFS_FCNTL_RESET_STATS, 0);
+}
+/*
+** Blocks of a prefetch or speculation batch stay pinned in the VFS cache
+** until they are read, and the cache may grow past its budget for them (up
+** to a hard limit). Pins end when the blocks are read or when the next batch
+** starts; httpvfs_release() ends the remaining ones and shrinks the cache
+** back to its budget. Call it when a statement is done (the JavaScript API
+** does after every statement; PRAGMA httpvfs_release does the same).
+*/
+static inline int httpvfs_release(sqlite3 *db){
+  return sqlite3_file_control(db, "main", HTTPVFS_FCNTL_RELEASE, 0);
 }
 
 /*

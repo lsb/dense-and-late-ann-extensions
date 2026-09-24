@@ -117,6 +117,55 @@ test('httpvfs_prefetch by byte range and sequential readahead', async () => {
   }
 });
 
+test('a prefetch batch larger than the cache is pinned until read, then trimmed', async () => {
+  const db = await open(dbUrl, {
+    pageCacheBytes: 64 << 10, pageCacheMaxBytes: 4 << 20, readaheadBytes: 0, sqliteCacheKiB: 1,
+  });
+  try {
+    const want = nativeQuery(dbPath, 'SELECT count(*), sum(length(body)) FROM docs')[0];
+    await db.query('SELECT httpvfs_prefetch_pages(1, 1)');   // header block and schema
+    await db.resetStats();
+    const npages = db.stats().fileSize / 4096;
+    // One statement: prefetch every page (about 540 blocks against a budget
+    // of 16), then scan the table; the scan depends on the prefetch result.
+    const [[rc, got]] = (await db.queryRaw(
+      `WITH w AS MATERIALIZED (SELECT httpvfs_prefetch_pages(2, ${npages - 1}) AS rc)
+       SELECT w.rc, (SELECT count(*) || ',' || sum(length(body)) FROM docs WHERE w.rc = 0) FROM w`)).rows;
+    assert.equal(rc, 0);
+    assert.equal(got, want.join(','));
+    const s = db.stats();
+    assert.equal(s.cacheBlocks, 16);
+    assert.equal(s.rounds, 1, 'the batch arrived in one round and nothing was fetched again');
+    assert.equal(s.cacheMisses, 0);
+    assert.equal(s.pinEvictions, 0);
+    assert.ok(s.peakBlocks > 30 * s.cacheBlocks, `peak ${s.peakBlocks}`);
+    // the statement is done: pins released, back within the budget
+    assert.equal(s.pinnedBlocks, 0);
+    assert.ok(s.cachedBlocks <= s.cacheBlocks, `cached ${s.cachedBlocks}`);
+  } finally {
+    await db.close();
+  }
+});
+
+test('the cache budget defaults to 1/64 of the database, at least 4 MiB', async () => {
+  let db = await open(dbUrl);
+  try {
+    const s = db.stats();
+    assert.equal(s.cacheBlocks, 1024);            // the 2 MB test database: the floor
+    assert.equal(s.cacheMaxBlocks, 4 * 1024);
+  } finally {
+    await db.close();
+  }
+  db = await open(dbUrl, { pageCacheMinBytes: 16 << 10, pageCacheMaxBytes: 1 << 20 });
+  try {
+    const s = db.stats();
+    assert.equal(s.cacheBlocks, Math.max(16, Math.floor(s.fileSize / 64 / 4096)));
+    assert.equal(s.cacheMaxBlocks, 256);
+  } finally {
+    await db.close();
+  }
+});
+
 test('parameters, blobs and errors', async () => {
   const db = await open(dbUrl);
   try {

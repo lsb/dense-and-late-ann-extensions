@@ -134,7 +134,7 @@ WASM_EXPORTS := $(subst $(space),,$(strip \
   _sqlite3_errmsg,_sqlite3_errcode,_sqlite3_changes,_sqlite3_libversion, \
   _sqlite3_db_release_memory,_sqlite3_file_control, \
   _httpvfs_stats_array,_httpvfs_reset,_httpvfs_log_count,_httpvfs_log_copy,_httpvfs_now, \
-  _httpvfs_net_config,_httpvfs_net_state))
+  _httpvfs_net_config,_httpvfs_net_state,_httpvfs_release_db))
 # Exports that can block on the network (JSPI needs them listed).
 WASM_ASYNC_EXPORTS := sqlite3_open_v2,sqlite3_exec,sqlite3_prepare_v2,sqlite3_step,sqlite3_file_control
 

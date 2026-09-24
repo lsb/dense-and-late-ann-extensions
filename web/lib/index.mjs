@@ -183,7 +183,8 @@ export class SearchIndex {
  * Open a search database.
  * opts:
  *   variant          SQLite WASM build: 'auto' (JSPI where supported, else Asyncify) | 'asyncify' | 'jspi'
- *   pageCacheBytes, blockSize, readaheadBytes, maxParallel   passed to wasm/pkg open()
+ *   pageCacheBytes, blockSize, readaheadBytes, maxParallel   passed to wasm/pkg open();
+ *                    pageCacheBytes defaults to 'auto' (1/64 of the database, 16..64 MiB)
  *   maxRequests, multipart, rttMs, bandwidthKbps, netAutoEstimate   request planning under a
  *                    per-round request budget (wasm/pkg open(); maxRequests 'auto' by default:
  *                    6 over HTTP/1.x, 100 over HTTP/2)
@@ -206,12 +207,12 @@ export async function openIndex(url, opts = {}) {
   for (const w of opts.preload || []) ix.loadEncoder(w).catch(() => {});
   ix.sqliteWorker = new Worker(new URL('sqlite-worker.mjs', HERE), { type: 'module', name: 'sqlite' });
   ix.sql = client(ix.sqliteWorker);
-  const { variant = 'auto', pageCacheBytes = 16 << 20, blockSize, readaheadBytes, maxParallel,
+  const { variant = 'auto', pageCacheBytes = 'auto', pageCacheMinBytes = 16 << 20, blockSize, readaheadBytes, maxParallel,
     maxRequests, multipart, rttMs, bandwidthKbps, netAutoEstimate } = opts;
   const info = await ix.sql('open', {
     url: new URL(url, globalThis.location?.href).href,
     sqliteModule: absUrl(opts.sqliteModule || PATHS.sqliteModule, 'sqliteModule'),
-    variant, pageCacheBytes, blockSize, readaheadBytes, maxParallel,
+    variant, pageCacheBytes, pageCacheMinBytes, blockSize, readaheadBytes, maxParallel,
     maxRequests, multipart, rttMs, bandwidthKbps, netAutoEstimate,
   });
   ix.url = url;

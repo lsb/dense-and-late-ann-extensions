@@ -18,7 +18,8 @@ const SQLITE_INTEGER = 1, SQLITE_FLOAT = 2, SQLITE_TEXT = 3, SQLITE_BLOB = 4;
 const STAT_NAMES = [
   'requests', 'bytes', 'rounds', 'reads', 'cacheHits', 'cacheMisses',
   'prefetchCalls', 'prefetchBlocks', 'specMisses', 'fileSize', 'blockSize',
-  'cacheBlocks', 'cachedBlocks', 'netMs',
+  'cacheBlocks', 'cachedBlocks', 'netMs', 'cacheMaxBlocks', 'pinnedBlocks', 'peakBlocks',
+  'pinEvictions',
 ];
 
 const modules = new Map();   // variant -> Promise<Module>
@@ -85,7 +86,14 @@ export class SqliteError extends Error {
 /**
  * Open a read-only database served at url (must support HTTP Range).
  * Options:
- *   pageCacheBytes  VFS block cache size (default 4 MiB)
+ *   pageCacheBytes  VFS block cache budget in bytes, or 'auto' (default):
+ *                   1/64 of the database size, clamped to
+ *                   pageCacheMinBytes..64 MiB
+ *   pageCacheMinBytes  lower bound of the 'auto' budget (default 4 MiB)
+ *   pageCacheMaxBytes  hard limit while the blocks of a prefetch batch are
+ *                   pinned (default 4 x the budget): a batch larger than the
+ *                   budget is kept until it has been read, and the cache
+ *                   shrinks back to the budget after each statement
  *   blockSize       cache block and minimum request size (default 4096;
  *                   use the database page size or a multiple of it)
  *   readaheadBytes  maximum sequential readahead (default 1 MiB, 0 = off)
@@ -139,8 +147,11 @@ export async function open(url, opts = {}) {
       cache: opts.httpCache,
       fetchSync,
     });
+    const cacheBytes = opts.pageCacheBytes ?? 'auto';
     const params = new URLSearchParams({
-      cache_kb: String(Math.max(1, Math.round((opts.pageCacheBytes ?? 4 << 20) / 1024))),
+      cache_kb: cacheBytes === 'auto' ? 'auto' : String(Math.max(1, Math.round(cacheBytes / 1024))),
+      cache_min_kb: String(Math.max(1, Math.round((opts.pageCacheMinBytes ?? 4 << 20) / 1024))),
+      cache_max_kb: String(Math.max(0, Math.round((opts.pageCacheMaxBytes ?? 0) / 1024))),
       block: String(opts.blockSize ?? 4096),
       readahead_kb: String(Math.round((opts.readaheadBytes ?? 1 << 20) / 1024)),
       gap_kb: String(Math.round((opts.coalesceGapBytes ?? 0) / 1024)),
@@ -237,7 +248,14 @@ export class Database {
       this._check(rc);
     } finally {
       M._free(p);
+      this._release();
     }
+  }
+
+  /** End of a statement: unpin prefetched blocks that were never read and
+   * shrink the VFS cache back to its budget. */
+  _release() {
+    if (this.db) this.M._httpvfs_release_db(this.db);
   }
 
   /** Run one or more statements, discarding results. */
@@ -337,6 +355,7 @@ export class Database {
       } finally {
         if (stmt) M._sqlite3_finalize(stmt);
         M._free(pStmt); M._free(pSql);
+        this._release();
       }
     });
   }
