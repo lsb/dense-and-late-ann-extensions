@@ -410,3 +410,26 @@ Real shaped runs agree with the simulation: bm25 took 51 s on `lte` and bm25c 1.
 After this fix, a cold FTS5 query still costs 6–17 rounds. Those come from FTS5's own chain of dependent lookups (structure record, `%_idx`, leaves), so prefetching the structure pages when the database opens is the next lever.
 
 **Caveat for the matrix.** Ties are broken by rowid, and in the LLM query sets query *i* is about document *i*. A subset of the first 1,000 queries therefore favours methods with many ties; over all 10,000 queries this washes out.
+
+## 2026-09-24 — Request budget per round for HTTP/1.1 (`wasm/src/httpvfs.c`)
+
+**Problem.** Browsers run at most six requests per host over HTTP/1.1, so a round of 16–100 range requests costs several latencies in sequence.
+
+**Design.** The VFS now plans each round against a request budget C (`maxRequests: 'auto'`: 6 over HTTP/1.x, 100 over HTTP/2, off in Node). It has two strategies:
+- *Coalescing.* It merges nearby ranges into at most C requests, choosing merges exactly under the cost model ⌈g/C⌉·RTT + bytes/bandwidth. RTT and bandwidth are estimated online from recent rounds (in Chromium on `4g,h1` the estimate converged to 167–169 ms, against a true 165 ms). Over-fetched pages go into the block cache.
+- *Multi-range requests* (opt-in). It sends at most C requests of the form `Range: bytes=a-b,c-d,…`, which over-fetch nothing. A server that ignores or refuses multi-range requests is detected once per URL (a 200 reply is aborted after its headers), and the VFS falls back to coalescing, at a cost of one extra round trip.
+
+**Results.** Warm-session p50 on `4g`, re-simulating the words-10k matrix traces with the C planner:
+
+| System | HTTP/1.1 before | Coalescing, C = 6 | Multi-range | HTTP/2 |
+|---|---|---|---|---|
+| Dense graph (ef 64) | 2.60 s | 2.58 s | 1.43 s | 1.42 s |
+| Dense IVF (nprobe 64) | 1.13 s | 0.95 s | 0.47 s | 0.47 s |
+| Late warp (nprobe 8, rerank 64) | 2.09 s | 1.92 s | 0.63 s | 0.62 s |
+
+- Multi-range requests make HTTP/1.1 match HTTP/2 within 1 % for every system and profile.
+- Coalescing alone gains 15–23 % for IVF, 3–8 % for warp, and 1 % or less for the graph, whose 16 nodes per round are scattered over 40 MB.
+- Node + WASM runs against the h1-shaped server agree with the simulator within 2–4 % and return identical results.
+- In Chromium on `4g,h1` the demo's later queries go from 3.5 / 3.4 s (graph / late) to 3.3 / 3.0 s with coalescing and to 1.8 / 1.0 s with multi-range requests.
+
+**Recommendation.** Host on HTTP/2, or enable multi-range requests on HTTP/1.1 servers that support them (nginx, Apache and Caddy do; S3 and R2 do not). One caveat: a cross-origin page sends one CORS preflight per URL for multi-range requests.
