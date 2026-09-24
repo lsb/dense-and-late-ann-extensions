@@ -475,3 +475,7 @@ CI on GitHub had been red since the FTS5 merge, for two reasons.
 
 1. **npm package test.** It compared the WASM client's FTS5 results, now ranked with `bm25c` by default, against a native reference ranked with plain `bm25`. The test now asks for `rank: 'bm25'` explicitly.
 2. **Stoplist on tiny corpora.** Once the late option parser was fixed, the stoplist (`stoplist=0.02`) actually took effect. At N = 100, 2 % of N is 2 entries, so nearly every query token counted as a stop token and a top-10 query returned only 6 documents. A stop token must now also exceed a floor of 64 list entries (`LATE_STOPLIST_MIN_ENTRIES`). This changes nothing at 10k (where 2 % is 200) or at 1M, and only affects corpora below 3,200 documents.
+
+## 2026-09-24 — Disk housekeeping
+
+The w8 1M encodings are complete: LateOn in 3.0 h, MiniLM in 3.0 h, one document at a time on 2 threads with a shared CPU. The words-1m late index (warp layout, K = 65,536, int8 centroids, nbits = 2) was built from the LateOn vectors into `build/matrix/words-1m--late.db` (1.6 GB). The 10.7 GB file `data/emb/words-1m.lateon.vectors.npy` was then deleted to make room for the 1M dense indexes, because the 30 GB disk allowance is nearly full. The offsets and document lengths are kept. Exact MaxSim ground truth is skipped at this scale anyway (111M token vectors), and the vectors can be regenerated with `enc/encode_corpus.py --model late data/corpora/words-1m.txt` in about 3 hours.
