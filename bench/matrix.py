@@ -25,6 +25,7 @@ Steps (each writes build/matrix/<corpus>.<step>.*; `all` runs them in order):
 """
 import argparse
 import json
+import re
 import math
 import os
 import socket
@@ -64,8 +65,13 @@ def manifest(corpus):
     return json.loads(p.read_text())
 
 
+def base(corpus):
+    """'words-1m--late' (a per-index database built with --split) -> 'words-1m'."""
+    return corpus.split("--")[0]
+
+
 def qmeta(corpus):
-    p = QDIR / f"{corpus}.json"
+    p = QDIR / f"{base(corpus)}.json"
     if not p.exists():
         raise SystemExit(f"{p} missing: run tools/encode_queries.py {corpus}")
     return json.loads(p.read_text())
@@ -74,9 +80,15 @@ def qmeta(corpus):
 def configs_for(cfg, man):
     """Configs whose index exists in the database, with {table} substituted."""
     out = []
+    ccfg = cfg["corpora"].get(man["corpus"], {})
     for c in cfg["configs"]:
         spec = man["indexes"].get(c["index"])
         if spec is None:
+            continue
+        if c.get("exhaustive") and ccfg.get("skip_exhaustive"):
+            continue
+        layout = re.search(r"layout=(\w+)", spec.get("params_used") or "")
+        if c.get("needs_layout") and layout and layout.group(1) not in (c["needs_layout"], "both"):
             continue
         out.append({**c, "sql_resolved": c["sql"].replace("{table}", spec["table"]),
                     "system": spec.get("system", c["index"])})
@@ -147,7 +159,7 @@ class QueryInputs:
 
 def exact_dense(cfg, corpus, meta, qi_all, k):
     import build_db
-    X = build_db.load_minilm(cfg, corpus, manifest(corpus)["n_docs"])
+    X = build_db.load_minilm(cfg, base(corpus), manifest(corpus)["n_docs"])
     Q = np.fromfile(QDIR / meta["minilm"]["file"], "<f4").reshape(-1, 384)[qi_all]
     Q = Q / np.linalg.norm(Q, axis=1, keepdims=True)
     best_s = np.full((len(Q), k), -np.inf, np.float32)
@@ -173,7 +185,7 @@ def _merge_topk(best_s, best_i, S, base, k):
 def exact_late(cfg, corpus, meta, qi_all, k, max_tokens=60_000_000):
     """Float-exact MaxSim over the original float16 token vectors."""
     import build_db
-    p = build_db.emb_paths(cfg, corpus, "lateon")
+    p = build_db.emb_paths(cfg, base(corpus), "lateon")
     n = manifest(corpus)["n_docs"]
     off = np.load(p["offsets"])[:n + 1]
     if off[-1] > max_tokens:
@@ -228,6 +240,9 @@ def compute_metrics(out, all_confs, meta, n_docs):
         for qi, a, b in zip(r["qidx"], r["ids10"], r["ids100"]):
             m = per_query_metrics(a, b, meta["relevant"][qi], n_docs, refmap.get(qi))
             m["kind"] = meta["kinds"][qi]
+            cw = (meta.get("contains_word") or [None] * len(meta["kinds"]))[qi]
+            if cw is not None:   # LLM paraphrase queries: did the model use the word anyway?
+                m["group"] = f"{m['kind']}, word {'used' if cw else 'absent'}"
             rows.append(m)
         r["ref"] = ref_key if ref else None
         r["metrics"] = summarize_metrics(rows)
@@ -298,7 +313,7 @@ def step_quality(cfg, corpus, args):
 
 
 def summarize_metrics(rows):
-    keys = [k for k in rows[0] if k != "kind"]
+    keys = [k for k in rows[0] if k not in ("kind", "group")]
     def mean(rs, key):
         v = [r[key] for r in rs if key in r and not (isinstance(r[key], float) and math.isnan(r[key]))]
         return float(np.mean(v)) if v else None
@@ -307,6 +322,10 @@ def summarize_metrics(rows):
         rs = [r for r in rows if r["kind"] == kind]
         out[kind] = {k: mean(rs, k) for k in keys}
         out[kind]["n"] = len(rs)
+    for g in sorted({r["group"] for r in rows if "group" in r}):
+        rs = [r for r in rows if r.get("group") == g]
+        out[g] = {k: mean(rs, k) for k in keys}
+        out[g]["n"] = len(rs)
     return out
 
 
@@ -542,7 +561,7 @@ def aggregate(cfg, corpus):
                            for k in sorted(set(meta["kinds"]))},
            "encode_ms": {m: {"p50": pct(meta[m]["encode_ms"], 50), "p95": pct(meta[m]["encode_ms"], 95),
                              "threads": meta["threads"]} for m in ("minilm", "lateon")},
-           "profiles": specs, "configs": [], "references": []}
+           "profiles": specs, "configs": [], "references": [], "encoders": meta.get("encoders")}
     by = {}
     for r in simd["records"]:
         by.setdefault((r["config"], r["regime"]), []).append(r)
@@ -640,6 +659,36 @@ def sim_vs_real(cfg, corpus, simd):
     return out
 
 
+def merge_splits(corpus, parts):
+    """One result for a corpus measured as per-index databases (build_db.py --split)."""
+    r = dict(parts[0])
+    r["corpus"] = corpus
+    r["split"] = [p["db_file"] for p in parts]
+    r["db_file"] = ", ".join(p["db_file"] for p in parts)
+    r["db_bytes"] = sum(p["db_bytes"] for p in parts)
+    sizes = {}
+    for p in parts:
+        for k, v in p["sizes"].items():
+            sizes[k] = sizes.get(k, 0) + v
+    r["sizes"] = sizes
+    r["index_params"] = {k: v for p in parts for k, v in p["index_params"].items()}
+    r["tables"] = {k: v for p in parts for k, v in p["tables"].items()}
+    r["build_seconds"] = {p["db_file"]: p["build_seconds"] for p in parts}
+    r["configs"] = [c for p in parts for c in p["configs"]]
+    seen, refs = set(), []
+    for p in parts:
+        for ref in p["references"]:
+            if ref["id"] not in seen:
+                seen.add(ref["id"]); refs.append(ref)
+    r["references"] = refs
+    sv = {}
+    for p in parts:
+        for spec, o in (p.get("sim_vs_real") or {}).items():
+            sv[f"{spec} ({p['db_file'].split('--')[-1].replace('.db', '')})"] = o
+    r["sim_vs_real"] = sv or None
+    return r
+
+
 def fmt(x, d=3):
     if x is None or (isinstance(x, float) and math.isnan(x)):
         return "–"
@@ -668,9 +717,15 @@ def md_corpus(cfg, r):
     L.append(f"## {r['corpus']}\n")
     sub = (f" evaluated, the first of each kind out of {r['n_queries_in_set']:,}"
            if r.get("n_queries_in_set", r["n_queries"]) > r["n_queries"] else "")
+    if r.get("split"):
+        L.append("Measured as separate per-index databases (`build_db.py --split`, to fit the disk; the "
+                 "attribution check in `bench/MATRIX.md` shows this gives the same fetch costs): "
+                 + ", ".join(f"`{x}`" for x in r["split"]) + ". Sizes are summed over the files.\n")
     L.append(f"{r['n_docs']:,} documents; {r['n_queries']:,} queries{sub} ("
              + ", ".join(f"{v:,} {k}" for k, v in r["query_kinds"].items())
              + f"). Database `{r['db_file']}`: {r['db_bytes'] / 1e6:.2f} MB.\n")
+    if r.get("encoders"):
+        L.append("Encoders: " + ", ".join(f"`{v}`" for v in r["encoders"].values()) + ".\n")
     agr = [c.get("wasm_native_agreement") for c in r["configs"] if c.get("wasm_native_agreement") is not None]
     if agr:
         L.append(f"The top-10 lists returned through WASM are identical to the native ones for "
@@ -696,9 +751,15 @@ def md_corpus(cfg, r):
                  f"{fmt(q.get('mrr@10'))} | {fmt(q.get('ndcg@10'))} | {fmt(q.get('auc@100'))} | 1.000 | "
                  f"{ref['quality']['n']} |")
     L.append("")
-    kinds = list(r["query_kinds"])
-    L.append("nDCG@10 by query kind:\n")
-    L.append("| Config | " + " | ".join(kinds) + " |\n|---|" + "---|" * len(kinds))
+    kinds = list(r["query_kinds"]) + [g for g in (r["configs"][0].get("quality") or {})
+                                       if "word " in g and g not in r["query_kinds"]]
+    L.append("nDCG@10 by query kind" + (" (LLM paraphrase queries also split by whether the model "
+                                         "used the target word, `contains_word`)" if len(kinds) > len(r["query_kinds"]) else "")
+             + ":\n")
+    def n_of(k):
+        q = (r["configs"][0].get("quality") or {}).get(k) or {}
+        return f"{k} (n={q['n']})" if "n" in q else k
+    L.append("| Config | " + " | ".join(n_of(k) for k in kinds) + " |\n|---|" + "---|" * len(kinds))
     for c in r["configs"] + r["references"]:
         q = c["quality"] or {}
         L.append(f"| {c['label']} | " + " | ".join(fmt((q.get(k) or {}).get("ndcg@10")) for k in kinds) + " |")
@@ -746,9 +807,14 @@ def step_report(cfg, corpora, args):
     RESULTS.mkdir(parents=True, exist_ok=True)
     allres = []
     for corpus in corpora:
-        if not (BUILD / f"{corpus}.quality.json").exists():
-            continue
-        r = aggregate(cfg, corpus)
+        if (BUILD / f"{corpus}.quality.json").exists():
+            r = aggregate(cfg, corpus)
+        else:
+            splits = [p.name[:-len(".db.json")] for p in sorted(BUILD.glob(f"{corpus}--*.db.json"))
+                      if (BUILD / f"{p.name[:-len('.db.json')]}.quality.json").exists()]
+            if not splits:
+                continue
+            r = merge_splits(corpus, [aggregate(cfg, sp) for sp in splits])
         (RESULTS / f"{corpus}.json").write_text(json.dumps(r, indent=1))
         allres.append(r)
         print(f"[{corpus}] wrote {RESULTS / f'{corpus}.json'}")
@@ -774,7 +840,8 @@ def main():
     import build_db
     build_db.reexec_with_native_sqlite()   # Python's sqlite3 on SQLite 3.53.4 (build/native)
     cfg = load_config()
-    corpora = args.corpora or [c for c in cfg["corpora"] if (BUILD / f"{c}.db.json").exists()]
+    corpora = args.corpora or [c for c in cfg["corpora"] if (BUILD / f"{c}.db.json").exists()
+                                or any(BUILD.glob(f"{c}--*.db.json"))]
     if args.step == "report":
         return step_report(cfg, corpora, args)
     for corpus in corpora:

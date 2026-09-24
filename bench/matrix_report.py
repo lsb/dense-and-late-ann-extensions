@@ -29,8 +29,8 @@ def readme(cfg, results, md_corpus):
              "each index is its pages as counted by `dbstat`. A query touches only its own index's pages plus "
              "page 1 and the schema, so fetch counts are attributable per system without separate databases; "
              "`tools/build_db.py --split` builds per-index databases for checking this.")
-    L.append("- **Queries** are embedded one at a time (`tools/encode_queries.py`; batching changes the outputs of "
-             "the dynamically quantised models). FTS5 queries quote each term; AND is FTS5's implicit conjunction.")
+    L.append("- **Encoders.** Documents and queries are embedded with the weight-only int8 models "
+             "(`models/*/model_w8.onnx`), one text at a time (`tools/encode_queries.py`). FTS5 queries quote each term; AND is FTS5's implicit conjunction.")
     L.append("- **Quality** comes from native SQLite with the same extension code (the WASM results agree; see "
              "the agreement column in the JSON). Recall@10, success@1, MRR@10 and nDCG@10 use k = 10. "
              "**AUC is computed from a separate k = 100 run** (documents not returned count as tied below all "

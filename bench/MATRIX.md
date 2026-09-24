@@ -2,6 +2,8 @@
 
 The benchmark matrix measures every retrieval configuration of the project end to end: the size it adds to the deployed database, its retrieval quality against the relevance labels, and its fetch costs and latency when the WebAssembly SQLite build reads the database over HTTP range requests. Results are in `results/matrix/` (`README.md` with tables, `index.html` with charts, `<corpus>.json` with every number).
 
+**Encoders.** All results in `results/matrix/` use the weight-only int8 encoders (`models/*/model_w8.onnx`, the `enc/` defaults since commit 54a9095) for both the corpus embeddings and the queries. The earlier matrix, made with the dynamically quantised int8 files, was discarded; see RESEARCH_LOG.md, "The int8 encoders are wrong on CPUs without VNNI". `build/queries/<set>.json` records the model files used, and each database manifest records the embedding metadata.
+
 ## Files
 
 | File | Purpose |
@@ -34,33 +36,39 @@ The only difference is that the combined schema occupies a second page, which th
 
 **Warm and cold.** *Warm* is one connection answering the whole query sequence (kinds interleaved) after one warm-up query, with the default 4 MiB block cache: per-connection static data is loaded and pages shared between queries are cache hits. *Cold* opens a new connection per query and includes the open, the schema and the static data. HTTP connection setup (TCP, TLS) is not included; `netsim`'s `cold` modifier could add it.
 
-**Simulated latency for all queries, real latency for a subset.** Every query's request log is recorded against the unshaped server with timestamps, so the CPU time between rounds (WASM, Asyncify) is known; the log is turned into a netsim trace (one round per backend call) and simulated under every profile with `h1` and `h2`. The real-network runs use the same runner against a server shaped with each profile (one server per profile, four profiles at a time) on 50 queries per kind (10 on `slow-4g`, `3g`, `lte-poor`) warm and a fifth of that cold; exhaustive configurations run for real only on `none`, `lan` and `wifi`. The report compares the real wall times with the pipeline estimate for the same queries.
+**Simulated latency for all queries, real latency for a subset.** Every query's request log is recorded against the unshaped server with timestamps, so the CPU time between rounds (WASM, Asyncify) is known; the log is turned into a netsim trace (one round per backend call) and simulated under every profile with `h1` and `h2`. The real-network runs use the same runner against a server shaped with each profile (one server per profile, four at a time) on 50 queries per kind warm and 10 per kind cold. Exhaustive configurations run for real only on `none` and `lan`. The current results have real runs on `4g` and `lte`, each with `h1` and `h2`; the previous (int8) matrix also ran all eight profiles, with the same agreement. The report compares the real wall times with the pipeline estimate for the same queries.
 
 ## Corpora
 
-| Corpus | Status | Notes |
+| Corpus | Database | Measured |
 |---|---|---|
-| words-100, words-10k | complete: quality, traces, simulation, real runs on all 8 profiles × h1/h2 | |
-| llm-100 | complete, as above | 200 queries: 100 `word`, 100 `llmq` |
-| llm-10k | quality, traces and simulation complete; real runs on `4g` and `lte` | 20,000 queries in the set; the first 1,000 of each kind are evaluated (`max_per_kind` in the config) |
-| words-1m | recipe below | embeddings still being encoded |
+| words-100, llm-100, words-10k, llm-10k | one combined database each | quality and traces for every query (up to 1,000 per kind), simulation for all profiles × h1/h2, real runs on `4g` and `lte` × h1/h2 |
+| words-1m | one database per index (`--split`), no VACUUM | as above, on 250 queries per kind; late index warp-only; no exhaustive rows |
 
-The LLM query kinds: `word` is the word the paragraph was written about; `llmq` is the model's own search query for it (the `contains_word` flag records whether the model used the word anyway; the report does not yet break results down by it).
+The LLM query kinds are `word` (the word the paragraph was written about) and `llmq` (the model's own search query for it). `llmq` results are also reported split by `contains_word`, that is, by whether the model used the word despite being asked not to.
 
-## Recipe for words-1m
+## words-1m
 
-Once `data/emb/words-1m.minilm.npy` and `data/emb/words-1m.lateon.*` exist:
+Disk is the constraint: about 20 GB are free and the LateOn input alone is 10.7 GB. A combined 1M database would be about 8 GB, and VACUUM needs a second copy. The run (`build/matrix/words1m.sh`) therefore handles one index at a time:
+
+- It builds `words-1m--<index>.db` with `--split-only --no-vacuum`. Without VACUUM, the float32 build buffer of a dense index (1.5 GB) stays on the free list. It occupies disk but is never fetched, and `dbstat` sizes exclude it.
+- It runs quality, trace, simulation and the real runs, then deletes the dense databases and keeps their manifests and results. The FTS5 and late databases are kept.
+- `bench/matrix.py report words-1m` merges the per-index results into one table (`merge_splits`).
+
+Index parameters at 1M:
+
+- **Late:** `layout=warp nbits=2 centroids=65536 fast_assign=1 sample_tokens=2000000`. The rerank and plaid configurations need the plaid document rows, so they are skipped automatically (`needs_layout`).
+- **Dense:** same parameters as at 10k (nlist = 4√N = 4,000).
+- **Quality:** measured on 250 queries per kind (`max_per_kind`). Exhaustive rows are skipped (`skip_exhaustive`). Float-exact MaxSim is not computed above 60 M token vectors, so late R@10-vs-exact is empty at 1M.
+
+Recipe, by hand:
 
 ```sh
-python3 tools/build_db.py words-1m          # hours: late K = 65,536 with fast_assign, graph build
 python3 tools/encode_queries.py words-1m
-python3 bench/matrix.py quality words-1m    # float-exact MaxSim is skipped above 60 M token vectors
-python3 bench/matrix.py trace words-1m && python3 bench/matrix.py sim words-1m
-python3 bench/matrix.py real words-1m --parallel 4 --profiles 4g,lte
+python3 tools/build_db.py words-1m --split-only --indexes fts            # then late, dense_ivf, dense_graph with --no-vacuum
+python3 bench/matrix.py quality words-1m--fts   # likewise trace, sim, real --profiles 4g,lte
 python3 bench/matrix.py report
 ```
-
-Expected cost at 1M, from the extension notes: roughly 4 GB (graph) + 0.9 GB (IVF with float16 vectors) + 3.9 GB (late, both layouts) + 0.7 GB (docs and FTS5), about 9–10 GB in one file. Disk must therefore be freed first; the words-1m LateOn input alone is 10.7 GB. If that is too large, build the late index with `layout=warp` (per-corpus override in the config) or build per index with `--split`, which the attribution check above shows gives the same costs. The exhaustive configurations should be removed for 1M (`"exhaustive"` rows): their cost runs read the whole index per query, and the dense one does so one page per round (below). With 1,000 queries per kind and cold subsets of 200, the trace step is about 30 minutes at 10k and will be dominated by the graph and late configurations at 1M.
 
 ## Findings worth knowing when reading the tables
 

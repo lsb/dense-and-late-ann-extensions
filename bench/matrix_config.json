@@ -16,7 +16,8 @@
       "text": "data/corpora/words-1m.txt",
       "queries": "data/queries/words-1m.jsonl",
       "emb": "words-1m",
-      "max_per_kind": 1000
+      "max_per_kind": 250,
+      "skip_exhaustive": true
     },
     "llm-100": {
       "text": "data/corpora/llm-100.txt",
@@ -60,7 +61,7 @@
       "embedding": "lateon",
       "params": "dim=48 nbits=2 centroids=0 layout=both order=1 threads=2 input=f16",
       "per_corpus": {
-        "words-1m": "centroids=65536 fast_assign=1 mem_mb=1024"
+        "words-1m": "layout=warp nbits=2 centroids=65536 fast_assign=1 sample_tokens=2000000 mem_mb=1024"
       },
       "desc": "LateOn-Code-edge token vectors, 2-bit residuals, K = fast-plaid formula (65,536 at 1M), warp postings + plaid rows + IVF"
     }
@@ -164,21 +165,24 @@
       "index": "late",
       "input": "lateon",
       "label": "warp nprobe 8 + rerank 64",
-      "sql": "SELECT rowid AS id, stats FROM {table} WHERE {table} MATCH :q AND k = :k AND nprobe = 8 AND opts = 'layout=warp stoplist=0.02 rerank=64'"
+      "sql": "SELECT rowid AS id, stats FROM {table} WHERE {table} MATCH :q AND k = :k AND nprobe = 8 AND opts = 'layout=warp stoplist=0.02 rerank=64'",
+      "needs_layout": "plaid"
     },
     {
       "id": "warp-np16-rr64",
       "index": "late",
       "input": "lateon",
       "label": "warp nprobe 16 + rerank 64",
-      "sql": "SELECT rowid AS id, stats FROM {table} WHERE {table} MATCH :q AND k = :k AND nprobe = 16 AND opts = 'layout=warp stoplist=0.02 rerank=64'"
+      "sql": "SELECT rowid AS id, stats FROM {table} WHERE {table} MATCH :q AND k = :k AND nprobe = 16 AND opts = 'layout=warp stoplist=0.02 rerank=64'",
+      "needs_layout": "plaid"
     },
     {
       "id": "plaid-ivf-np8",
       "index": "late",
       "input": "lateon",
       "label": "plaid approx=ivf nprobe 8, ndocs 64",
-      "sql": "SELECT rowid AS id, stats FROM {table} WHERE {table} MATCH :q AND k = :k AND nprobe = 8 AND opts = 'layout=plaid approx=ivf ndocs=64 stoplist=0.02'"
+      "sql": "SELECT rowid AS id, stats FROM {table} WHERE {table} MATCH :q AND k = :k AND nprobe = 8 AND opts = 'layout=plaid approx=ivf ndocs=64 stoplist=0.02'",
+      "needs_layout": "plaid"
     },
     {
       "id": "late-exact",
@@ -186,7 +190,8 @@
       "input": "lateon",
       "label": "late exhaustive (decompressed)",
       "exhaustive": true,
-      "sql": "SELECT rowid AS id, stats FROM {table} WHERE {table} MATCH :q AND k = :k AND opts = 'layout=plaid exact=1'"
+      "sql": "SELECT rowid AS id, stats FROM {table} WHERE {table} MATCH :q AND k = :k AND opts = 'layout=plaid exact=1'",
+      "needs_layout": "plaid"
     }
   ],
   "profiles": [

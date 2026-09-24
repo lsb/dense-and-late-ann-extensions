@@ -74,6 +74,9 @@ def encode(name, threads, force=False):
         "minilm": {"file": f"{name}.minilm.f32", "dim": 384, "encode_ms": [round(x, 3) for x in t_dense]},
         "lateon": {"file": f"{name}.lateon.f32", "dim": 48, "offsets": offs,
                    "encode_ms": [round(x, 3) for x in t_late]},
+        "contains_word": [r.get("contains_word") for r in rows],
+        "encoders": {"minilm": str(Path(MiniLM.__init__.__defaults__[0]).relative_to(REPO)),
+                     "lateon": str(Path(LateOn.__init__.__defaults__[0]).relative_to(REPO))},
         "threads": threads, "batch_size": 1,
         "encoded_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }

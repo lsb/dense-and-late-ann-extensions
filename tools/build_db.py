@@ -26,7 +26,7 @@ format is the same, and queries use `make native` / `make wasm` builds.
 
   python3 tools/build_db.py words-10k                 # build/matrix/words-10k.db
   python3 tools/build_db.py words-100 --split
-  python3 tools/build_db.py words-1m --indexes fts,dense_graph,dense_ivf,late
+  python3 tools/build_db.py words-1m --split-only --indexes late --no-vacuum
 """
 import argparse
 import hashlib
@@ -119,6 +119,16 @@ def emb_paths(cfg, corpus, model):
     if model == "minilm":
         return {"vectors": Path(f"{base}.minilm.npy")}
     return {"vectors": Path(f"{base}.lateon.vectors.npy"), "offsets": Path(f"{base}.lateon.offsets.npy")}
+
+
+def emb_meta(cfg, corpus):
+    """The encoder metadata files (data/emb/NAME.<model>.json) the indexes were built from."""
+    out = {}
+    for m in ("minilm", "lateon"):
+        p = REPO / "data" / "emb" / f"{cfg['corpora'][corpus]['emb']}.{m}.json"
+        if p.exists():
+            out[m] = json.loads(p.read_text())
+    return out
 
 
 def load_minilm(cfg, corpus, n):
@@ -225,7 +235,7 @@ def table_sizes(db, indexes):
     return tables, per
 
 
-def build(cfg, corpus, keys, path, with_docs=True):
+def build(cfg, corpus, keys, path, with_docs=True, vacuum=True):
     indexes = {k: cfg["indexes"][k] for k in keys}
     docs = corpus_docs(cfg, corpus)
     n = len(docs)
@@ -260,8 +270,9 @@ def build(cfg, corpus, keys, path, with_docs=True):
             times[key] = time.time() - t
             print(f"[{corpus}] {key}: {times[key]:.1f} s", flush=True)
     t = time.time()
-    db.execute("VACUUM")
-    times["vacuum"] = time.time() - t
+    if vacuum:
+        db.execute("VACUUM")
+        times["vacuum"] = time.time() - t
     t = time.time()
     for spec in indexes.values():
         finalize(db, spec)
@@ -290,7 +301,9 @@ def build(cfg, corpus, keys, path, with_docs=True):
         "ext_sources_sha256": {k: ext_digest(k) for k in EXT_SOURCES},
         "git_head": subprocess.run(["git", "-C", str(REPO), "rev-parse", "HEAD"], capture_output=True,
                                    text=True).stdout.strip(),
+        "vacuumed": vacuum,
         "sqlite_version": "3.53.4",
+        "embeddings": emb_meta(cfg, corpus),
         "built_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
     Path(str(path) + ".json").write_text(json.dumps(manifest, indent=1))
@@ -308,6 +321,9 @@ def main():
     ap.add_argument("--split", action="store_true", help="also build one database per index")
     ap.add_argument("--split-only", action="store_true", help="only the per-index databases")
     ap.add_argument("--out-dir", default=str(OUT))
+    ap.add_argument("--no-vacuum", action="store_true",
+                    help="skip VACUUM (saves the temporary copy's disk space at 1M; the pages freed by the "
+                         "dense build buffer stay on the free list: they take disk space but are never fetched)")
     args = ap.parse_args()
     cfg = load_config()
     if args.corpus not in cfg["corpora"]:
@@ -316,10 +332,11 @@ def main():
     out = Path(args.out_dir)
     out.mkdir(parents=True, exist_ok=True)
     if not args.split_only:
-        build(cfg, args.corpus, keys, out / f"{args.corpus}.db")
+        build(cfg, args.corpus, keys, out / f"{args.corpus}.db", vacuum=not args.no_vacuum)
     if args.split or args.split_only:
         for k in keys:
-            build(cfg, args.corpus, [k], out / f"{args.corpus}--{k}.db", with_docs=False)
+            build(cfg, args.corpus, [k], out / f"{args.corpus}--{k}.db", with_docs=False,
+                  vacuum=not args.no_vacuum)
 
 
 if __name__ == "__main__":
