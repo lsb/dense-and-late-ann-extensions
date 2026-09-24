@@ -67,6 +67,7 @@ class LateOn:
             np.int64)
         so = ort.SessionOptions()
         so.intra_op_num_threads = threads or default_threads()
+        so.add_session_config_entry("session.intra_op.allow_spinning", "0")  # do not spin on a shared CPU
         so.inter_op_num_threads = 1
         so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
         self.session = ort.InferenceSession(str(model_path), so, providers=["CPUExecutionProvider"])

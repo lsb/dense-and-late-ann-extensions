@@ -127,3 +127,7 @@ The JS API (`wasm/pkg/index.mjs`) picks JSPI when available and otherwise Asynci
 - The native build has no real HTTP backend; it only simulates a delay per round.
 - Speculative batching is tested only for rowid lookups.
 - Index construction must stay native, because the WASM build is single-threaded.
+
+## 2026-09-24 — CPU contention
+
+With the LLM job, the 1M MiniLM encoding and the agents' builds and benchmarks all running at once (load average 15–18 on 4 cores), LLM generation fell to 46 tokens/s and encoding to 12 documents/s. ONNX Runtime's intra-op threads spin-wait by default, which wastes CPU when cores are oversubscribed. All ONNX sessions now set `session.intra_op.allow_spinning = 0`. The 1M encoding is paused, at a chunk boundary (120,000 documents done), until the LLM corpus is finished. The LLM job restarted at 79 tokens/s. Timings measured during this period are marked as noisy.

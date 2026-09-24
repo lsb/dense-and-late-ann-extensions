@@ -52,6 +52,8 @@ class LFM:
     def __init__(self, threads=4):
         so = ort.SessionOptions()
         so.intra_op_num_threads = threads
+        # Sleep rather than spin between ops: spinning wastes CPU when other jobs share the machine.
+        so.add_session_config_entry("session.intra_op.allow_spinning", "0")
         self.s = ort.InferenceSession(str(MD / "onnx/model_q4f16.onnx"), so, providers=["CPUExecutionProvider"])
         self.inputs = [i.name for i in self.s.get_inputs()]
         self.outputs = [o.name for o in self.s.get_outputs()]

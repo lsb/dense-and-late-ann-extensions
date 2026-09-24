@@ -173,12 +173,6 @@ static const float *cent(const LtIndex *ix, uint32_t c) {
   while (lo + 1 < ix->G && ix->cell_start[lo + 1] <= c) lo++;       /* skip empty cells */
   return ix->cell_cent[lo] ? ix->cell_cent[lo] + (size_t)(c - ix->cell_start[lo]) * ix->dim : NULL;
 }
-static int cell_of(const LtIndex *ix, uint32_t c) {
-  int lo = 0, hi = ix->G - 1;
-  while (lo < hi) { int mid = (lo + hi + 1) / 2; if (ix->cell_start[mid] <= c) lo = mid; else hi = mid - 1; }
-  while (lo + 1 < ix->G && ix->cell_start[lo + 1] <= c) lo++;
-  return lo;
-}
 
 typedef struct LtVtab {
   sqlite3_vtab base;
@@ -412,6 +406,7 @@ static int ix_load(LtVtab *vt) {
   snprintf(tb, sizeof tb, "%s_ivf", vt->zName); ix->root_ivf = lpg_root(vt->db, vt->zDb, tb);
   snprintf(tb, sizeof tb, "%s_post", vt->zName); ix->root_post = lpg_root(vt->db, vt->zDb, tb);
   snprintf(tb, sizeof tb, "%s_rowids", vt->zName); ix->root_rowids = lpg_root(vt->db, vt->zDb, tb);
+  snprintf(tb, sizeof tb, "%s_cells", vt->zName); ix->root_cells = lpg_root(vt->db, vt->zDb, tb);
   MetaCtx mc; memset(&mc, 0, sizeof mc);
   int rc = SQLITE_ERROR, r0 = vt->rd.round;
   if (reader(vt) > 0 && ix->root_meta) rc = lpg_scan(&vt->rd, ix->root_meta, meta_cb, &mc);
@@ -637,8 +632,8 @@ static int do_build(LtVtab *vt, DocSrc *src) {
   if (src->rowids) { ix->rowid_identity = 1; for (int64_t i = 0; i < src->N; i++) if (src->rowids[i] != i) { ix->rowid_identity = 0; break; } }
 
   /* Remove any previous index. */
-  static const char *const sfx[] = { "meta", "docs", "ivf", "post", "rowids" };
-  for (int i = 0; i < 5 && rc == SQLITE_OK; i++) rc = exec_fmt(db, &err, "DELETE FROM \"%w\".\"%w_%s\"", vt->zDb, vt->zName, sfx[i]);
+  static const char *const sfx[] = { "meta", "docs", "ivf", "post", "rowids", "cells" };
+  for (int i = 0; i < 6 && rc == SQLITE_OK; i++) rc = exec_fmt(db, &err, "DELETE FROM \"%w\".\"%w_%s\"", vt->zDb, vt->zName, sfx[i]);
   if (rc) { set_err(vt, "%s", err ? err : "late_plaid: cannot clear index"); sqlite3_free(err); return rc; }
 
   /* Page size decides the stream row size. */
@@ -930,7 +925,7 @@ static int do_finalize(LtVtab *vt) {
 /* ================================================================ QUERY */
 
 typedef struct QOpts {
-  int k, nprobe, layout, approx, ndocs, impute, cross, rerank, exact, trace;
+  int k, nprobe, layout, approx, ndocs, impute, cross, rerank, exact, trace, cprobe;
   float tcs;
 } QOpts;
 enum { APPROX_CODES = 0, APPROX_IVF = 1 };
@@ -959,6 +954,7 @@ static void opts_parse(QOpts *o, const char *s) {
     else if (!strcmp(key, "trace")) o->trace = iv;
     else if (!strcmp(key, "tcs")) o->tcs = (float)atof(val);
     else if (!strcmp(key, "k")) o->k = iv;
+    else if (!strcmp(key, "cprobe")) o->cprobe = iv;
   }
 }
 
@@ -1036,12 +1032,14 @@ typedef struct QStats {
   int nq, probed, lists_bytes_i; int64_t candidates, tokens_decoded, docs_fetched, list_entries, list_bytes, doc_bytes;
   double ms_total, ms_cpu;
   int static_rounds;
+  int cells, cell_rounds; int64_t cell_bytes;
 } QStats;
 
 typedef struct Query {
   LtVtab *vt; LtIndex *ix; QOpts o; QStats st;
   const float *q; int nq;
-  float *S;                    /* K x nq centroid scores */
+  float *S;                    /* nF x nq centroid scores (rows: see srow) */
+  int *Fidx;                   /* two-level: K -> row of S or -1 (NULL: row = centroid id) */
   uint32_t *probe;             /* nq x nprobe probed centroid per token */
   float *impute;               /* nq */
   uint32_t *P; int nP;         /* union of probed centroids, sorted */
@@ -1051,38 +1049,91 @@ typedef struct Query {
 } Query;
 
 static void q_free(Query *q) {
-  free(q->S); free(q->probe); free(q->impute); free(q->P); free(q->Pmask); free(q->res);
+  free(q->S); free(q->Fidx); free(q->probe); free(q->impute); free(q->P); free(q->Pmask); free(q->res);
   acc_free(&q->acc);
+}
+
+static int load_cells(LtVtab *vt, const int *cells, int n);
+
+/* Centroid-score row of fine centroid c, NULL if not scored this query. */
+static inline const float *srow(const Query *q, uint32_t c) {
+  int r = q->Fidx ? q->Fidx[c] : (int)c;
+  return r < 0 ? NULL : q->S + (size_t)r * q->nq;
 }
 
 static int q_probe(Query *q) {
   LtIndex *ix = q->ix;
   int K = ix->K, nq = q->nq, np = q->o.nprobe;
   if (np < 1) np = 1;
-  if (np > K) np = K;
+  /* Candidate centroids F: all of them, or (two-level) the members of the
+  ** cprobe best cells of every query token. */
+  uint32_t *F = NULL; int nF = K;
+  if (ix->G && ix->cells_loaded < ix->G) {
+    int G = ix->G, cp = q->o.cprobe < 1 ? 1 : q->o.cprobe > G ? G : q->o.cprobe;
+    int *cells = (int *)malloc(sizeof(int) * (size_t)nq * cp);
+    float *bs = (float *)malloc(sizeof(float) * cp);
+    if (!cells || !bs) { free(cells); free(bs); return SQLITE_NOMEM; }
+    int nc = 0;
+    for (int i = 0; i < nq; i++) {
+      int n = 0, *bi = cells + nc;
+      for (int g = 0; g < G; g++) {
+        if (ix->cell_start[g + 1] == ix->cell_start[g]) continue;
+        float sc = lt_dot(ix->coarse + (size_t)g * ix->dim, q->q + (size_t)i * ix->dim, ix->dim);
+        if (n == cp && sc <= bs[n - 1]) continue;
+        int j = n < cp ? n++ : cp - 1;
+        while (j > 0 && bs[j - 1] < sc) { bs[j] = bs[j - 1]; bi[j] = bi[j - 1]; j--; }
+        bs[j] = sc; bi[j] = g;
+      }
+      nc += n;
+    }
+    free(bs);
+    /* unique cells, ascending */
+    for (int i = 1; i < nc; i++) { int v = cells[i], j = i - 1; while (j >= 0 && cells[j] > v) { cells[j + 1] = cells[j]; j--; } cells[j + 1] = v; }
+    int u = 0;
+    for (int i = 0; i < nc; i++) if (u == 0 || cells[i] != cells[u - 1]) cells[u++] = cells[i];
+    q->st.cells = u;
+    int r0 = q->vt->rd.round;
+    int64_t b0 = ix->cell_bytes_loaded;
+    int rc = load_cells(q->vt, cells, u);
+    q->st.cell_rounds = q->vt->rd.round - r0;
+    q->st.cell_bytes = ix->cell_bytes_loaded - b0;
+    if (rc) { free(cells); return rc; }
+    nF = 0;
+    for (int k = 0; k < u; k++) nF += (int)(ix->cell_start[cells[k] + 1] - ix->cell_start[cells[k]]);
+    F = (uint32_t *)malloc(sizeof(uint32_t) * (nF ? nF : 1));
+    q->Fidx = (int *)malloc(sizeof(int) * K);
+    if (!F || !q->Fidx) { free(cells); free(F); return SQLITE_NOMEM; }
+    for (int c = 0; c < K; c++) q->Fidx[c] = -1;
+    int m = 0;
+    for (int k = 0; k < u; k++)
+      for (uint32_t c = ix->cell_start[cells[k]]; c < ix->cell_start[cells[k] + 1]; c++) { q->Fidx[c] = m; F[m++] = c; }
+    free(cells);
+  }
+  if (np > nF) np = nF;
+  if (np < 1) return SQLITE_OK;
   q->o.nprobe = np;
-  q->S = (float *)malloc(sizeof(float) * (size_t)K * nq);
+  q->S = (float *)malloc(sizeof(float) * (size_t)(nF ? nF : 1) * nq);
   q->probe = (uint32_t *)malloc(sizeof(uint32_t) * (size_t)nq * np);
   q->impute = (float *)malloc(sizeof(float) * nq);
-  if (!q->S || !q->probe || !q->impute) return SQLITE_NOMEM;
-  const float *C = ix->codec.centroids;
-  for (int c = 0; c < K; c++)
-    for (int i = 0; i < nq; i++) q->S[(size_t)c * nq + i] = lt_dot(C + (size_t)c * ix->dim, q->q + (size_t)i * ix->dim, ix->dim);
   float *bs = (float *)malloc(sizeof(float) * np);
-  if (!bs) return SQLITE_NOMEM;
+  if (!q->S || !q->probe || !q->impute || !bs) { free(F); free(bs); return SQLITE_NOMEM; }
+  for (int r = 0; r < nF; r++) {
+    const float *cv = cent(ix, F ? F[r] : (uint32_t)r);
+    for (int i = 0; i < nq; i++) q->S[(size_t)r * nq + i] = lt_dot(cv, q->q + (size_t)i * ix->dim, ix->dim);
+  }
   for (int i = 0; i < nq; i++) {
     uint32_t *bi = q->probe + (size_t)i * np;
     int n = 0;
-    for (int c = 0; c < K; c++) {
-      float s = q->S[(size_t)c * nq + i];
-      if (n == np && s <= bs[n - 1]) continue;
+    for (int r = 0; r < nF; r++) {
+      float sc = q->S[(size_t)r * nq + i];
+      if (n == np && sc <= bs[n - 1]) continue;
       int j = n < np ? n++ : np - 1;
-      while (j > 0 && bs[j - 1] < s) { bs[j] = bs[j - 1]; bi[j] = bi[j - 1]; j--; }
-      bs[j] = s; bi[j] = (uint32_t)c;
+      while (j > 0 && bs[j - 1] < sc) { bs[j] = bs[j - 1]; bi[j] = bi[j - 1]; j--; }
+      bs[j] = sc; bi[j] = F ? F[r] : (uint32_t)r;
     }
     q->impute[i] = q->o.impute ? bs[n - 1] : 0.0f;
   }
-  free(bs);
+  free(bs); free(F);
   /* union, optional t_cs pruning */
   uint32_t *all = (uint32_t *)malloc(sizeof(uint32_t) * (size_t)nq * np);
   if (!all) return SQLITE_NOMEM;
@@ -1093,8 +1144,9 @@ static int q_probe(Query *q) {
   if (q->o.tcs > 0) {
     int v = 0;
     for (int j = 0; j < u; j++) {
+      const float *sr = srow(q, all[j]);
       float mx = -FLT_MAX;
-      for (int i = 0; i < nq; i++) if (q->S[(size_t)all[j] * nq + i] > mx) mx = q->S[(size_t)all[j] * nq + i];
+      for (int i = 0; i < nq; i++) if (sr[i] > mx) mx = sr[i];
       if (mx >= q->o.tcs) all[v++] = all[j];
     }
     u = v;
@@ -1112,55 +1164,53 @@ static int q_probe(Query *q) {
   return SQLITE_OK;
 }
 
-/* Fetch the byte segments [off[c], off[c+1]) of the probed centroids from a
-** paged stream. On return segs[j] points into *pool (caller frees). */
-static int fetch_segments(Query *q, int warp, uint8_t **pool, uint8_t **segs) {
-  LtIndex *ix = q->ix;
-  const uint64_t *off = warp ? ix->post_off : ix->ivf_off;
-  const uint32_t *runs = warp ? ix->post_runs : ix->ivf_runs;
-  int nruns = warp ? ix->n_post_runs : ix->n_ivf_runs;
-  uint32_t root = warp ? ix->root_post : ix->root_ivf;
+static int cmp_i64q(const void *a, const void *b) {
+  int64_t x = *(const int64_t *)a, y = *(const int64_t *)b;
+  return x < y ? -1 : x > y;
+}
+
+enum { STREAM_IVF = 0, STREAM_POST = 1, STREAM_CELLS = 2 };
+
+/* Fetch byte ranges [start[j], start[j]+len[j]) of a paged stream: all rows
+** they touch are read in one round (hinted) or one round per b-tree level.
+** On return segs[j] points into *pool (malloc'd, caller frees). */
+static int fetch_ranges(LtVtab *vt, int stream, const uint64_t *start, const uint64_t *len, int n,
+                        uint8_t **pool, uint8_t **segs) {
+  LtIndex *ix = &vt->ix;
+  const uint32_t *runs = stream == STREAM_POST ? ix->post_runs : stream == STREAM_IVF ? ix->ivf_runs : ix->cell_runs;
+  int nruns = stream == STREAM_POST ? ix->n_post_runs : stream == STREAM_IVF ? ix->n_ivf_runs : ix->n_cell_runs;
+  uint32_t root = stream == STREAM_POST ? ix->root_post : stream == STREAM_IVF ? ix->root_ivf : ix->root_cells;
+  const char *sfx = stream == STREAM_POST ? "post" : stream == STREAM_IVF ? "ivf" : "cells";
   const int ch = ix->chunk;
   uint64_t total = 0;
   int64_t nrows = 0;
-  for (int j = 0; j < q->nP; j++) {
-    uint64_t a = off[q->P[j]], b = off[q->P[j] + 1];
-    total += b - a;
-    if (b > a) nrows += (int64_t)((b - 1) / ch - a / ch + 1);
+  for (int j = 0; j < n; j++) {
+    total += len[j];
+    if (len[j]) nrows += (int64_t)((start[j] + len[j] - 1) / ch - start[j] / ch + 1);
   }
-  q->st.list_bytes += (int64_t)total;
   *pool = (uint8_t *)malloc(total + LT_BITPAD);
-  LpRow *rows = (LpRow *)malloc(sizeof(LpRow) * (nrows ? nrows : 1));
-  if (!*pool || !rows) { free(rows); return SQLITE_NOMEM; }
+  int64_t *ids = (int64_t *)malloc(sizeof(int64_t) * (nrows ? nrows : 1));
+  LpRow *rows = (LpRow *)calloc(nrows ? nrows : 1, sizeof(LpRow));
+  if (!*pool || !ids || !rows) { free(ids); free(rows); return SQLITE_NOMEM; }
   memset(*pool + total, 0, LT_BITPAD);
   int64_t m = 0;
-  for (int j = 0; j < q->nP; j++) {
-    uint64_t a = off[q->P[j]], b = off[q->P[j] + 1];
-    if (b <= a) continue;
-    for (int64_t r = (int64_t)(a / ch); r <= (int64_t)((b - 1) / ch); r++) { rows[m].rowid = r + 1; m++; }
+  for (int j = 0; j < n; j++) {
+    if (!len[j]) continue;
+    for (int64_t r = (int64_t)(start[j] / ch); r <= (int64_t)((start[j] + len[j] - 1) / ch); r++) ids[m++] = r + 1;
   }
-  /* sort + dedupe row ids */
-  int64_t *ids = (int64_t *)malloc(sizeof(int64_t) * (m ? m : 1));
-  if (!ids) { free(rows); return SQLITE_NOMEM; }
-  for (int64_t i = 0; i < m; i++) ids[i] = rows[i].rowid;
-  for (int64_t i = 1; i < m; i++) {           /* insertion into sorted order (mostly sorted already) */
-    int64_t v = ids[i], k = i - 1;
-    while (k >= 0 && ids[k] > v) { ids[k + 1] = ids[k]; k--; }
-    ids[k + 1] = v;
-  }
+  qsort(ids, (size_t)m, sizeof(int64_t), cmp_i64q);
   int64_t u = 0;
   for (int64_t i = 0; i < m; i++) if (u == 0 || ids[i] != ids[u - 1]) ids[u++] = ids[i];
   for (int64_t i = 0; i < u; i++) { rows[i].rowid = ids[i]; rows[i].hint = nruns ? run_hint(runs, nruns, ids[i] - 1) : 0; }
   free(ids);
-  char tb[300]; snprintf(tb, sizeof tb, "%s_%s", q->vt->zName, warp ? "post" : "ivf");
-  int rc = lpg_multiget(&q->vt->rd, tb, root, rows, (int)u);
+  char tb[300]; snprintf(tb, sizeof tb, "%s_%s", vt->zName, sfx);
+  int rc = lpg_multiget(&vt->rd, tb, root, rows, (int)u);
   uint64_t pos = 0;
-  for (int j = 0; j < q->nP && rc == SQLITE_OK; j++) {
-    uint64_t a = off[q->P[j]], b = off[q->P[j] + 1];
+  for (int j = 0; j < n && rc == SQLITE_OK; j++) {
+    uint64_t a = start[j], b = start[j] + len[j];
     segs[j] = *pool + pos;
     for (uint64_t x = a; x < b;) {
       int64_t r = (int64_t)(x / ch);
-      /* rows[] is sorted: binary search */
       int64_t lo = 0, hi = u - 1, f = -1;
       while (lo <= hi) { int64_t mid = (lo + hi) / 2; if (rows[mid].rowid == r + 1) { f = mid; break; } if (rows[mid].rowid < r + 1) lo = mid + 1; else hi = mid - 1; }
       if (f < 0 || !rows[f].data) { rc = SQLITE_CORRUPT; break; }
@@ -1176,6 +1226,60 @@ static int fetch_segments(Query *q, int warp, uint8_t **pool, uint8_t **segs) {
   return rc;
 }
 
+/* Make sure the given cells (two-level mode) are loaded: one round. */
+static int load_cells(LtVtab *vt, const int *cells, int n) {
+  LtIndex *ix = &vt->ix;
+  if (!ix->G) return SQLITE_OK;
+  uint64_t *st = (uint64_t *)malloc(sizeof(uint64_t) * (n ? n : 1)), *ln = (uint64_t *)malloc(sizeof(uint64_t) * (n ? n : 1));
+  int *which = (int *)malloc(sizeof(int) * (n ? n : 1));
+  uint8_t **segs = (uint8_t **)malloc(sizeof(uint8_t *) * (n ? n : 1));
+  uint8_t *pool = NULL;
+  int m = 0, rc = SQLITE_OK;
+  if (!st || !ln || !which || !segs) rc = SQLITE_NOMEM;
+  for (int i = 0; i < n && rc == SQLITE_OK; i++) {
+    int g = cells[i];
+    if (ix->cell_cent[g] || ix->cell_start[g + 1] == ix->cell_start[g]) continue;
+    int dup = 0;
+    for (int k = 0; k < m; k++) if (which[k] == g) dup = 1;
+    if (dup) continue;
+    which[m] = g; st[m] = ix->cell_off[g]; ln[m] = ix->cell_off[g + 1] - ix->cell_off[g]; m++;
+  }
+  if (rc == SQLITE_OK && m) rc = fetch_ranges(vt, STREAM_CELLS, st, ln, m, &pool, segs);
+  for (int k = 0; k < m && rc == SQLITE_OK; k++) rc = cell_install(ix, which[k], segs[k]);
+  free(pool); free(st); free(ln); free(which); free(segs);
+  return rc;
+}
+
+static int load_all_cells(LtVtab *vt) {
+  LtIndex *ix = &vt->ix;
+  if (!ix->G || ix->cells_loaded == ix->G) return SQLITE_OK;
+  int *all = (int *)malloc(sizeof(int) * ix->G);
+  if (!all) return SQLITE_NOMEM;
+  int n = 0;
+  for (int g = 0; g < ix->G; g++) if (!ix->cell_cent[g]) all[n++] = g;
+  /* one call per 4096 cells keeps the duplicate check cheap */
+  int rc = SQLITE_OK;
+  for (int i = 0; i < n && rc == SQLITE_OK; i += 4096) rc = load_cells(vt, all + i, n - i < 4096 ? n - i : 4096);
+  free(all);
+  return rc;
+}
+
+/* Fetch the list segments of the probed centroids (IVF or postings). */
+static int fetch_segments(Query *q, int warp, uint8_t **pool, uint8_t **segs) {
+  LtIndex *ix = q->ix;
+  uint64_t *st = (uint64_t *)malloc(sizeof(uint64_t) * (q->nP ? q->nP : 1)), *ln = (uint64_t *)malloc(sizeof(uint64_t) * (q->nP ? q->nP : 1));
+  if (!st || !ln) { free(st); free(ln); return SQLITE_NOMEM; }
+  for (int j = 0; j < q->nP; j++) {
+    uint32_t c = q->P[j];
+    st[j] = warp ? ix->post_off[c] : ix->ivf_off[c];
+    ln[j] = seg_bytes(ix, warp, warp ? ix->post_cnt[c] : ix->ivf_cnt[c]);
+    q->st.list_bytes += (int64_t)ln[j];
+  }
+  int rc = fetch_ranges(q->vt, warp ? STREAM_POST : STREAM_IVF, st, ln, q->nP, pool, segs);
+  free(st); free(ln);
+  return rc;
+}
+
 /* Exact decompressed MaxSim of one doc row. */
 static float doc_maxsim(Query *q, const uint8_t *row, int len, float *tmp, float *best) {
   LtIndex *ix = q->ix;
@@ -1187,8 +1291,9 @@ static float doc_maxsim(Query *q, const uint8_t *row, int len, float *tmp, float
   for (int i = 0; i < q->nq; i++) best[i] = -FLT_MAX;
   for (int j = 0; j < n; j++) {
     uint32_t c = lt_get_bits(row + 2, (uint64_t)j * ix->kbits, ix->kbits);
-    if ((int)c >= ix->K) continue;
-    lc_decode(&ix->codec, c, res + (size_t)j * ix->codec.rbytes, tmp);
+    const float *cv = (int)c < ix->K ? cent(ix, c) : NULL;
+    if (!cv) continue;
+    lc_decode_with(&ix->codec, cv, res + (size_t)j * ix->codec.rbytes, tmp);
     for (int i = 0; i < q->nq; i++) {
       float s = lt_dot(tmp, q->q + (size_t)i * ix->dim, ix->dim);
       if (s > best[i]) best[i] = s;
@@ -1208,8 +1313,8 @@ static float doc_approx(Query *q, const uint8_t *row, int len, float *best) {
   for (int i = 0; i < q->nq; i++) best[i] = -FLT_MAX;
   for (int j = 0; j < n; j++) {
     uint32_t c = lt_get_bits(row + 2, (uint64_t)j * ix->kbits, ix->kbits);
-    if ((int)c >= ix->K) continue;
-    const float *s = q->S + (size_t)c * q->nq;
+    const float *s = (int)c < ix->K ? srow(q, c) : NULL;
+    if (!s) continue;
     for (int i = 0; i < q->nq; i++) if (s[i] > best[i]) best[i] = s[i];
   }
   float sum = 0;
@@ -1283,12 +1388,13 @@ static int q_warp(Query *q) {
     for (int i = 0; i < nq; i++) if (q->o.cross || q->Pmask[(size_t)j * nq + i]) toks[nt++] = i;
     const uint8_t *ids = segs[j], *res = segs[j] + lt_bits_bytes(cnt, ix->idbits);
     const uint8_t *mask = q->Pmask + (size_t)j * nq;
+    const float *cv = cent(ix, c);
     q->st.list_entries += cnt;
     for (uint32_t e = 0; e < cnt; e++) {
       uint32_t d = lt_get_bits(ids, (uint64_t)e * ix->idbits, ix->idbits);
       int s = acc_get(&q->acc, d);
       if (s < 0) { rc = SQLITE_NOMEM; break; }
-      lc_decode(&ix->codec, c, res + (size_t)e * rb, v);
+      lc_decode_with(&ix->codec, cv, res + (size_t)e * rb, v);
       float *best = q->acc.best + (size_t)s * nq;
       uint8_t *own = q->acc.own + (size_t)s * nq;
       for (int k = 0; k < nt; k++) {
@@ -1327,7 +1433,7 @@ static int q_plaid(Query *q) {
   const int nq = q->nq;
   for (int j = 0; j < q->nP && rc == SQLITE_OK; j++) {
     uint32_t c = q->P[j], cnt = ix->ivf_cnt[c];
-    const float *sc = q->S + (size_t)c * nq;
+    const float *sc = srow(q, c);
     const uint8_t *mask = q->Pmask + (size_t)j * nq;
     q->st.list_entries += cnt;
     for (uint32_t e = 0; e < cnt; e++) {
@@ -1457,7 +1563,7 @@ static int q_exact(Query *q) {
     for (uint32_t e = 0; e < cnt; e++) {
       int s = acc_get(&q->acc, lt_get_bits(ids, (uint64_t)e * ix->idbits, ix->idbits));
       if (s < 0) { rc = SQLITE_NOMEM; break; }
-      lc_decode(&ix->codec, (uint32_t)c, res + (size_t)e * ix->codec.rbytes, v);
+      lc_decode_with(&ix->codec, cent(ix, (uint32_t)c), res + (size_t)e * ix->codec.rbytes, v);
       float *best = q->acc.best + (size_t)s * q->nq;
       memset(q->acc.own + (size_t)s * q->nq, 1, q->nq);
       for (int i = 0; i < q->nq; i++) { float x = lt_dot(v, q->q + (size_t)i * ix->dim, ix->dim); if (x > best[i]) best[i] = x; }
@@ -1501,8 +1607,8 @@ static int vt_init(sqlite3 *db, void *pAux, int argc, const char *const *argv,
     sqlite3_free(schema);
   }
   if (rc == SQLITE_OK && create) {
-    static const char *const sfx[] = { "meta", "docs", "ivf", "post", "rowids", "buffer" };
-    for (int i = 0; i < 6 && rc == SQLITE_OK; i++)
+    static const char *const sfx[] = { "meta", "docs", "ivf", "post", "rowids", "buffer", "cells" };
+    for (int i = 0; i < 7 && rc == SQLITE_OK; i++)
       rc = exec_fmt(db, pzErr, "CREATE TABLE IF NOT EXISTS \"%w\".\"%w_%s\"(id INTEGER PRIMARY KEY, data BLOB)", argv[1], argv[2], sfx[i]);
   }
   if (rc != SQLITE_OK) {
@@ -1532,8 +1638,8 @@ static int xDisconnect(sqlite3_vtab *p) {
 
 static int xDestroy(sqlite3_vtab *p) {
   LtVtab *vt = (LtVtab *)p;
-  static const char *const sfx[] = { "meta", "docs", "ivf", "post", "rowids", "buffer" };
-  for (int i = 0; i < 6; i++) exec_fmt(vt->db, NULL, "DROP TABLE IF EXISTS \"%w\".\"%w_%s\"", vt->zDb, vt->zName, sfx[i]);
+  static const char *const sfx[] = { "meta", "docs", "ivf", "post", "rowids", "buffer", "cells" };
+  for (int i = 0; i < 7; i++) exec_fmt(vt->db, NULL, "DROP TABLE IF EXISTS \"%w\".\"%w_%s\"", vt->zDb, vt->zName, sfx[i]);
   return xDisconnect(p);
 }
 
@@ -1589,12 +1695,13 @@ static char *stats_json(Query *q, int total_rounds) {
   sqlite3_str_appendf(s, "{\"layout\":\"%s\",\"nq\":%d,\"nprobe\":%d,\"probed\":%d,\"candidates\":%lld,"
       "\"list_entries\":%lld,\"list_bytes\":%lld,\"docs_fetched\":%lld,\"doc_bytes\":%lld,\"tokens_decoded\":%lld,"
       "\"rounds\":%d,\"static_rounds\":%d,\"pages\":%d,\"page_size\":%d,\"bytes\":%lld,\"payload_bytes\":%lld,"
-      "\"cache_hits\":%lld,\"hint_miss\":%lld,\"fallbacks\":%lld,\"static_bytes\":%lld,\"ms\":%.3f,\"cpu_ms\":%.3f",
+      "\"cache_hits\":%lld,\"hint_miss\":%lld,\"fallbacks\":%lld,\"static_bytes\":%lld,\"ms\":%.3f,\"cpu_ms\":%.3f,"
+      "\"cells\":%d,\"cell_rounds\":%d,\"cell_bytes\":%lld,\"cells_loaded\":%d",
       lay, q->nq, q->o.nprobe, q->st.probed, (long long)q->st.candidates, (long long)q->st.list_entries,
       (long long)q->st.list_bytes, (long long)q->st.docs_fetched, (long long)q->st.doc_bytes, (long long)q->st.tokens_decoded,
       total_rounds, q->st.static_rounds, rd->tn, rd->pgsz, (long long)rd->tn * rd->pgsz, (long long)rd->payload_bytes,
       (long long)rd->cache_hits, (long long)rd->hint_miss, (long long)rd->fallbacks, (long long)q->ix->static_bytes,
-      q->st.ms_total, q->st.ms_cpu);
+      q->st.ms_total, q->st.ms_cpu, q->st.cells, q->st.cell_rounds, (long long)q->st.cell_bytes, q->ix->cells_loaded);
   if (q->o.trace) {
     sqlite3_str_appendall(s, ",\"trace\":[");
     for (int r = 1; r <= rd->round; r++) {
@@ -1618,7 +1725,7 @@ static int xFilter(sqlite3_vtab_cursor *pc, int idxNum, const char *idxStr, int 
   double t0 = now_ms();
   Query q; memset(&q, 0, sizeof q);
   q.vt = vt; q.ix = &vt->ix;
-  q.o.k = 10; q.o.nprobe = 4; q.o.approx = APPROX_CODES; q.o.ndocs = 256; q.o.impute = 1; q.o.cross = 1;
+  q.o.k = 10; q.o.nprobe = 4; q.o.approx = APPROX_CODES; q.o.ndocs = 256; q.o.impute = 1; q.o.cross = 1; q.o.cprobe = 4;
   int ai = 0;
   sqlite3_value *qv = argv[ai++];
   if (idxNum & F_K) q.o.k = sqlite3_value_int(argv[ai++]);
@@ -1642,6 +1749,14 @@ static int xFilter(sqlite3_vtab_cursor *pc, int idxNum, const char *idxStr, int 
     return SQLITE_ERROR;
   }
   q.nq = nbytes / (4 * ix->dim);
+  if (ix->G && (q.o.exact || q.o.layout == LAY_PLAID || q.o.rerank > 0)) {
+    /* decompressing whole documents (or scoring their codes) needs every
+    ** centroid: two-level mode then degenerates to the flat table */
+    int r0 = vt->rd.round;
+    rc = load_all_cells(vt);
+    q.st.cell_rounds = vt->rd.round - r0;
+    if (rc) return rc;
+  }
   float *qcopy = (float *)malloc(nbytes);          /* aligned copy */
   if (!qcopy) return SQLITE_NOMEM;
   memcpy(qcopy, qf, nbytes);
@@ -1763,8 +1878,8 @@ static int xUpdate(sqlite3_vtab *p, int argc, sqlite3_value **argv, sqlite3_int6
 }
 
 static int xShadowName(const char *z) {
-  static const char *const sfx[] = { "meta", "docs", "ivf", "post", "rowids", "buffer" };
-  for (int i = 0; i < 6; i++) if (!sqlite3_stricmp(z, sfx[i])) return 1;
+  static const char *const sfx[] = { "meta", "docs", "ivf", "post", "rowids", "buffer", "cells" };
+  for (int i = 0; i < 7; i++) if (!sqlite3_stricmp(z, sfx[i])) return 1;
   return 0;
 }
 
