@@ -433,3 +433,38 @@ After this fix, a cold FTS5 query still costs 6–17 rounds. Those come from FTS
 - In Chromium on `4g,h1` the demo's later queries go from 3.5 / 3.4 s (graph / late) to 3.3 / 3.0 s with coalescing and to 1.8 / 1.0 s with multi-range requests.
 
 **Recommendation.** Host on HTTP/2, or enable multi-range requests on HTTP/1.1 servers that support them (nginx, Apache and Caddy do; S3 and R2 do not). One caveat: a cross-origin page sends one CORS preflight per URL for multi-range requests.
+
+## 2026-09-24 — Cold start: warming and shrinking per-connection static data
+
+**Warming.** Both extensions accept `SELECT … WHERE t MATCH 'warm'`, which loads their per-connection static data without running a query:
+- dense: the codebook and entry set, or the IVF centroids;
+- late: the centroids, the list lengths and the document table's interior pages.
+
+The browser client (`openIndex({warm: 'auto'})`) runs it in the SQLite worker at low priority as soon as an encoder starts loading, so the fetch overlaps with model loading. A search that arrives meanwhile goes first.
+
+**Shrinking.** The following changes cost nothing measurable on llm-10k and words-10k (within ±0.002 of float16 in nDCG and recall against exact search):
+- int8 late centroids (late format 3, which also stores list lengths as varints);
+- int8 PQ codebooks (dense format 2);
+- int8 or PQ IVF centroids (`ivf_centroids=auto`).
+
+They halve the static data and are now the defaults:
+
+| Index | Before | After |
+|---|---|---|
+| late, llm-10k | 832 KB | 418 KB |
+| late, words-10k | 1,664 KB | 836 KB |
+| dense graph head | 264 KB | 168 KB |
+| dense IVF head | 497 KB | 252 KB |
+
+A cold query becomes 0.1–0.9 s faster on `4g`. Two further reductions were rejected because they lose quality:
+- int4 centroids: +0.015 nDCG on llm-10k but −0.007 to −0.014 on words-10k;
+- halving K: −0.008 to −0.015 nDCG.
+
+A *lazy cells* mode stores the flat centroids in cells fetched on demand, and it matches flat quality at cprobe 16. That makes it better than the trained two-level mode (−0.05 to −0.09 nDCG, a loss that came from per-cell k-means, not from routing), but it saves little at 10k and is kept for 1M-scale use.
+
+**Time to first result in Chromium** (llm-10k; a real HTTP/2 proxy, `web/test/h2proxy.mjs`, allows true h2 measurements):
+- *Repeat visit, query typed 3 s after the page opens.* The first query is 30–55 % faster, for example 2.9 s → 1.4 s for late on `4g`/h2 and 3.1 s → 2.1 s for IVF on `4g`/h1. It now costs what a query within a session costs.
+- *Repeat visit, query issued the moment the index opens.* The gain is 0.1–1.4 s. Opening the page, the SQLite build and the database (1.9–3.4 s) is then the long pole, not the cached encoder (1.1–1.7 s).
+- *First visit.* The roughly 37 MB download of ONNX Runtime and the models dominates (28–44 s), and the gain is 0.5–1.2 s.
+
+**Parser bug.** `late_plaid` ignored every option after the first when options were space-separated, which is how `tools/build_db.py` writes them. Earlier matrix late indexes were therefore built with default parameters. At 10k these equal the intended ones; at 1M they would have meant 131,072 centroids. The bug is fixed (with a test), and all matrix databases are being rebuilt.

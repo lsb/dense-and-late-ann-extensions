@@ -209,6 +209,42 @@ def finalize(db, spec):
         db.execute(f"INSERT INTO {t}({t}) VALUES ('finalize')")
 
 
+def late_header(db, table):
+    """Parameters actually stored in a late_plaid index (header of <table>_meta;
+    layout of ext/late/pyref.py)."""
+    import struct
+    blob = db.execute(f"SELECT data FROM {table}_meta ORDER BY id LIMIT 1").fetchone()[0]
+    magic, ver = struct.unpack_from("<II", blob, 0)
+    dim, nbits, K, layout, kbits, idbits, chunk, rid = struct.unpack_from("<8I", blob, 8)
+    N, T, ivf = struct.unpack_from("<3Q", blob, 40)
+    p = 64 + 132 + 8
+    G = cq = 0
+    if ver >= 2:
+        G, _ = struct.unpack_from("<II", blob, p)
+        p += 8
+    if ver >= 3:
+        (cq,) = struct.unpack_from("<I", blob, p)
+    return {"format": ver, "dim": dim, "nbits": nbits, "centroids": K, "coarse": G,
+            "layout": {1: "plaid", 2: "warp", 3: "both"}.get(layout, layout),
+            "centroid_type": {0: "f16", 1: "int8", 2: "int4"}.get(cq, cq), "n_docs": N, "n_tokens": T}
+
+
+def check_late(db, table, params):
+    """Fail if the stored index does not have the requested parameters (a parser
+    bug once silently ignored all but the first space-separated option)."""
+    h = late_header(db, table)
+    want = dict(kv.split("=", 1) for kv in params.replace(",", " ").split() if "=" in kv)
+    bad = []
+    for k in ("dim", "nbits", "layout", "centroid_type"):
+        if k in want and str(h[k]) != want[k]:
+            bad.append(f"{k}: asked {want[k]}, got {h[k]}")
+    if want.get("centroids", "0") != "0" and str(h["centroids"]) != want["centroids"]:
+        bad.append(f"centroids: asked {want['centroids']}, got {h['centroids']}")
+    if bad:
+        raise SystemExit(f"late index {table} was not built as requested: " + "; ".join(bad))
+    return h
+
+
 def owner(name, indexes):
     """Which index (or 'docs' / 'schema') a b-tree belongs to."""
     base = name
@@ -280,6 +316,9 @@ def build(cfg, corpus, keys, path, with_docs=True, vacuum=True):
     free = db.execute("PRAGMA freelist_count").fetchone()[0]
     tables, per = table_sizes(db, indexes)
     ext_cfg = {}
+    for key, spec in indexes.items():
+        if spec["kind"] == "late_plaid":
+            ext_cfg[key] = check_late(db, spec["table"], params_used[key])
     for key, spec in indexes.items():
         if spec["kind"] in ("dense_ann", "late_plaid"):
             try:
