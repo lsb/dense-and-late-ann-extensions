@@ -1,0 +1,56 @@
+{
+ "corpus": "llm-10k",
+ "name": "g-f16",
+ "index": "dense_graph",
+ "params": "dim=384, layout=colocated, vectors=inline, store_vectors=f16, M=16, ef_construction=200, threads=2, codebook=f16",
+ "index_bytes": 41484288,
+ "n_queries": 2000,
+ "static": {
+  "static_payload": 270336,
+  "static_pages": 72
+ },
+ "configs": {
+  "graph-ef64": {
+   "label": "graph ef 64, W 16",
+   "ndcg10": 0.58665437448631,
+   "r10_exact": 0.984,
+   "by_kind": {
+    "llmq": 0.3051170555827272,
+    "word": 0.8681916933898927
+   },
+   "cold": {
+    "n": 40,
+    "rounds": 9.0,
+    "kb": 596.0,
+    "requests": 77.0,
+    "ms": {
+     "4g,h1": 3574.9823202160496,
+     "4g,h2": 2086.4770776172836,
+     "lte,h1": 1669.0822708333337,
+     "lte,h2": 1036.8917936666667
+    }
+   }
+  },
+  "graph-ef128": {
+   "label": "graph ef 128, W 16",
+   "ndcg10": 0.5876165838195884,
+   "r10_exact": 0.9946499999999999,
+   "by_kind": {
+    "llmq": 0.30604147424928413,
+    "word": 0.8691916933898927
+   },
+   "cold": {
+    "n": 40,
+    "rounds": 12.0,
+    "kb": 824.0,
+    "requests": 134.0,
+    "ms": {
+     "4g,h1": 5455.792932345681,
+     "4g,h2": 2817.8096768950613,
+     "lte,h1": 2524.9512533333327,
+     "lte,h2": 1406.3106151666673
+    }
+   }
+  }
+ }
+}

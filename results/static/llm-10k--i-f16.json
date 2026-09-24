@@ -1,0 +1,56 @@
+{
+ "corpus": "llm-10k",
+ "name": "i-f16",
+ "index": "dense_ivf",
+ "params": "dim=384, layout=ivf, store_vectors=f16, threads=2, ivf_centroids=f16, codebook=f16",
+ "index_bytes": 9871360,
+ "n_queries": 2000,
+ "static": {
+  "static_payload": 508608,
+  "static_pages": 135
+ },
+ "configs": {
+  "ivf-np16": {
+   "label": "IVF nprobe 16, rerank 64",
+   "ndcg10": 0.4879383179433552,
+   "r10_exact": 0.7387,
+   "by_kind": {
+    "llmq": 0.261905701027869,
+    "word": 0.7139709348588413
+   },
+   "cold": {
+    "n": 40,
+    "rounds": 5.0,
+    "kb": 774.0,
+    "requests": 38.5,
+    "ms": {
+     "4g,h1": 2351.9854775185186,
+     "4g,h2": 1611.6336766604938,
+     "lte,h1": 1175.4349590000002,
+     "lte,h2": 881.5691828333333
+    }
+   }
+  },
+  "ivf-np64": {
+   "label": "IVF nprobe 64, rerank 64",
+   "ndcg10": 0.5448807776413453,
+   "r10_exact": 0.9092,
+   "by_kind": {
+    "llmq": 0.28458441802123796,
+    "word": 0.8051771372614529
+   },
+   "cold": {
+    "n": 40,
+    "rounds": 5.0,
+    "kb": 976.0,
+    "requests": 76.5,
+    "ms": {
+     "4g,h1": 3432.2462364807952,
+     "4g,h2": 1814.1178755987657,
+     "lte,h1": 1655.3968755370374,
+     "lte,h2": 1018.3151101666667
+    }
+   }
+  }
+ }
+}

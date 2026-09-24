@@ -1,0 +1,56 @@
+{
+ "corpus": "words-10k",
+ "name": "g-int8",
+ "index": "dense_graph",
+ "params": "dim=384, layout=colocated, vectors=inline, store_vectors=f16, M=16, ef_construction=200, threads=2, codebook=int8",
+ "index_bytes": 41377792,
+ "n_queries": 2000,
+ "static": {
+  "static_payload": 172288,
+  "static_pages": 46
+ },
+ "configs": {
+  "graph-ef64": {
+   "label": "graph ef 64, W 16",
+   "ndcg10": 0.07156362211578064,
+   "r10_exact": 0.72975,
+   "by_kind": {
+    "known": 0.08897542334399375,
+    "word": 0.05415182088756756
+   },
+   "cold": {
+    "n": 40,
+    "rounds": 10.0,
+    "kb": 508.0,
+    "requests": 81.0,
+    "ms": {
+     "4g,h1": 3650.9021489938277,
+     "4g,h2": 2165.9021489938273,
+     "lte,h1": 1679.5843218333337,
+     "lte,h2": 1049.584321833333
+    }
+   }
+  },
+  "graph-ef128": {
+   "label": "graph ef 128, W 16",
+   "ndcg10": 0.07558667148952987,
+   "r10_exact": 0.8272,
+   "by_kind": {
+    "known": 0.09419044538802185,
+    "word": 0.05698289759103789
+   },
+   "cold": {
+    "n": 40,
+    "rounds": 13.0,
+    "kb": 736.0,
+    "requests": 138.0,
+    "ms": {
+     "4g,h1": 5531.619817172841,
+     "4g,h2": 2891.900694623457,
+     "lte,h1": 2534.826476666666,
+     "lte,h2": 1415.321121333334
+    }
+   }
+  }
+ }
+}
