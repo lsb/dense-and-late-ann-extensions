@@ -564,10 +564,15 @@ def step_real(cfg, corpus, args):
 
 
 def load_real(corpus):
-    recs = []
-    for p in sorted(BUILD.glob(f"{corpus}.real.*.jsonl")):
-        recs.extend(json.loads(line) for line in open(p))
-    return recs
+    """Real-run records; when a (config, profile) appears in several files (a later
+    partial rerun with --configs), only the most recently written file's records count."""
+    files = sorted(BUILD.glob(f"{corpus}.real.*.jsonl"), key=lambda p: p.stat().st_mtime)
+    per_file = [[json.loads(line) for line in open(p)] for p in files]
+    newest = {}
+    for i, rs in enumerate(per_file):
+        for r in rs:
+            newest[(r["config"], r.get("profile"))] = i
+    return [r for i, rs in enumerate(per_file) for r in rs if newest[(r["config"], r.get("profile"))] == i]
 
 
 # ================================================================ report
