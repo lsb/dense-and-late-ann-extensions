@@ -507,3 +507,25 @@ The w8 1M encodings are complete: LateOn in 3.0 h, MiniLM in 3.0 h, one document
 - **Ranking at 1M.** A cold `bm25()` query at 1M takes 354–883 rounds (59–127 s on `4g`); `bm25c` takes 14.5 rounds and 2.2 s with the same quality.
 - **Client cache at 1M.** One IVF query at nprobe 128 prefetches about 870 pages (3.5 MB). With the client's default 4 MiB block cache, the VFS evicted part of each batch before use and refetched it page by page: 110 rounds against the 2 the extension issued. A 64 MiB cache brings it to 1.9 rounds and 2.0 MB. IVF nprobe 512 (13 MB per query) still evicts its own batch once a 64 MiB cache is full. The VFS should therefore pin the blocks of the batch in flight and size its default cache from the database size (open item).
 - **Build footprint at 1M.** Space was short, so words-1m is built as one database per index and without VACUUM: graph 4.1 GB, IVF 3.0 GB (of which 2 GB are free pages left by the build buffer), late 1.6 GB and FTS5 0.7 GB. A deployment would VACUUM and then finalize.
+
+## 2026-09-24 — Pinned prefetch batches and an automatic cache size (`wasm/src/httpvfs.c`)
+
+**Pinning.** The VFS now pins every block an extension prefetches: through the prefetch calls, through speculation passes, and including blocks of the batch that were already cached. A pinned block is released when it is first read, when the next batch starts, or when the statement ends. An immutable database gives the VFS no transaction boundaries, so the JS API signals the end of each statement with `httpvfs_release()`.
+
+While blocks are pinned, the cache may grow past its budget up to 4× the budget, keeping a quarter of the budget for unpinned pages. It trims back as the batch is read and frees the extra memory on release. The earlier cap of half the cache per batch is gone.
+
+**Default size.** The default budget is now clamp(file size / 64, 4 MiB, 64 MiB): 4 MiB at 10k, and 11–61 MiB for the 1M indexes.
+
+**Results on words-1m** (WASM, warm session of 40 queries). Every configuration now takes exactly the rounds its extension issues, whatever the budget. Rounds per query:
+
+| Configuration | Before (4 MiB default) | After (automatic default) |
+|---|---|---|
+| IVF, nprobe 128 | 104 | 2 |
+| IVF, nprobe 512 | 1,148 | 2 |
+| Late warp, nprobe 32 | 174 | 1 |
+
+- *Larger fixed cache.* At 64 MiB, IVF nprobe 512 goes from a median of 11 rounds (over 200 queries) to 2.
+- *Cold queries at 1M.* They drop from 14–1,152 rounds to 5; the graph stays at 13.
+- *Regressions.* None. Results are identical, and the 10k corpora are unchanged or slightly better (IVF on words-10k: 2.15 → 1.70 rounds).
+
+The words-1m matrix was measured with a fixed 64 MiB cache before this change, so its IVF nprobe 512 and warp nprobe 32 rows slightly overstate rounds.
