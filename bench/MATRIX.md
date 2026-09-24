@@ -55,10 +55,10 @@ The LLM query kinds are `word` (the word the paragraph was written about) and `l
 
 ## words-1m
 
-Disk is the constraint: about 20 GB are free and the LateOn input alone is 10.7 GB. A combined 1M database would be about 8 GB, and VACUUM needs a second copy. The run (`build/matrix/words1m.sh`) therefore handles one index at a time:
+Disk is the constraint: about 20 GB are free and the LateOn input alone is 10.7 GB. A combined 1M database would be about 8 GB, and VACUUM needs a second copy. The run (`build/matrix/chain1m.sh`) therefore handles one index at a time:
 
 - It builds `words-1m--<index>.db` with `--split-only --no-vacuum`. Without VACUUM, the float32 build buffer of a dense index (1.5 GB) stays on the free list. It occupies disk but is never fetched, and `dbstat` sizes exclude it.
-- It runs quality, trace, simulation and the real runs, then deletes the dense databases and keeps their manifests and results. The FTS5 and late databases are kept.
+- It runs quality, trace, simulation and the real runs, then deletes the database, keeping its manifest (`.db.json`, sizes and parameters), traces and results. Only about 9 GB of disk were free, so no words-1m database is kept. Rebuild one with the recipe below to query it.
 - `bench/matrix.py report words-1m` merges the per-index results into one table (`merge_splits`).
 
 Index parameters at 1M:
