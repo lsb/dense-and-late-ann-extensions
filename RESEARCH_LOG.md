@@ -479,3 +479,31 @@ CI on GitHub had been red since the FTS5 merge, for two reasons.
 ## 2026-09-24 — Disk housekeeping
 
 The w8 1M encodings are complete: LateOn in 3.0 h, MiniLM in 3.0 h, one document at a time on 2 threads with a shared CPU. The words-1m late index (warp layout, K = 65,536, int8 centroids, nbits = 2) was built from the LateOn vectors into `build/matrix/words-1m--late.db` (1.6 GB). The 10.7 GB file `data/emb/words-1m.lateon.vectors.npy` was then deleted to make room for the 1M dense indexes, because the 30 GB disk allowance is nearly full. The offsets and document lengths are kept. Exact MaxSim ground truth is skipped at this scale anyway (111M token vectors), and the vectors can be regenerated with `enc/encode_corpus.py --model late data/corpora/words-1m.txt` in about 3 hours.
+
+## 2026-09-24 — Final benchmark matrix (`results/matrix/`)
+
+**Inputs.** The matrix was rebuilt for all five corpora (words-100, words-10k, llm-100, llm-10k, words-1m) with:
+- the w8 encoders;
+- late format 3 and dense format 2 (int8 static data);
+- the late option-parser fix and the stoplist floor;
+- `bm25c` alongside `bm25`.
+
+`tools/build_db.py` now reads each index's stored parameters back out of the database and stops if they differ from those requested. Queries in capped query kinds are a seeded random sample, not the first N, which removes the tie-breaking bias noted earlier.
+
+**Agreement.** For every query, corpus and configuration, WASM returned exactly the native top 10. Real shaped-server runs on `4g` and `lte`, with both h1 and h2, agree with the simulated times within 1.1–3.0 % (median ratio 0.99–1.03). One methodological point was needed for that: in warm sessions the real-run subset must replay the trace session's own query order. Otherwise the cache history differs and per-query times diverge by 15–20 %.
+
+**Headline** (p50 on `4g`, HTTP/2-like; within a session / first query of a session):
+
+| Corpus | FTS5 `bm25c` | Dense graph, ef 64 | Dense IVF-PQ | Late warp, nprobe 8 |
+|---|---|---|---|---|
+| llm-10k | nDCG 0.438 · ≈0 / 1.5 s | 0.583 · 1.2 / 2.2 s | np 64: 0.552 · 0.43 / 1.7 s | 0.430 · ≈0 / 1.2 s |
+| words-10k | 0.994 · ≈0 / 1.6 s | 0.072 · 1.4 / 2.3 s | np 64: 0.071 · 0.48 / 1.8 s | 0.313 · 0.20 / 1.7 s |
+| words-1m | 0.992 · 0.68 / 2.2 s | 0.080 · 2.1 / 2.9 s | np 128: 0.120 · 1.5 / 4.9 s | 0.328 · 0.61 / 5.2 s |
+
+- **Paraphrase queries on llm-10k.** Split by whether the model's query contains the target word:
+  - without the word (78.9 % of queries): dense 0.16, late 0.06, FTS5 0.05;
+  - with the word: dense 0.86, late 0.57, FTS5 0.55.
+- **HTTP/1.1.** With multi-range requests, h1 comes within 1 % of h2 on every corpus. Plain h1 is 1.5–3.5 times slower for the multi-request systems; for example, the words-1m graph takes 3,890 ms against 2,057 ms.
+- **Ranking at 1M.** A cold `bm25()` query at 1M takes 354–883 rounds (59–127 s on `4g`); `bm25c` takes 14.5 rounds and 2.2 s with the same quality.
+- **Client cache at 1M.** One IVF query at nprobe 128 prefetches about 870 pages (3.5 MB). With the client's default 4 MiB block cache, the VFS evicted part of each batch before use and refetched it page by page: 110 rounds against the 2 the extension issued. A 64 MiB cache brings it to 1.9 rounds and 2.0 MB. IVF nprobe 512 (13 MB per query) still evicts its own batch once a 64 MiB cache is full. The VFS should therefore pin the blocks of the batch in flight and size its default cache from the database size (open item).
+- **Build footprint at 1M.** Space was short, so words-1m is built as one database per index and without VACUUM: graph 4.1 GB, IVF 3.0 GB (of which 2 GB are free pages left by the build buffer), late 1.6 GB and FTS5 0.7 GB. A deployment would VACUUM and then finalize.

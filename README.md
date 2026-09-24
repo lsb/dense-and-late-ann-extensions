@@ -13,18 +13,38 @@ A dated record of every decision and measurement is in [RESEARCH_LOG.md](RESEARC
 
 ## Results in brief
 
-Full tables and charts: [results/matrix/README.md](results/matrix/README.md) and `results/matrix/index.html`. The table below uses the LLM-generated corpus of 10,000 paragraphs, with latencies simulated for Chrome's "Fast 4G" profile (165 ms, 8.1 Mbit/s) and HTTP/2-like concurrency.
+Full tables and charts: [results/matrix/README.md](results/matrix/README.md) and `results/matrix/index.html`. Latencies are simulated p50 on Chrome's "Fast 4G" profile (165 ms, 8.1 Mbit/s) with HTTP/2-like concurrency, from request traces recorded through the WebAssembly build. They agree with runs against the shaped server within 1–3 %. *Within a session* means the index's static data is already loaded; *first query* includes loading it. Quality is nDCG@10 against the relevance labels.
+
+**LLM corpus, 10,000 paragraphs** (known-item queries: the word itself, or the model's own search query)
 
 | Method | Index size | nDCG@10 | Query within a session | First query of a session |
 |---|---|---|---|---|
-| FTS5 bm25 (OR) | 1.8 MB | 0.456 | ≈0 s (cached) | 2.7 s |
-| Dense graph (ef 64) | 41.5 MB | 0.585 | 1.2 s | 2.3 s |
-| Dense IVF-PQ (nprobe 128) | 9.9 MB | 0.567 | 0.4 s | 2.0 s |
-| Late interaction, warp (nprobe 8) | 19.5 MB | 0.431 | ≈0 s (cached) | 1.6 s |
+| FTS5, `bm25c` ranking | 1.8 MB | 0.438 | ≈0 s (cached) | 1.5 s |
+| Dense graph, ef 64 | 41.4 MB | 0.583 | 1.2 s | 2.2 s |
+| Dense IVF-PQ, nprobe 64 | 9.6 MB | 0.552 | 0.43 s | 1.7 s |
+| Dense IVF-PQ, nprobe 128 | 9.6 MB | 0.573 | 0.74 s | 2.1 s |
+| Late interaction, warp, nprobe 8 | 19.1 MB | 0.430 | ≈0 s (cached) | 1.2 s |
+| *Exhaustive MiniLM / LateOn (reference)* | | *0.587 / 0.431* | | |
 
-- **Model quality.** On this corpus MiniLM is the strongest model: exhaustive MiniLM search reaches nDCG@10 0.586, against 0.519 for exhaustive LateOn-Code-edge, a code-retrieval model. The ANN indexes lose little against exhaustive search.
-- **Random-word corpora.** On documents made of random dictionary words, FTS5 is essentially perfect and the neural models are much weaker, as expected.
-- **Where the time goes.** The first query of a session is dominated by per-connection static data such as centroids and codebooks. Within a session, the number of dependent round trips and the browser's limit of six connections per host under HTTP/1.1 dominate.
+**Random-word corpus, 1,000,000 documents**
+
+| Method | Index size | nDCG@10 | Query within a session | First query of a session |
+|---|---|---|---|---|
+| FTS5, `bm25c` ranking | 215 MB | 0.992 | 0.68 s | 2.2 s |
+| FTS5, built-in `bm25` | 215 MB | 0.992 | 0.68 s | 127 s |
+| Dense graph, ef 64 | 4.1 GB | 0.080 | 2.1 s | 2.9 s |
+| Dense IVF-PQ, nprobe 128 | 0.9 GB | 0.120 | 1.5 s | 4.9 s |
+| Late interaction, warp, nprobe 8 | 1.6 GB | 0.328 | 0.61 s | 5.2 s |
+
+- **Which model to use.** On natural text MiniLM is the strongest model here, and the dense ANN indexes lose almost nothing against exhaustive search: 0.583 for the graph against 0.587 exhaustive. LateOn-Code-edge is a code-retrieval model and trails on English prose. On the model's vague paraphrase queries dense retrieval is the only method that works (nDCG 0.16 against 0.05–0.06 when the query avoids the target word).
+- **Random words are a lexical task.** FTS5 is essentially perfect on them. The neural models are weak, and dense ANN recall against exhaustive search is low at 1M, because the embeddings of random word lists are near-ties.
+- **Where the time goes.** A query's cost is dominated by dependent round trips and by the per-connection static data (centroids, codebooks), not by computation. The project's main levers are:
+  - co-located neighbour codes in the graph;
+  - two-round IVF and one-round warp layouts;
+  - `bm25c` ranking, which turns FTS5's 685 rounds into 10;
+  - int8 static data, fetched while the query encoder loads;
+  - multi-range requests, which make HTTP/1.1 as fast as HTTP/2.
+- **Client cache at 1M.** One IVF query at 1M prefetches about 3.5 MB, so the WASM client needs a larger block cache (64 MiB) than the 4 MiB default.
 
 ## Components
 
