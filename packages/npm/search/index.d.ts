@@ -21,6 +21,19 @@ export interface OpenIndexOptions extends Pick<OpenOptions, 'pageCacheBytes' | '
   modelCache?: boolean;
   /** ONNX Runtime threads (needs cross-origin isolation; default 1). */
   encoderThreads?: number;
+  /**
+   * Load indexes' per-connection static data in the background: 'auto' (default:
+   * the indexes of each encoder as soon as it starts loading), true (every index),
+   * false, or a list of systems / tables.
+   */
+  warm?: 'auto' | boolean | string[];
+}
+
+export interface WarmStats {
+  table: string; kind?: IndexInfo['kind']; ms?: number; rounds?: number; requests?: number; bytes?: number;
+  /** Set when the extension build has no 'warm' command. */
+  skipped?: string;
+  error?: string;
 }
 
 export interface SystemInfo {
@@ -53,6 +66,8 @@ export declare class SearchIndex {
   loadEncoder(which: EncoderName, onProgress?: (p: { url: string; loaded: number; total: number }) => void): Promise<Record<string, unknown>>;
   encode(text: string, which: EncoderName): Promise<EncodeResult>;
   resolve(system: string): IndexInfo;
+  /** Load the static data of indexes now (default: all); each index once per connection. */
+  warm(systems?: string[]): Promise<WarmStats[]>;
   search(text: string, opts?: { system?: string; k?: number; cold?: boolean; fetchDocs?: boolean } & SearchParams): Promise<IndexSearchResult>;
   vfsStats(): Promise<VfsStats>;
   vfsLog(): Promise<LogEntry[]>;

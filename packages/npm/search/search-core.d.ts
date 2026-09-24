@@ -55,6 +55,8 @@ export interface SearchRequest {
 export declare const DEFAULT_PARAMS: Record<string, SearchParams>;
 export declare function ftsQuery(text: string, mode?: 'or' | 'and'): string;
 export declare function discover(db: Database): Promise<{ indexes: IndexInfo[]; docs: DocsInfo | null }>;
+/** The statement that makes an index load its static data (returns no rows). */
+export declare function warmSql(ix: IndexInfo): string;
 export declare function buildSql(ix: IndexInfo, k: number, params: SearchParams): { sql: string; extra?: unknown[] };
 
 export declare class SearchDb {
@@ -65,5 +67,6 @@ export declare class SearchDb {
   resolve(system: string): IndexInfo;
   fetchDocs(ids: number[]): Promise<Map<number, string>>;
   search(req: SearchRequest): Promise<SearchResult>;
+  warm(table: string): Promise<{ table: string; kind: IndexInfo['kind']; ms: number; rounds: number; requests: number; bytes: number; skipped?: string }>;
   close(): Promise<void>;
 }
