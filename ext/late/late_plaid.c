@@ -104,12 +104,20 @@ static void cfg_default(LtCfg *c) {
 
 static int cfg_parse(LtCfg *c, int argc, const char *const *argv, char **pzErr) {
   cfg_default(c);
+  /* Arguments are separated by commas (SQLite) and, within one argument,
+  ** by white space: "dim=48 nbits=2" is two options. */
   for (int i = 3; i < argc; i++) {
+   char tok[512];
+   for (const char *p = argv[i]; *p;) {
+    while (*p == ' ' || *p == '\t' || *p == '\n') p++;
+    if (!*p) break;
+    int tl = 0;
+    while (*p && *p != ' ' && *p != '\t' && *p != '\n') { if (tl < (int)sizeof tok - 1) tok[tl++] = *p; p++; }
+    tok[tl] = 0;
     char key[64], val[256];
-    const char *a = argv[i];
-    while (*a == ' ') a++;
+    const char *a = tok;
     const char *eq = strchr(a, '=');
-    if (!eq) { *pzErr = sqlite3_mprintf("late_plaid: expected key=value, got '%s'", argv[i]); return SQLITE_ERROR; }
+    if (!eq) { *pzErr = sqlite3_mprintf("late_plaid: expected key=value, got '%s'", tok); return SQLITE_ERROR; }
     int kl = (int)(eq - a); while (kl > 0 && a[kl - 1] == ' ') kl--;
     if (kl >= (int)sizeof key) kl = sizeof key - 1;
     memcpy(key, a, kl); key[kl] = 0;
@@ -151,6 +159,7 @@ static int cfg_parse(LtCfg *c, int argc, const char *const *argv, char **pzErr) 
       else { *pzErr = sqlite3_mprintf("late_plaid: centroid_type must be f16, int8 or int4"); return SQLITE_ERROR; }
     }
     else { *pzErr = sqlite3_mprintf("late_plaid: unknown option '%s'", key); return SQLITE_ERROR; }
+   }
   }
   if (c->nbits != 1 && c->nbits != 2 && c->nbits != 4) { *pzErr = sqlite3_mprintf("late_plaid: nbits must be 1, 2 or 4"); return SQLITE_ERROR; }
   if (c->dim < 8 || c->dim % 8) { *pzErr = sqlite3_mprintf("late_plaid: dim must be a multiple of 8"); return SQLITE_ERROR; }

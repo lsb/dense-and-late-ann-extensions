@@ -43,6 +43,8 @@ CREATE VIRTUAL TABLE t USING late_plaid(
     layout=both,              -- plaid | warp | both
     kmeans_iters=4, kmeans_ppc=256, sample_docs=0, sample_tokens=4000000,
     assign_probe=8, refine=2, order=1, fast_assign=0,
+    centroid_type=f16,        -- f16 | int8 | int4: storage of the centroids (format 3)
+    lazy_cells=0,             -- G > 0: flat centroids stored in G cells fetched on demand
     threads=4, mem_mb=1024, seed=42, input=f32);
 
 -- documents: one blob of n_tokens x dim float32 (or float16 with input=f16)
@@ -50,6 +52,8 @@ INSERT INTO t(rowid, vectors) VALUES (?1, ?2);
 INSERT INTO t(t) VALUES ('build');                         -- from the inserted rows
 INSERT INTO t(t) VALUES ('build_npy VECTORS.npy OFFSETS.npy'); -- or stream from files
 INSERT INTO t(t) VALUES ('finalize');                      -- store page hints; rerun after VACUUM
+SELECT rowid FROM t WHERE t MATCH 'warm';                  -- load the static data (and the document
+                                                           -- table's interior pages) now; no rows
 
 SELECT rowid, score, stats FROM t
  WHERE t MATCH ?1                 -- query: float32 blob [n_query_tokens x dim]

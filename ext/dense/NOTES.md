@@ -33,7 +33,9 @@ CREATE VIRTUAL TABLE v USING dense_ann(
     vectors=inline,       -- inline (inside the node row) | table (separate shadow table)
     layout=colocated,     -- colocated (neighbour PQ codes in the node row) | separate | ivf
     nlist=0,              -- ivf: number of lists (0 = 4 sqrt(n))
-    ivf_centroids=f16,    -- ivf: f16 | int8 | pq storage of the cached centroids
+    ivf_centroids=auto,   -- ivf: auto | f16 | int8 | pq storage of the cached centroids
+                          --   (auto: int8 below 1,024 lists, pq from 1,024)
+    codebook=int8,        -- f16 | int8: storage of the cached PQ codebook(s) (format 2)
     ivf_residual=1,       -- ivf: PQ on residuals x - centroid (IVFADC); 0 = on raw vectors
     nprobe=32, rerank_k=64,  -- ivf: query defaults
     metric=cosine,        -- cosine (normalises on insert/query) | ip | l2
@@ -59,6 +61,8 @@ SELECT rowid, distance FROM v
    [AND rerank_k = 64]; -- ivf: candidates reranked with stored vectors (R)
 -- the hidden column `stats` returns per-query JSON:
 --   rounds, pages, bytes, expanded, dist, entry_dist, rerank, fallback, setup_rounds, setup_pages, ms, ...
+
+SELECT rowid FROM v WHERE embedding MATCH 'warm'; -- load the cached head now; returns no rows
 
 SELECT embedding FROM v WHERE rowid = ?;        -- stored vector as float32 (NULL with store_vectors=none)
 DELETE FROM v WHERE rowid = ?;  UPDATE ...;     -- supported (see "Updates")

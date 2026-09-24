@@ -169,6 +169,38 @@ test('one query per system through the page', async () => {
   nat.forEach((q, i) => assert.deepEqual(q.ids, got[i], `${q.sys}: browser and native results differ`));
 });
 
+test('warm-up loads every index\'s static data before the first search', async () => {
+  const res = await page.evaluate(async (db) => {
+    const { openIndex } = await import('/web/lib/index.mjs');
+    const out = {};
+    for (const warm of [false, true]) {
+      const ix = await openIndex(db, { warm });
+      const w = await ix.warm(warm ? undefined : []);      // resolves when the warm-ups are done
+      const first = {};
+      for (const i of ix.indexes) {
+        if (i.kind === 'fts') continue;
+        const dim = i.kind === 'dense' ? 384 : 48;
+        const v = new Float32Array(dim); v[0] = 1;
+        const col = i.kind === 'dense' ? 'embedding' : `"${i.table}"`;
+        const r = await ix.query(`SELECT stats FROM "${i.table}" WHERE ${col} MATCH ? AND k = 1`, [new Uint8Array(v.buffer)]);
+        const st = JSON.parse(r.rows[0][0]);
+        first[i.table] = st.static_rounds ?? st.setup_rounds;
+      }
+      out[warm ? 'warm' : 'cold'] = { warmups: w, staticRounds: first };
+      await ix.close();
+    }
+    return out;
+  }, `/${DB}`);
+  report.warm = res;
+  for (const w of res.warm.warmups) {
+    assert.ok(!w.error && !w.skipped, `${w.table}: ${w.error || w.skipped}`);
+    if (w.kind !== 'fts') assert.ok(w.bytes > 0, `${w.table}: warm-up fetched nothing`);
+  }
+  for (const [t, n] of Object.entries(res.cold.staticRounds)) assert.ok(n > 0, `${t}: a cold first query loads static data`);
+  for (const [t, n] of Object.entries(res.warm.staticRounds)) assert.equal(n, 0, `${t}: static data already loaded`);
+  console.log(`# warm-up: ${res.warm.warmups.map((w) => `${w.table} ${w.rounds} rounds ${(w.bytes / 1024).toFixed(0)} KB`).join(', ')}`);
+});
+
 test('encode latency, warm (20 queries per model)', async () => {
   const texts = JSON.parse(fs.readFileSync(path.join(REF_DIR, 'reference-embeddings.json'))).queries.map((q) => q.text).slice(12, 32);
   // A long query too: a 50-word document (about 110 word pieces).

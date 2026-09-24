@@ -18,7 +18,7 @@ measures
     rounds and KB each cold query transferred.
 
   python3 bench/static_eval.py build llm-10k late int8 "dim=48 nbits=2 centroids=0 layout=both order=1 threads=2 input=f16 centroid_type=int8"
-  python3 bench/static_eval.py eval llm-10k int8 --cold 40
+  python3 bench/static_eval.py measure llm-10k int8 --cold 40
   python3 bench/static_eval.py table llm-10k words-10k        # markdown summary of results/static/*.json
 
 A version-2 (pre-format-3) copy of a late index can be made with
@@ -164,6 +164,9 @@ def cmd_eval(a):
     confs = [c for c in matrix.configs_for(cfg, man) if not c.get("exhaustive")]
     if a.configs:
         confs = [c for c in confs if c["id"] in a.configs.split(",")]
+    if a.opts:   # extra late_plaid query options, e.g. cprobe=16
+        confs = [{**c, "id": f"{c['id']}+{a.opts.replace(' ', '+')}",
+                  "sql_resolved": c["sql_resolved"].replace("opts = '", f"opts = '{a.opts} ")} for c in confs]
     qs = matrix.all_queries(cfg, meta)
     inputs = matrix.QueryInputs(meta)
     db = matrix.native_db(path)
@@ -190,7 +193,8 @@ def cmd_eval(a):
         for cid, v in cold.items():
             out["configs"][cid]["cold"] = v
     RES.mkdir(parents=True, exist_ok=True)
-    (RES / f"{a.corpus}--{a.name}.json").write_text(json.dumps(out, indent=1))
+    tag = f"--{a.opts.replace(' ', '_').replace('=', '')}" if a.opts else ""
+    (RES / f"{a.corpus}--{a.name}{tag}.json").write_text(json.dumps(out, indent=1))
 
 
 def cold_costs(cfg, man, meta, confs, qidx, path):
@@ -254,14 +258,15 @@ def main():
     b.add_argument("corpus"); b.add_argument("index"); b.add_argument("name"); b.add_argument("params")
     d = sub.add_parser("downgrade")
     d.add_argument("corpus"); d.add_argument("name"); d.add_argument("newname")
-    e = sub.add_parser("eval")
+    e = sub.add_parser("measure")
     e.add_argument("corpus"); e.add_argument("name")
     e.add_argument("--configs", default="")
+    e.add_argument("--opts", default="", help="extra late_plaid query options appended to each config's opts")
     e.add_argument("--cold", type=int, default=0, help="cold queries through WASM (0 = skip)")
     t = sub.add_parser("table")
     t.add_argument("corpora", nargs="+")
     a = ap.parse_args()
-    {"build": cmd_build, "downgrade": cmd_downgrade, "eval": cmd_eval, "table": cmd_table}[a.cmd](a)
+    {"build": cmd_build, "downgrade": cmd_downgrade, "measure": cmd_eval, "table": cmd_table}[a.cmd](a)
 
 
 if __name__ == "__main__":

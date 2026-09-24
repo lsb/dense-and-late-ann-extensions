@@ -258,6 +258,22 @@ class LatePlaidTest(unittest.TestCase):
         self.assertLess(st["cells_loaded"], 16)
         self.assertEqual(st["cell_rounds"], 1)
 
+    def test_space_separated_options(self):
+        """'dim=48 nbits=4 ...' in one argument (as tools/build_db.py writes
+        them) are separate options, not one 'dim' with a long value."""
+        import sqlite3
+        path = os.path.join(self.tmp.name, "spaces.db")
+        con = connect(path)
+        con.execute("CREATE VIRTUAL TABLE t USING late_plaid(dim=48 nbits=4 centroids=128 layout=warp centroid_type=int8)")
+        vec, off = os.path.join(self.tmp.name, "v.npy"), os.path.join(self.tmp.name, "o.npy")
+        np.save(vec, self.V.astype(np.float16))
+        np.save(off, self.O.astype(np.int64))
+        con.execute("INSERT INTO t(t) VALUES (?)", (f"build_npy {vec} {off}",))
+        ref = pyref.Index(sqlite3.connect(path))
+        self.assertEqual((ref.nbits, ref.K, ref.layout, ref.cq), (4, 128, 2, 1))
+        with self.assertRaises(apsw.Error):
+            con.execute("CREATE VIRTUAL TABLE u USING late_plaid(dim=48 bogus=1)")
+
     def test_unknown_version_is_a_clear_error(self):
         import sqlite3
         import struct
