@@ -14,7 +14,9 @@ self.onmessage = async (e) => {
   const { variant, dbUrl, isolated } = e.data;
   const report = { variant, isolated, userAgent: navigator.userAgent };
   try {
-    const db = await open(dbUrl, { variant });
+    // maxRequests: 0: this test checks that one round's 16 requests run in
+    // parallel, so no request budget (coalesce.test.mjs tests the budget).
+    const db = await open(dbUrl, { variant, maxRequests: 0 });
     report.resolvedVariant = db.variant;
     report.fts = [];
     for (const q of FTS_QUERIES) report.fts.push({ q, rows: (await db.queryRaw(q)).rows });
