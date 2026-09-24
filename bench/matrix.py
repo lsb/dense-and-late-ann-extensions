@@ -96,12 +96,20 @@ def configs_for(cfg, man):
 
 
 def interleave_kinds(meta, per_kind=None):
-    """Query indices, first `per_kind` of each kind, kinds interleaved round-robin
-    (a session mixes query kinds)."""
+    """Query indices of every kind, kinds interleaved round-robin (a session mixes
+    query kinds). With `per_kind`, a kind with more queries than that is sampled
+    at random (seeded, so every step and run sees the same queries, and a smaller
+    cap gives a prefix of a larger one): in the LLM query sets query i is about
+    document i, and ties broken by rowid would favour a first-N subset."""
     by = {}
     for i, k in enumerate(meta["kinds"]):
         by.setdefault(k, []).append(i)
-    lists = [v[:per_kind] if per_kind else v for v in by.values()]
+    lists = []
+    for kind, v in by.items():
+        if per_kind and len(v) > per_kind:
+            rng = np.random.default_rng([12345, len(v), sum(map(ord, kind))])
+            v = [v[j] for j in rng.permutation(len(v))[:per_kind]]
+        lists.append(v)
     out = []
     for j in range(max(len(v) for v in lists)):
         out.extend(v[j] for v in lists if j < len(v))
@@ -406,11 +414,16 @@ def step_trace(cfg, corpus, args):
         parts = [BUILD / f"{corpus}.trace.part{i}.jsonl" for i in range(len(halves))]
         t = time.time()
         with ThreadPoolExecutor(len(halves)) as ex:
-            futs = [ex.submit(run_node, {"url": f"{srv.base}/{man['file']}", "queries": str(QDIR / f"{corpus}.json"),
+            futs = [ex.submit(run_node, {"url": f"{srv.base}/{man['file']}", "queries": str(QDIR / f"{base(corpus)}.json"),
                                          "phases": [{"runs": h}]}, p) for h, p in zip(halves, parts)]
             for f in futs:
                 f.result()
+        keep = []
+        if args.configs and out.exists():   # partial rerun: keep the other configs' records
+            ids = {c["id"] for c in confs}
+            keep = [line for line in open(out) if json.loads(line)["config"] not in ids]
         with open(out, "w") as fo:
+            fo.writelines(keep)
             for p in parts:
                 fo.write(p.read_text())
                 p.unlink()
@@ -466,18 +479,26 @@ def profile_specs(cfg):
 def step_sim(cfg, corpus, args):
     specs = profile_specs(cfg)
     recs = [json.loads(line) for line in open(BUILD / f"{corpus}.trace.jsonl")]
+    sim_path = BUILD / f"{corpus}.sim.json"
+    old_recs = []
+    if args.configs and sim_path.exists():   # partial rerun: simulate only these configs
+        ids = set(args.configs.split(","))
+        recs = [r for r in recs if r["config"] in ids]
+        old = json.loads(sim_path.read_text())
+        if old["specs"] == specs:
+            old_recs = [r for r in old["records"] if r["config"] not in ids]
     t = time.time()
     jobs = [(r, specs, r["qi"]) for r in recs]
     with ProcessPoolExecutor(args.workers) as ex:
         res = list(ex.map(sim_record, jobs, chunksize=64))
-    out = {"specs": specs, "records": []}
+    out = {"specs": specs, "records": old_recs}
     for r, ms in zip(recs, res):
         out["records"].append({"config": r["config"], "regime": r["regime"], "qi": r["qi"], "ms": [round(x, 2) for x in ms],
                                "rounds": r["stats"]["rounds"], "requests": r["stats"]["requests"],
                                "bytes": r["stats"]["bytes"], "cacheHits": r["stats"]["cacheHits"],
                                "wall_ms": r["wall_ms"], "query_ms": r["query_ms"], "ids": r["ids"],
                                "error": r.get("error"), "ext": r.get("ext")})
-    (BUILD / f"{corpus}.sim.json").write_text(json.dumps(out))
+    sim_path.write_text(json.dumps(out))
     print(f"[{corpus}] simulated {len(recs)} traces x {len(specs)} profiles in {time.time() - t:.0f} s")
 
 
@@ -511,10 +532,11 @@ def step_real(cfg, corpus, args):
     def one(job):
         spec, runs = job
         srv = Server(spec, seed=1)
-        out = BUILD / f"{corpus}.real.{spec.replace(',', '_')}.jsonl"
+        tag = ("." + args.configs.replace(",", "+")) if args.configs else ""
+        out = BUILD / f"{corpus}.real.{spec.replace(',', '_')}{tag}.jsonl"
         t = time.time()
         try:
-            run_node({"url": f"{srv.base}/{man['file']}", "queries": str(QDIR / f"{corpus}.json"),
+            run_node({"url": f"{srv.base}/{man['file']}", "queries": str(QDIR / f"{base(corpus)}.json"),
                       "phases": [{"profile": None, "runs": runs}]}, out)
         finally:
             srv.close()

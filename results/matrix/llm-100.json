@@ -746,6 +746,18 @@
    }
   },
   {
+   "id": "fts-bm25c-or",
+   "label": "FTS5 bm25c (OR)",
+   "system": "FTS5",
+   "index": "fts",
+   "index_bytes": 49152,
+   "exhaustive": false,
+   "sql": "SELECT rowid AS id FROM {table} WHERE {table} MATCH :q AND rank MATCH 'bm25c()' ORDER BY rank LIMIT :k",
+   "quality": null,
+   "quality_ref": null,
+   "native_ms_p50": null
+  },
+  {
    "id": "fts-unranked",
    "label": "FTS5 unranked (AND)",
    "system": "FTS5",

@@ -45,6 +45,10 @@ The only difference is that the combined schema occupies a second page, which th
 | words-100, llm-100, words-10k, llm-10k | one combined database each | quality and traces for every query (up to 1,000 per kind), simulation for all profiles × h1/h2, real runs on `4g` and `lte` × h1/h2 |
 | words-1m | one database per index (`--split`), no VACUUM | as above, on 250 queries per kind; late index warp-only; no exhaustive rows |
 
+**Query subsets.** Where a kind has more queries than the cap (llm-10k: 10,000 per kind, cap 1,000; words-1m: 1,000 per kind, cap 250), the evaluated queries are a seeded random sample of that kind (`interleave_kinds`), not the first N. In the LLM query sets query *i* is about document *i*, and FTS5 breaks ties by rowid, so a first-N subset favours methods that produce many ties: on the first 1,000 per kind bm25c scores 0.787 against 0.757 for bm25, a gap that disappears over all 10,000. A random sample was chosen over evaluating all queries so that quality, traces and real runs use the same queries; the real-run subset (50 per kind) is a prefix of the same sample. Sets within the cap (words-100, words-10k, llm-100) are evaluated completely.
+
+**FTS5 ranking.** `fts-bm25c-or` ranks with `bm25c()` from `ext/fts5rank` (bm25 with every document at the average length, docs/fts5-httpvfs.md), which needs no per-document `fts_docsize` reads; it is the FTS5 row of the headline table. `fts-bm25-or` (standard bm25) is kept next to it. Its R@10-vs-exact is measured against standard bm25.
+
 The LLM query kinds are `word` (the word the paragraph was written about) and `llmq` (the model's own search query for it). `llmq` results are also reported split by `contains_word`, that is, by whether the model used the word despite being asked not to.
 
 ## words-1m

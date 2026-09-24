@@ -3,7 +3,7 @@ import html as H
 import math
 import time
 
-HEADLINE = ("fts-bm25-or", "graph-ef64", "ivf-np64", "warp-np8", "warp-np8-rr64", "late-exact")
+HEADLINE = ("fts-bm25c-or", "graph-ef64", "ivf-np64", "warp-np8", "warp-np8-rr64", "late-exact")
 FAMILY = {"FTS5": 0, "dense graph": 1, "dense IVF": 1, "late": 2}
 SHAPE = {"FTS5": "circle", "dense graph": "circle", "dense IVF": "square", "late": "circle"}
 
