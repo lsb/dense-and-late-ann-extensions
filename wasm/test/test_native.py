@@ -92,6 +92,95 @@ class NativeTest(unittest.TestCase):
               f"{t_seq*1e3:.0f} ms; batched ({passes} passes) {r_bat} rounds {t_bat*1e3:.0f} ms",
               file=sys.stderr)
 
+    def test_pinned_batch_larger_than_cache(self):
+        """A prefetch batch 30x the cache budget arrives in one round and
+        stays cached (pinned) until it is read, so a full scan costs no
+        further round; PRAGMA httpvfs_release shrinks the cache back to its
+        budget. The batch is cut at the hard limit (cache_max_kb)."""
+        npages = os.path.getsize(DB) // 4096
+        want = sqlite3.connect(f"file:{DB}?mode=ro", uri=True).execute(
+            "SELECT count(*), sum(length(body)) FROM docs").fetchone()
+        conn = self.open(cache_kb=64, readahead_kb=0, cache_max_kb=1 << 20)   # budget 16 blocks
+        conn.execute("SELECT id FROM docs LIMIT 1").fetchall()                # schema
+        conn.execute("PRAGMA httpvfs_reset=cache")
+        conn.execute("PRAGMA cache_size=0")
+        conn.execute("SELECT httpvfs_prefetch_pages(1, 1)").fetchone()        # header block
+        conn.execute("PRAGMA httpvfs_reset")
+        self.assertEqual(conn.execute("SELECT httpvfs_prefetch_pages(2, ?)", (npages - 1,)).fetchone()[0], 0)
+        s = self.stats(conn)
+        self.assertGreater(npages, 30 * s["cache_blocks"])
+        self.assertEqual(s["rounds"], 1)
+        self.assertEqual(s["prefetch_blocks"], npages - 1)
+        self.assertEqual(s["pinned_blocks"], npages - 1)
+        self.assertEqual(s["pin_evictions"], 0)
+        self.assertEqual(conn.execute("SELECT count(*), sum(length(body)) FROM docs").fetchone(), want)
+        s = self.stats(conn)
+        self.assertEqual(s["rounds"], 1)                 # every page read came from the batch
+        self.assertEqual(s["cache_misses"], 0)
+        self.assertLess(s["pinned_blocks"], npages - 1)  # read blocks are unpinned
+        conn.execute("PRAGMA httpvfs_release").fetchall()
+        s = self.stats(conn)
+        self.assertEqual(s["pinned_blocks"], 0)
+        self.assertLessEqual(s["cached_blocks"], s["cache_blocks"])
+        self.assertEqual(conn.execute("SELECT count(*), sum(length(body)) FROM docs").fetchone(), want)
+
+        # hard limit: 64 blocks; the rest of the batch is left to on-demand reads
+        conn = self.open(cache_kb=64, readahead_kb=0, cache_max_kb=256)
+        conn.execute("SELECT id FROM docs LIMIT 1").fetchall()
+        conn.execute("PRAGMA httpvfs_reset")
+        conn.execute("SELECT httpvfs_prefetch_pages(2, ?)", (npages - 1,)).fetchone()
+        s = self.stats(conn)
+        self.assertEqual(s["cache_max_blocks"], 64)
+        self.assertLessEqual(s["prefetch_blocks"], 64)
+        self.assertLessEqual(s["peak_blocks"], 64)
+        self.assertEqual(s["pin_evictions"], 0)
+        self.assertEqual(conn.execute("SELECT count(*), sum(length(body)) FROM docs").fetchone(), want)
+
+    def test_pinning_random_workload(self):
+        """Random prefetch batches, lookups, scans and releases on a small
+        cache (growth past the budget, hash resizing, eviction of pinned
+        blocks at the hard limit, shrinking): results always match."""
+        import random
+        rnd = random.Random(5)
+        npages = os.path.getsize(DB) // 4096
+        plain = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
+        for cache_kb, max_kb in [(64, 4096), (64, 96), (256, 3000)]:
+            conn = self.open(cache_kb=cache_kb, cache_max_kb=max_kb)
+            conn.execute("PRAGMA cache_size=0")
+            for it in range(150):
+                op = rnd.random()
+                if op < 0.3:
+                    first = rnd.randint(1, npages)
+                    conn.execute("SELECT httpvfs_prefetch_pages(?, ?)",
+                                 (first, rnd.randint(1, npages - first + 1))).fetchone()
+                elif op < 0.4:
+                    conn.execute("PRAGMA httpvfs_release").fetchall()
+                elif op < 0.45:
+                    q = "SELECT count(*), sum(length(body)) FROM docs"
+                    self.assertEqual(conn.execute(q).fetchone(), plain.execute(q).fetchone())
+                else:
+                    i = rnd.randint(1, 4000)
+                    q = "SELECT body FROM docs WHERE id=?"
+                    self.assertEqual(conn.execute(q, (i,)).fetchone(), plain.execute(q, (i,)).fetchone())
+                s = self.stats(conn)
+                self.assertLessEqual(s["cached_blocks"], s["cache_max_blocks"])
+                self.assertLessEqual(s["pinned_blocks"], s["cached_blocks"])
+            conn.execute("PRAGMA httpvfs_release").fetchall()
+            s = self.stats(conn)
+            self.assertLessEqual(s["cached_blocks"], s["cache_blocks"])
+            q = "SELECT count(*), sum(length(body)) FROM docs"
+            self.assertEqual(conn.execute(q).fetchone(), plain.execute(q).fetchone())
+
+    def test_auto_cache_budget(self):
+        """cache_kb=auto (the default): 1/64 of the file, at least 4 MiB."""
+        s = self.stats(self.open())
+        self.assertEqual(s["cache_blocks"], 1024)            # the 2 MB test file: the 4 MiB floor
+        self.assertEqual(s["cache_max_blocks"], 4096)
+        s = self.stats(self.open(cache_min_kb=64))
+        self.assertEqual(s["cache_blocks"], max(16, os.path.getsize(DB) // 64 // 4096))
+        s = self.stats(self.open(cache_kb=8192))
+        self.assertEqual(s["cache_blocks"], 2048)
+
     def test_pragma_stats(self):
         conn = self.open()
         conn.execute("SELECT count(*) FROM docs").fetchall()

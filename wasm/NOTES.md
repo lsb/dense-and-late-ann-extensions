@@ -120,6 +120,7 @@ int httpvfs_speculate_begin(sqlite3 *db);
 int httpvfs_speculate_end(sqlite3 *db);     /* > 0: blocks fetched in one round */
 int httpvfs_stats(sqlite3 *db, HttpvfsStats *out);
 int httpvfs_reset_stats(sqlite3 *db);
+int httpvfs_release(sqlite3 *db);           /* end of statement: unpin, shrink to budget */
 ```
 
 `httpvfs_prefetch` fetches every uncached block of the given ranges in one parallel round; later `xRead`s hit the cache. The VFS also accepts `DENSE_ANN_FCNTL_PREFETCH` (`0x44414e01`) from `ext/dense/rawpage.h` with the same meaning, so that extension works unchanged.
@@ -138,22 +139,58 @@ While speculating, uncached blocks read as zeros and are only recorded; SQLite m
 
 ## The VFS
 
-- **Block cache.** LRU over fixed-size blocks (default 4096 bytes; set it to the database page size or a multiple). Size from `pageCacheBytes` (JS) or `cache_kb` (URI), default 4 MiB. A read larger than the cache still works (copied straight from the fetched buffers). SQLite's own page cache sits on top (the JS API sets `PRAGMA cache_size` to 2 MiB by default).
+- **Block cache.** LRU over fixed-size blocks (default 4096 bytes; set it to the database page size or a multiple), with the blocks of the current prefetch batch pinned; see [Block cache: pinned batches and the default budget](#block-cache-pinned-batches-and-the-default-budget). The budget comes from `pageCacheBytes` (JS) or `cache_kb` (URI); by default (`'auto'`) it is 1/64 of the database file, clamped to 4–64 MiB. A read larger than the cache still works (copied straight from the fetched buffers). SQLite's own page cache sits on top (the JS API sets `PRAGMA cache_size` to 2 MiB by default).
 - **Readahead** (as in sql.js-httpvfs): when a read starts where the previous one ended, the miss is extended by 1, 2, 4, … blocks up to `readaheadBytes` (default 1 MiB, 0 disables). A full scan of the `docs` table in the 2.2 MB test database takes 12 requests (2.1 MB) instead of 336 (1.4 MB) without readahead; the extra bytes are readahead running past the end of the table.
 - **Coalescing.** Adjacent missing blocks in a batch become one request; `coalesceGapBytes` also merges ranges separated by small gaps. A per-round request budget (`maxRequests`, 6 over HTTP/1.1 in browsers) merges or groups the rest; see [Request budget per round](#request-budget-per-round-http11).
 - **Size discovery.** The first request (block 0, which SQLite reads first anyway) learns the file size from `Content-Range`, so opening costs one round.
 - **Read-only.** `SQLITE_IOCAP_IMMUTABLE`, writes return `SQLITE_READONLY`; a WAL-mode header is presented as rollback mode. Non-main files (temp, journals) go to the default VFS.
-- **Instrumentation.** Every request is logged as `{offset, length, round, tStart, tEnd}` (ms, `performance.now()` clock of the calling thread). `round` is the number of the backend call; the requests of one batch share a round. Counters: `requests`, `bytes`, `rounds`, `reads`, `cacheHits`, `cacheMisses`, `prefetchCalls`, `prefetchBlocks`, `specMisses`, `netMs` (wall time blocked on the network), plus `fileSize`, `blockSize`, `cacheBlocks`, `cachedBlocks`.
-- **URI parameters** (native and WASM): `cache_kb`, `block`, `readahead_kb`, `gap_kb`, `log_max`, `max_req`, `rtt_ms`, `bw_kbps`, `multipart`, `max_parts`, `net_auto`, and natively `latency_ms`.
+- **Instrumentation.** Every request is logged as `{offset, length, round, tStart, tEnd}` (ms, `performance.now()` clock of the calling thread). `round` is the number of the backend call; the requests of one batch share a round. Counters: `requests`, `bytes`, `rounds`, `reads`, `cacheHits`, `cacheMisses`, `prefetchCalls`, `prefetchBlocks`, `specMisses`, `netMs` (wall time blocked on the network), plus `fileSize`, `blockSize`, `cacheBlocks` (the budget), `cachedBlocks`, `cacheMaxBlocks` (the hard limit), `pinnedBlocks`, `peakBlocks` (most blocks held at once since the last reset) and `pinEvictions`.
+- **URI parameters** (native and WASM): `cache_kb` (a number or `auto`), `cache_min_kb`, `cache_max_kb`, `block`, `readahead_kb`, `gap_kb`, `log_max`, `max_req`, `rtt_ms`, `bw_kbps`, `multipart`, `max_parts`, `net_auto`, and natively `latency_ms`.
 
 Chunked databases (sql.js-httpvfs "chunked" mode) are not implemented; the backend interface would take them without changes to the C side.
+
+### Block cache: pinned batches and the default budget
+
+**Problem.** At words-1m one IVF query at nprobe 128 prefetches about 870 pages (3.5 MB) in one batch. The VFS used to cap a batch at half the cache and insert it into a plain LRU. With the old default of 4 MiB the batch was cut, and part of it was evicted by the rest of the batch before SQLite read it. Those pages were then fetched again one at a time: 104 rounds (median, warm) for the 2 rounds the extension issued, and 1,148 for nprobe 512. A 64 MiB cache fixed nprobe 128 but not nprobe 512 (13 MB per query), which evicted its own batch once the cache was full (median 11–16 rounds).
+
+**Pinning.** The cache now has two lists: the LRU list and a list of *pinned* blocks.
+- Every block that an extension asks for in `httpvfs_prefetch`, `httpvfs_prefetch_pages`, `DENSE_ANN_FCNTL_PREFETCH` or a speculation pass (`httpvfs_speculate_end`) is pinned, including blocks of the batch that were already cached. Blocks over-fetched by coalescing, readahead blocks and on-demand misses are not pinned.
+- A pinned block is unpinned when it is first read (it becomes the most recently used LRU block), when the next batch starts (the extensions read a batch before announcing the next one), or at the end of the statement.
+- Eviction takes the LRU tail. While blocks are pinned, the cache may exceed its budget to hold them, up to a hard limit (`cache_max_kb` / `pageCacheMaxBytes`, default 4 × the budget). The unpinned part then keeps a floor of a quarter of the budget, so the pages read most recently (B-tree interior pages, the previous batch) survive a large batch. Only when the cache would exceed the hard limit with nothing unpinned left is the oldest pinned block evicted (`pinEvictions`). A batch larger than the hard limit is cut there, and the rest is read on demand as before.
+- As pinned blocks are read the cache trims back towards the budget. At the end of a statement (`httpvfs_release()`, `PRAGMA httpvfs_release`, file control `HTTPVFS_FCNTL_RELEASE`) the remaining pins are dropped, the cache is trimmed to its budget, and the memory above the budget is returned: blocks are stored in chunks of 256, and the blocks in chunks past the budget are moved down before those chunks are freed. The JavaScript API calls it after every statement. Native users who never call it get the same round counts; only unread pinned blocks linger until the next batch.
+- The per-round cap of half the cache is gone. The coalescing planner may still over-fetch at most half the budget beyond the requested blocks, because those blocks are not pinned.
+
+With an immutable database SQLite takes no locks, so the VFS sees no transaction boundaries: the end of a statement has to be signalled, and first read is the pin's natural end.
+
+**Default budget.** `pageCacheBytes: 'auto'` (the default; `cache_kb=auto` or no `cache_kb` in a URI) sets the budget to clamp(file size / 64, 4 MiB, 64 MiB) once the size is known (after the first request). The reasoning:
+- at 10k documents (75–100 MB) this is the old 4 MiB, which already holds a query's working set there;
+- at 1M it gives 11 MiB (FTS5, 0.7 GB), 24 MiB (late, 1.6 GB), 44 MiB (IVF, 3.0 GB, of which 1 GB is live data) and 61 MiB (graph, 4.1 GB). That is enough for one query's batch and for the pages that successive queries share. With pinning, the batch no longer has to fit anyway;
+- 64 MiB (plus up to 4 × that, briefly, for a pinned batch) is a reasonable ceiling for a browser tab.
+
+`pageCacheMinBytes` (`cache_min_kb`) raises the floor. The web client (`web/lib/index.mjs`) uses 'auto' with a 16 MiB floor, its previous fixed size, because its single combined database serves four indexes. An explicit `pageCacheBytes` still sets a fixed budget.
+
+**Results.** words-1m, WASM (Asyncify) against the unshaped range server, a warm session of 40 queries per configuration after one warm-up query; rounds per query (median / mean), requests and KB per query (mean). *Before* is the previous VFS with its 4 MiB default; *after* is this VFS with the automatic budget.
+
+| Configuration | Extension rounds | Before (4 MiB) | After (auto) | Before, 64 MiB | After, 64 MiB | After, 4 MiB |
+|---|---|---|---|---|---|---|
+| IVF nprobe 128 | 2 | 104 / 118 · 311 req · 3,771 KB | 2 / 2.0 · 167 req · 1,892 KB | 2 / 2.35 · 158 req · 1,697 KB | 2 / 2.0 · 158 req · 1,693 KB | 2 / 2.0 · 226 req · 3,363 KB |
+| IVF nprobe 512 | 2 | 1,148 / 1,158 · 1,338 req · 16,473 KB | 2 / 2.0 · 281 req · 5,046 KB | 11.5 / 19.8 · 220 req · 3,051 KB | 2 / 2.0 · 202 req · 2,881 KB | 2 / 2.0 · 515 req · 12,349 KB |
+| graph ef 64 | 9.9 | 10 / 9.9 · 114 req · 455 KB | 10 / 9.85 · 109 req · 437 KB | 10 / 9.85 · 109 req · 437 KB | 10 / 9.85 · 109 req · 437 KB | 10 / 9.88 · 114 req · 455 KB |
+| warp nprobe 8 | 1 | 2 / 2.9 · 39 req · 872 KB | 1 / 1.0 · 31 req · 723 KB | 1 / 1.0 · 31 req · 723 KB | 1 / 1.0 · 31 req · 723 KB | 1 / 1.0 · 37 req · 855 KB |
+| warp nprobe 32 | 1 | 174 / 190 · 265 req · 4,120 KB | 1 / 1.0 · 107 req · 2,735 KB | 1 / 2.9 · 90 req · 2,302 KB | 1 / 1.0 · 88 req · 2,278 KB | 1 / 1.48 · 133 req · 3,408 KB |
+
+- Every configuration now takes exactly the rounds its extension issues, whatever the budget. Over 200 queries at 64 MiB, IVF nprobe 512 goes from a median of 11 rounds (mean 18.8) to 2.
+- The larger automatic budget also saves bytes across queries (IVF nprobe 128: 1.9 MB against 3.4 MB per query with a 4 MiB budget).
+- Cold queries (a new connection per query, 10 queries): IVF nprobe 128 goes from 140 to 5 rounds, nprobe 512 from 1,152 to 5, warp nprobe 8 from 14 to 5, warp nprobe 32 from 287 to 5; graph stays at 13.
+- The top 10 are identical in every run. words-10k and llm-10k (graph, IVF nprobe 64, warp nprobe 8, FTS5 bm25c) keep their 4 MiB budget and give the same or slightly fewer rounds, requests and bytes (for example words-10k IVF 2.15 → 1.70 rounds, llm-10k IVF 1.90 → 1.63), because blocks of a batch that were already cached can no longer be evicted before they are read. FTS5 at 1M is unchanged (7.55 rounds).
+- Tests: `test_pinned_batch_larger_than_cache` (native: a 538-block batch against a 16-block budget arrives in one round, a full scan then costs no further round, and `PRAGMA httpvfs_release` shrinks the cache back), `test_pinning_random_workload` (random batches, lookups, scans and releases against small budgets and hard limits; the results always match), `test_auto_cache_budget`, and the Node tests for the same batch inside one statement and for the default budget.
 
 ## JavaScript API (`wasm/pkg/index.mjs`)
 
 ```js
 import { open } from './wasm/pkg/index.mjs';
 const db = await open('https://host/db.sqlite', {
-  pageCacheBytes: 8 << 20, blockSize: 4096, readaheadBytes: 1 << 20,
+  pageCacheBytes: 'auto', blockSize: 4096, readaheadBytes: 1 << 20,
   coalesceGapBytes: 0, maxParallel: undefined, variant: 'auto',
   maxRequests: 'auto', multipart: false,   // request budget per round, see below
 });
@@ -214,7 +251,7 @@ Over HTTP/1.1 a browser runs at most six requests per host at once. A round of t
 - **Input.** A round's uncached blocks, sorted, after adjacent blocks and `gap_kb` gaps have been merged into *m* ranges. If *m* ≤ *C* nothing changes.
 - **Coalescing** (the default when *m* > *C*). `httpvfs_plan()` chooses *g* contiguous requests. It minimises the estimated round time
   *T*(*g*) = ⌈*g*/*C*⌉ · RTT + bytes(*g*) / bandwidth,
-  where bytes(*g*) is the smallest total span of *g* requests, obtained by cutting at the *g*−1 largest gaps. Between multiples of *C* the number of waves is constant and more requests fetch fewer bytes, so only *g* = *m* and *g* = *C*, 2*C*, … can be optimal. All candidates are evaluated exactly, in O(*m* log *m*); a test checks the result against brute force over every set of cuts. The total span is capped at half the block cache. Blocks fetched in the gaps are real data and go into the cache. They are inserted *before* the requested blocks, so a round never evicts its own blocks.
+  where bytes(*g*) is the smallest total span of *g* requests, obtained by cutting at the *g*−1 largest gaps. Between multiples of *C* the number of waves is constant and more requests fetch fewer bytes, so only *g* = *m* and *g* = *C*, 2*C*, … can be optimal. All candidates are evaluated exactly, in O(*m* log *m*); a test checks the result against brute force over every set of cuts. The total span may exceed the requested blocks by at most half the cache budget. Blocks fetched in the gaps are real data and go into the cache, unpinned. They are inserted *before* the requested blocks, and the requested blocks of a prefetch batch are pinned, so a round never evicts its own blocks.
 - **Only RTT × bandwidth matters.** The decision depends only on the bandwidth-delay product, the number of bytes worth one extra wave. That product is similar across the profiles: 167 KB on `4g`, 105 KB on `lte`, 101 KB on `slow-4g` and 125 KB on `wifi`. The defaults (100 ms, 10 Mbit/s: 125 KB) are therefore close everywhere. Scaling the RTT given to the planner by 0.5–2× changed the simulated warm `4g` p50 by less than 1 % for graph and IVF and by at most 7 % for warp (2× was 2 % *better*: the model slightly underestimates a wave). Too-large values cost a lot, because the planner then over-fetches: 8× costs 26 % (graph) to 79 % (IVF).
 - **Online estimate** (`netAutoEstimate`, on by default). The VFS keeps the last 64 rounds that ran without client-side queueing (at most *C* requests), as pairs of bytes and wall time. The bandwidth estimate is the slope between the medians of the smaller and larger halves, used only when their sizes differ by 2× or more. The RTT estimate is a low quartile of *T* − *B*/bandwidth over the smaller half. In Chromium on `4g,h1` it converged to RTT 167–169 ms (true value 165) and 4.8–7.4 Mbit/s (true 8.1); against a localhost server it converged to 1.3 ms.
 - **Multi-range requests** (`multipart: true`, opt-in). The ranges are split in offset order into min(*C*, *m*) requests of similar byte size, each with at most `maxRangesPerRequest` (100) ranges, sent as `Range: bytes=a-b,c-d,…`. Nothing is over-fetched. The `multipart/byteranges` parser (`wasm/pkg/multipart.mjs`) takes each part's length from its `Content-Range`, so bodies that contain the boundary string are safe. It accepts parts in any order, and parts the server merged. The same module is compiled into the glue as a `--pre-js`, with its `export`s stripped, and is imported by the sync fetch worker.
@@ -351,4 +388,4 @@ The simulator predicts real multipart and coalesce times within 2–4 %. The exc
 - No native HTTP backend: native runs read a local file and simulate latency per round. A libcurl-multi backend would let native benchmarks run through `netsim`.
 - Speculation relies on SQLite tolerating zero-filled pages (it reports `SQLITE_CORRUPT` and moves on). It is tested for rowid lookups; extensions that speculate through virtual tables should test their own paths, and should cap passes (the demo caps at 16).
 - The WASM build is single-threaded (`THREADSAFE=0`, no `-pthread`): pthread calls in extension code (for example `ext/dense/hnsw.c`) link against Emscripten's stubs, so index construction belongs in the native build.
-- Chunked databases and an eviction policy that pins blocks of the current batch are not done. (The HTTP/1.1 connection limit is handled by the request budget.)
+- Chunked databases are not done. (The HTTP/1.1 connection limit is handled by the request budget; batches larger than the cache by pinning.)

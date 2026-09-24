@@ -44,7 +44,7 @@ Full tables and charts: [results/matrix/README.md](results/matrix/README.md) and
   - `bm25c` ranking, which turns FTS5's 685 rounds into 10;
   - int8 static data, fetched while the query encoder loads;
   - multi-range requests, which make HTTP/1.1 as fast as HTTP/2.
-- **Client cache at 1M.** One IVF query at 1M prefetches about 3.5 MB, so the WASM client needs a larger block cache (64 MiB) than the 4 MiB default.
+- **Client cache at 1M.** One IVF query at 1M prefetches 3.5–13 MB in one batch. The VFS pins a batch's blocks until they are read, so a batch larger than the cache still costs one round, and it sizes its cache from the database (1/64 of the file, 4–64 MiB) by default (wasm/NOTES.md).
 
 ## Components
 
