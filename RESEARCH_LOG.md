@@ -275,3 +275,36 @@ All 10,000 paragraphs were generated (9,995 ended with the end-of-turn token wit
 - **llmq**: the model's own search query.
 
 The generated queries are short (3.1 words on average) and often vague. Common ones are "creative ideas" (70 times), "historical significance" (68) and "negative impact" (68). 21.8 % contain the target word despite the instruction. Because each has exactly one relevant document, llmq is a hard, noisy known-item task; it resembles what a small model produces rather than what a careful user types. The LLM corpora were encoded with both models, one document at a time, into `data/emb/llm-{100,10k}.*`.
+
+## 2026-09-24 — First full benchmark matrix (`results/matrix/`)
+
+**Method.** `tools/build_db.py` builds one deployable database per corpus: documents, FTS5, the dense graph and dense IVF-PQ indexes, and the late index in both the warp and plaid layouts, VACUUMed and finalized, with 4 KiB pages. `bench/matrix.py` then does four things:
+- measures quality natively against the relevance labels;
+- runs every configuration through the Asyncify WASM build in Node against the shaped range server, recording each query's request trace;
+- replays the traces through `netsim/simulate.py` under 8 profiles × {HTTP/1.1 with 6 connections, HTTP/2-like with 100};
+- validates the simulation against real shaped-server runs.
+
+WASM returned exactly the native top-10 list for every query and configuration. Real runs were 0.3–3 % slower than simulated on cellular profiles (localhost overhead of 2–6 ms per round on a loaded machine). "Warm" means a query within a session with a 4 MiB block cache; "cold" means a fresh connection. AUC uses a separate k = 100 run.
+
+**Headline** (simulated p50 on `4g`, HTTP/2-like; the full tables are in `results/matrix/README.md` and the charts in `results/matrix/index.html`):
+
+| Corpus | Method | Index size | nDCG@10 | AUC@100 | Warm p50 | Cold p50 |
+|---|---|---|---|---|---|---|
+| words-10k | FTS5 bm25 | 2.5 MB | 0.994 | 1.000 | ≈0 ms (cached) | 3.0 s |
+| words-10k | dense graph, ef 64 | 41.5 MB | 0.075 | 0.588 | 1.4 s | 2.4 s |
+| words-10k | dense IVF, nprobe 64 | 9.9 MB | 0.075 | 0.583 | 0.48 s | 2.1 s |
+| words-10k | late warp 8 + rerank 64 | 39.7 MB | 0.350 | 0.754 | 0.69 s | 3.3 s |
+| llm-10k | FTS5 bm25 (OR) | 1.8 MB | 0.456 | 0.775 | ≈0 ms (cached) | 2.7 s |
+| llm-10k | dense graph, ef 64 | 41.5 MB | 0.585 | 0.866 | 1.2 s | 2.3 s |
+| llm-10k | dense IVF, nprobe 128 | 9.9 MB | 0.567 | — | 0.40 s | 2.0 s |
+| llm-10k | late warp 8 | 19.5 MB | 0.431 | — | ≈0 ms (cached) | 1.6 s |
+
+References for exhaustive search on llm-10k: MiniLM exact nDCG@10 = 0.586, LateOn exact MaxSim = 0.519.
+
+**Findings.**
+- *Random-word corpora are a lexical task.* FTS5 is essentially perfect, MiniLM is near chance (nDCG 0.075), and LateOn is in between (0.35), because its token vectors can match exact words.
+- *On the LLM corpus the dense model is best.* MiniLM beats LateOn-Code-edge for both query kinds, and both beat FTS5 on paraphrase (llmq) queries: nDCG@10 of 0.31 (dense), 0.16–0.18 (late) and 0.15 (FTS5 OR). LateOn-Code-edge is a code-retrieval model, so this is not a verdict on late interaction in general.
+- *ANN costs almost nothing in quality.* The dense graph at ef 64 is within 0.001 nDCG of exhaustive MiniLM search on llm-10k, and IVF nprobe 128 within 0.02.
+- *Session start dominates the first query.* A cold query costs 1.6–3.3 s on `4g` for every method, mostly per-connection static data (late centroids ≈1.7 MB, IVF centroids, PQ codebook and entry set). Within a session, IVF answers in about 0.4 s and the graph in about 1.2 s.
+- *Session caching can make the "warm" regime look free.* At 10k documents the 4 MiB block cache ends up holding much of the hot data, so warm-session numbers depend on query order and cache size; the "Ext. KB" column shows the extension's reads before the cache.
+- *Exhaustive dense search in the extension (`exact=1`) reads one page per round* (about 2,000 sequential rounds at 10k), so it is useful only as a quality baseline.
