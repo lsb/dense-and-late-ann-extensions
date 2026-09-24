@@ -355,3 +355,31 @@ Windows is unsupported because index building uses pthreads.
 Dynamic activation quantization cost LateOn about 0.012 nDCG even on VNNI hardware. The price of w8 is speed: native encoding one document at a time falls from 177 to 93 documents/s (MiniLM) and from 224 to 150 (LateOn) on the shared CPU. In the browser a short query now takes about 30 ms (MiniLM) and 13 ms (LateOn) to encode, instead of 7–11 ms and 3.5–4 ms.
 
 **Consequence.** All corpora are re-encoded with the w8 models, and the benchmark matrix is rebuilt. The dense words-1m ANN comparison that was already running uses int8 MiniLM embeddings. Its conclusions about recall against exact search, rounds and bytes do not depend on the encoder variant, so it is left to finish.
+
+## 2026-09-24 — Dense ANN on the real words-1m embeddings
+
+Both `dense_ann` layouts were built over the 1M random-word corpus's MiniLM embeddings (the int8 encoder, computed before the w8 switch) and queried with 1,000 held-out random-word documents and single words. Recall@10 is measured against exact float search. All times are warm-connection `4g` estimates.
+
+**Graph layout** (HNSW-built, M = 16, 4 KiB pages):
+
+| ef | Best W | Recall@10 | Rounds | KiB | `4g` |
+|---|---|---|---|---|---|
+| 64 | 32 | 0.434 | 8.2 | 649 | 2.0 s |
+| 128 | 64 | 0.515 | 8.5 | 1,257 | 2.6 s |
+| 256 | 64 | 0.574 | 10.7 | 1,710 | 3.5 s |
+
+**IVF-PQ layout** (1,000 lists):
+
+| nprobe | Rerank R | Recall@10 | KiB | `4g` |
+|---|---|---|---|---|
+| 128 | 256 | 0.796 | 12,945 | 13.6 s |
+| 512 | 128 | 0.901 | 47,278 | 48 s |
+| 1,024 (all lists) | 256 | 0.962 | 72,957 | 74 s |
+
+With the default 4√N ≈ 4,000 lists, 0.922 needs 29 MB per query (30 s on `4g`). Setup is 0.5–0.7 MB per connection. Build times are 166 s with 1,000 lists and 681 s with the default number.
+
+**Interpretation.** Random-word documents make a pathological dense corpus. Each document is a bag of 50 unrelated words, so MiniLM places all million documents in a narrow, nearly structureless region: neighbours are near-ties, and the top 10 is fragile.
+- *PQ-64 cannot separate near-ties.* The graph's recall against exhaustive PQ search is only about 0.3.
+- *Coarse clustering does not follow the data.* IVF's clusters do not line up with query neighbourhoods, so recall grows only slowly as more lists are probed.
+
+The same code on synthetic clustered 1M data reaches recall 0.97–0.995 in 2–8 rounds and 0.4–0.6 MB. And on llm-10k the graph matches exhaustive MiniLM search (nDCG 0.585 against 0.586). Recall against exact search at 1M random words is therefore a stress test rather than a prediction for real text. A realistic 1M-scale dense evaluation would need a realistic 1M-document corpus: generating one with the local LLM would take about 10 days on this machine, so it is out of scope.
