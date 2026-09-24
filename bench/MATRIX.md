@@ -45,7 +45,7 @@ The only difference is that the combined schema occupies a second page, which th
 | Corpus | Database | Measured |
 |---|---|---|
 | words-100, llm-100, words-10k, llm-10k | one combined database each | quality and traces for every query (up to 1,000 per kind), simulation for all profiles × h1/h2, real runs on `4g` and `lte` × h1/h2 |
-| words-1m | one database per index (`--split`), no VACUUM | as above, on 250 queries per kind; late index warp-only; no exhaustive rows |
+| words-1m | one database per index (`--split`), no VACUUM, 64 MiB client cache | quality and traces on 250 queries per kind (random sample), simulation for all profiles, real runs on `4g` and `lte` with 20 queries per kind; late index warp-only; no exhaustive rows; dense configurations graph ef 64 / 128 / 256 and IVF nprobe 128 / 512 |
 
 **Query subsets.** Where a kind has more queries than the cap (llm-10k: 10,000 per kind, cap 1,000; words-1m: 1,000 per kind, cap 250), the evaluated queries are a seeded random sample of that kind (`interleave_kinds`), not the first N. In the LLM query sets query *i* is about document *i*, and FTS5 breaks ties by rowid, so a first-N subset favours methods that produce many ties: on the first 1,000 per kind bm25c scores 0.787 against 0.757 for bm25, a gap that disappears over all 10,000. A random sample was chosen over evaluating all queries so that quality, traces and real runs use the same queries; the real-run subset (50 per kind) is a prefix of the same sample. Sets within the cap (words-100, words-10k, llm-100) are evaluated completely.
 
@@ -58,7 +58,7 @@ The LLM query kinds are `word` (the word the paragraph was written about) and `l
 Disk is the constraint: about 20 GB are free and the LateOn input alone is 10.7 GB. A combined 1M database would be about 8 GB, and VACUUM needs a second copy. The run (`build/matrix/chain1m.sh`) therefore handles one index at a time:
 
 - It builds `words-1m--<index>.db` with `--split-only --no-vacuum`. Without VACUUM, the float32 build buffer of a dense index (1.5 GB) stays on the free list. It occupies disk but is never fetched, and `dbstat` sizes exclude it.
-- It runs quality, trace, simulation and the real runs, then deletes the database, keeping its manifest (`.db.json`, sizes and parameters), traces and results. Only about 9 GB of disk were free, so no words-1m database is kept. Rebuild one with the recipe below to query it.
+- It runs quality, trace, simulation and the real runs on each database. All four databases are kept in `build/matrix/` (9.4 GB): graph 4.1 GB, IVF 3.0 GB, late 1.6 GB and FTS5 0.7 GB. The IVF file contains 2 GB of free pages left by the build buffer (no VACUUM), and `VACUUM` would reclaim them if disk allows. Delete the databases before rebuilding; manifests, traces and results are separate files.
 - `bench/matrix.py report words-1m` merges the per-index results into one table (`merge_splits`).
 
 Index parameters at 1M:
@@ -82,21 +82,22 @@ python3 bench/matrix.py report
 
 ## Findings worth knowing when reading the tables
 
-- **Warm sessions cache a lot.** At 10k the VFS block cache (4 MiB) holds a large share of the smaller indexes after a few hundred queries: FTS5 needs 0.2–0.3 rounds per warm query, and at llm-10k the warp posting stream (about 8 MB) is served almost entirely from cache (3 KB transferred against 125 KB read by the extension). The *Ext. KB* column shows the extension's own reads before the cache.
-- **The dense exhaustive baseline (`exact=1`) reads its vector table one page per round** (2,006 rounds per query at 10k): the scan is neither prefetched nor detected as sequential by readahead. It is a baseline for quality only; over a network it would need batching.
-- **HTTP/1.1 costs a lot, and multi-range requests win it back.** The per-corpus section *HTTP/1.1 with the request budget* re-simulates the traces with `bench/coalesce_eval.py` (the VFS's own planner via ctypes). At 10k on 4g, warm, plain h1 is 1.5–3.4× slower than h2 for the multi-request systems (graph 2,409 vs 1,240 ms at llm-10k; warp + rerank 2,086 vs 622 ms at words-10k). With at most six multi-range requests per round, h1 comes within 1 % of h2. Coalescing with over-fetch recovers only part of the gap.
-- **Cold starts are dominated by static data.** Late interaction's centroid table (1.7 MB at K = 16,384) makes its first query 2.5–3.5 s on 4g even though a warm warp query is 0.2 s.
+- **Warm sessions cache a lot at 10k.** The 4 MiB VFS block cache holds a large share of the smaller indexes after a few hundred queries. FTS5 needs 0.2–0.3 rounds per warm query. At llm-10k the warp posting stream is served almost entirely from cache: 3 KB transferred against 114 KB read by the extension. The *Ext. KB* column shows the extension's own reads, before the cache.
+- **The dense exhaustive baseline (`exact=1`) reads its vector table one page per round**, about 2,000 rounds per query at 10k. The scan is neither prefetched nor recognised as sequential by readahead. It serves as a quality baseline only; over a network it would need batching.
+- **Cold starts.** With int8 centroids (late format 3), a cold warp nprobe 8 query at 10k reads 0.5–1.0 MB and takes 1.2–1.7 s on 4g, against 2.5 s in the first (float16) matrix. At 1M the late static data dominates the first query: 4.3 MB and 5.2 s on 4g.
+- **HTTP/1.1 costs a lot, and multi-range requests win it back.** The per-corpus section *HTTP/1.1 with the request budget* re-simulates the traces with `bench/coalesce_eval.py` (the VFS's own planner, called via ctypes). At 10k on 4g, warm, plain h1 is 1.8–3.5× slower than h2 for the systems that issue many requests per round:
 
-## FTS5 ranking
+  | Corpus | System | h1 | h2 |
+  |---|---|---|---|
+  | words-10k | graph | 2,583 ms | 1,419 ms |
+  | words-10k | warp + rerank | 2,217 ms | 628 ms |
+  | words-10k | IVF | 1,131 ms | 476 ms |
+  | words-1m | graph | 3,890 ms | 2,057 ms |
 
-FTS5's `bm25()` reads one `fts_docsize` row per matching document, one round trip each: 685 rounds for a cold single-word query at 1M. The client therefore ranks with `bm25c()` (`ext/fts5rank`, bm25 at the average document length) by default. The configuration `fts-bm25c-or` measures it next to `fts-bm25-or` in future matrix runs. The current `results/matrix/` tables predate it and show `bm25()`.
-
-The comparison of ranking methods is not part of the matrix:
-
-- `bench/fts5_rank.py quality|cost|report` compares bm25, bm25c, bm25-rerank, bm25-prefetch and rowid order on quality, cold and warm rounds and bytes, and simulated and real 4G/LTE latency, through `web/lib/search-core.mjs` in the WASM build;
-- `bench/fts5_options.py` compares the FTS5 table options.
-
-Results are in `results/fts5-rank/*.json`, write-up in `docs/fts5-httpvfs.md`.
+  With at most six multi-range requests per round, h1 comes within 1 % of h2. Coalescing with over-fetch recovers only part of the gap.
+- **FTS5 at 1M:** standard bm25 is prohibitive cold (354–883 rounds, 1.5–5.3 MB, 59–127 s on 4g) because of the per-document `fts_docsize` lookups. bm25c gives identical quality in 14.5 rounds and 60 KB (2.2 s on 4g).
+- **Dense ANN at 1M reaches low recall against exact search.** Graph ef 64 / 128 / 256 reaches R@10-vs-exact of 0.33 / 0.41 / 0.45, and IVF nprobe 128 / 512 reaches 0.57 / 0.80, in line with ext/dense's own 1M run. MiniLM is near chance on random words (nDCG@10 0.08–0.15 against FTS5's 0.99), so the labels say little here.
+- **VFS eviction under large prefetches (IVF nprobe 512 at 1M).** The extension issues 2 rounds, but once the 64 MiB cache is full of earlier queries' pages, a 13 MB prefetch evicts some of its own blocks before they are read. The VFS then needs a median of 16 rounds (the first queries of the session take 2). Pinning the current batch's blocks during eviction (an open item in wasm/NOTES.md) would fix this.
 
 ## Caveats
 

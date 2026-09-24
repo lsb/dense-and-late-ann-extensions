@@ -3,7 +3,8 @@ import html as H
 import math
 import time
 
-HEADLINE = ("fts-bm25c-or", "graph-ef64", "ivf-np64", "warp-np8", "warp-np8-rr64", "late-exact")
+HEADLINE = (("fts-bm25c-or",), ("graph-ef64",), ("ivf-np64", "ivf-np128"), ("warp-np8",), ("warp-np8-rr64",),
+            ("late-exact",))   # one slot per method; the first configuration a corpus has
 FAMILY = {"FTS5": 0, "dense graph": 1, "dense IVF": 1, "late": 2}
 SHAPE = {"FTS5": "circle", "dense graph": "circle", "dense IVF": "square", "late": "circle"}
 
@@ -62,8 +63,10 @@ def readme(cfg, results, md_corpus):
     L.append("| Corpus | Config | Index MB | nDCG@10 | AUC@100 | Warm rounds | Warm KB | Warm p50 ms | Warm p95 ms | Cold KB | Cold p50 ms |")
     L.append("|---|---|---|---|---|---|---|---|---|---|---|")
     for r in results:
-        for c in r["configs"]:
-            if c["id"] not in HEADLINE:
+        have = {c["id"]: c for c in r["configs"]}
+        for slot in HEADLINE:
+            c = next((have[i] for i in slot if i in have), None)
+            if c is None:
                 continue
             q = (c.get("quality") or {}).get("all", {})
             w, co = c.get("warm") or {}, c.get("cold") or {}
@@ -271,7 +274,7 @@ def html(cfg, results):
         f"<option{' selected' if s == default else ''}>{H.escape(s)}</option>" for s in specs)
         + "</select> &nbsp; Metric: <select id='met'>" + "".join(
         f"<option{' selected' if m == 'ndcg@10' else ''}>{m}</option>"
-        for m in ("ndcg@10", "recall@10", "mrr@10", "success@1", "auc@100", "r10_vs_exact")) + "</select></p>")
+        for m in ("ndcg@10", "recall@10", "auc@100")) + "</select></p>")
     for r in results:
         cid = r["corpus"]
         out.append(f"<h2>{H.escape(cid)}</h2>")
@@ -279,7 +282,7 @@ def html(cfg, results):
                    "composed of:</p>")
         out.append(size_bar(r))
         for s in specs:
-            for m in ("ndcg@10", "recall@10", "mrr@10", "success@1", "auc@100", "r10_vs_exact"):
+            for m in ("ndcg@10", "recall@10", "auc@100"):
                 vis = "" if (s == default and m == "ndcg@10") else " hidden"
                 out.append(f"<div class='chart' data-spec='{H.escape(s)}' data-met='{m}'{vis}>"
                            f"<div class='pair'><div>{scatter(r, s, m, 'warm', W=520, Hh=360)}</div>"

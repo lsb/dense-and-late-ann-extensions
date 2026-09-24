@@ -31,6 +31,8 @@ One configuration per method, all corpora. Latency is the simulated p50 on `4g` 
 | words-10k | warp nprobe 8 + rerank 64 | 38.8 | 0.408 | 0.785 | 2.7 | 290 | 701 | 1,121 | 1,317 | 2,497 |
 | words-10k | late exhaustive (decompressed) | 38.8 | 0.420 | 0.836 | 31.0 | 20,624 | 26,260 | 26,356 | 21,500 | 29,336 |
 | words-1m | FTS5 bm25c (OR) | 214.7 | 0.992 | 0.787 | 4.0 | 18 | 681 | 1,524 | 60 | 2,204 |
+| words-1m | graph ef 64, W 16 | 4,118.6 | 0.080 | 0.509 | 10.4 | 403 | 2,057 | 2,924 | 689 | 2,874 |
+| words-1m | IVF nprobe 128, rerank 128 | 914.1 | 0.120 | 0.511 | 3.6 | 1,077 | 1,505 | 3,478 | 3,974 | 4,940 |
 | words-1m | warp nprobe 8 | 1,637.8 | 0.328 | 0.576 | 1.2 | 442 | 613 | 1,384 | 4,263 | 5,166 |
 | llm-100 | FTS5 bm25c (OR) | 0.0 | 0.538 | 0.791 | 0.0 | 0 | 0 | 15 | 27 | 1,015 |
 | llm-100 | graph ef 64, W 16 | 0.6 | 0.785 | 0.944 | 0.1 | 1 | 0 | 14 | 384 | 1,710 |
@@ -444,9 +446,9 @@ nDCG@10 by query kind:
 
 ## words-1m
 
-Measured as separate per-index databases (`build_db.py --split`, to fit the disk; the attribution check in `bench/MATRIX.md` shows this gives the same fetch costs): `words-1m--dense_ivf.db`, `words-1m--fts.db`, `words-1m--late.db`. Sizes are summed over the files.
+Measured as separate per-index databases (`build_db.py --split`, to fit the disk; the attribution check in `bench/MATRIX.md` shows this gives the same fetch costs): `words-1m--dense_graph.db`, `words-1m--dense_ivf.db`, `words-1m--fts.db`, `words-1m--late.db`. Sizes are summed over the files.
 
-1,000,000 documents; 500 queries evaluated, the first of each kind out of 2,000 (250 known, 250 word). Database `words-1m--dense_ivf.db, words-1m--fts.db, words-1m--late.db`: 5328.23 MB.
+1,000,000 documents; 500 queries evaluated, the first of each kind out of 2,000 (250 known, 250 word). Database `words-1m--dense_graph.db, words-1m--dense_ivf.db, words-1m--fts.db, words-1m--late.db`: 9446.79 MB.
 
 Encoders: `models/minilm-l6-v2/model_w8.onnx`, `models/lateon-code-edge/model_w8.onnx`.
 
@@ -456,16 +458,20 @@ The top-10 lists returned through WASM are identical to the native ones for 100.
 
 | Part | MB | Share | Index parameters |
 |---|---|---|---|
-| late | 1637.85 | 30.7 % | dim=48 order=1 threads=2 input=f16 layout=warp nbits=2 centroids=65536 fast_assign=1 sample_tokens=2000000 mem_mb=1024 centroid_type=int8 |
-| dense_ivf | 914.10 | 17.2 % | dim=384, layout=ivf, store_vectors=f16, threads=2, ivf_centroids=auto, codebook=int8 |
-| docs | 508.40 | 9.5 % |  |
-| fts | 214.71 | 4.0 % |  |
-| schema | 0.01 | 0.0 % |  |
+| dense_graph | 4118.55 | 43.6 % | dim=384, layout=colocated, vectors=inline, store_vectors=f16, M=16, ef_construction=200, threads=2, codebook=int8 |
+| late | 1637.85 | 17.3 % | dim=48 order=1 threads=2 input=f16 layout=warp nbits=2 centroids=65536 fast_assign=1 sample_tokens=2000000 mem_mb=1024 centroid_type=int8 |
+| dense_ivf | 914.10 | 9.7 % | dim=384, layout=ivf, store_vectors=f16, threads=2, ivf_centroids=auto, codebook=int8 |
+| docs | 508.40 | 5.4 % |  |
+| fts | 214.71 | 2.3 % |  |
+| schema | 0.02 | 0.0 % |  |
 
 **Quality** (k = 10; AUC from k = 100 lists; R@10 vs exact = overlap of the top 10 with the system's own exact search):
 
 | Config | Index MB | Recall@10 | Success@1 | MRR@10 | nDCG@10 | AUC@100 | R@10 vs exact | Queries |
 |---|---|---|---|---|---|---|---|---|
+| graph ef 64, W 16 | 4118.55 | 0.003 | 0.130 | 0.170 | 0.080 | 0.509 | 0.334 | 500 |
+| graph ef 128, W 64 | 4118.55 | 0.007 | 0.146 | 0.185 | 0.094 | 0.512 | 0.407 | 500 |
+| graph ef 256, W 64 | 4118.55 | 0.007 | 0.152 | 0.193 | 0.100 | 0.510 | 0.453 | 500 |
 | IVF nprobe 128, rerank 128 | 914.10 | 0.006 | 0.194 | 0.242 | 0.120 | 0.511 | 0.574 | 500 |
 | IVF nprobe 512, rerank 128 | 914.10 | 0.012 | 0.208 | 0.261 | 0.148 | 0.520 | 0.798 | 500 |
 | FTS5 bm25 (AND) | 214.71 | 0.507 | 0.996 | 0.998 | 0.992 | 0.787 | 1.000 | 500 |
@@ -480,6 +486,9 @@ nDCG@10 by query kind:
 
 | Config | known (n=250) | word (n=250) |
 |---|---|---|
+| graph ef 64, W 16 | 0.004 | 0.156 |
+| graph ef 128, W 64 | 0.007 | 0.181 |
+| graph ef 256, W 64 | 0.007 | 0.192 |
 | IVF nprobe 128, rerank 128 | 0.007 | 0.234 |
 | IVF nprobe 512, rerank 128 | 0.012 | 0.285 |
 | FTS5 bm25 (AND) | 1.000 | 0.985 |
@@ -494,6 +503,9 @@ nDCG@10 by query kind:
 
 | Config | Rounds | Requests | KB | Ext. KB | none | lan | wifi | 4g | lte | slow-4g | 3g | lte-poor |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
+| graph ef 64, W 16 | 10.4 | 100.7 | 403 | 489 | 1.9 / 3.1 | 27 / 36 | 491 / 666 | 3,890 / 5,301 | 1,757 / 2,379 | 14,192 / 19,205 | 8,422 / 11,291 | 5,392 / 8,131 |
+| graph ef 128, W 64 | 9.0 | 246.9 | 988 | 1,339 | 3.0 / 4.0 | 56 / 69 | 1,065 / 1,304 | 8,424 / 10,315 | 3,825 / 4,689 | 30,914 / 37,885 | 18,542 / 22,753 | 10,141 / 12,850 |
+| graph ef 256, W 64 | 11.5 | 368.6 | 1,474 | 1,821 | 3.9 / 5.0 | 82 / 98 | 1,564 / 1,888 | 12,375 / 14,953 | 5,624 / 6,785 | 45,458 / 54,842 | 27,300 / 32,858 | 14,428 / 18,050 |
 | IVF nprobe 128, rerank 128 | 3.6 | 132.9 | 1,077 | 3,472 | 4.8 / 8.9 | 34 / 51 | 585 / 889 | 4,533 / 6,777 | 2,113 / 3,262 | 17,110 / 26,597 | 10,855 / 17,679 | 6,289 / 11,104 |
 | IVF nprobe 512, rerank 128 | 23.2 | 195.5 | 2,265 | 12,968 | 15 / 22 | 70 / 147 | 1,128 / 2,552 | 8,675 / 19,857 | 4,074 / 9,241 | 33,013 / 74,813 | 21,491 / 46,950 | 13,326 / 29,892 |
 | FTS5 bm25 (AND) | 8.8 | 8.8 | 37 | – | 2.2 / 4.0 | 6.2 / 12 | 86 / 209 | 683 / 1,693 | 296 / 729 | 2,366 / 5,856 | 1,305 / 3,208 | 666 / 2,077 |
@@ -507,6 +519,9 @@ nDCG@10 by query kind:
 
 | Config | Rounds | Requests | KB | Ext. KB | none | lan | wifi | 4g | lte | slow-4g | 3g | lte-poor |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
+| graph ef 64, W 16 | 10.4 | 100.7 | 403 | 489 | 1.9 / 3.1 | 15 / 21 | 267 / 376 | 2,057 / 2,924 | 972 / 1,366 | 7,880 / 11,059 | 5,046 / 7,002 | 4,521 / 6,935 |
+| graph ef 128, W 64 | 9.0 | 246.9 | 988 | 1,339 | 3.0 / 4.0 | 20 / 25 | 345 / 432 | 2,477 / 3,180 | 1,308 / 1,621 | 10,686 / 13,250 | 7,769 / 9,388 | 6,251 / 7,970 |
+| graph ef 256, W 64 | 11.5 | 368.6 | 1,474 | 1,821 | 3.9 / 5.0 | 27 / 34 | 467 / 585 | 3,351 / 4,232 | 1,784 / 2,224 | 14,611 / 18,161 | 10,820 / 13,250 | 8,585 / 11,174 |
 | IVF nprobe 128, rerank 128 | 3.6 | 132.9 | 1,077 | 3,472 | 4.8 / 8.9 | 16 / 32 | 227 / 500 | 1,505 / 3,478 | 889 / 1,947 | 7,313 / 16,101 | 5,929 / 12,284 | 4,304 / 9,106 |
 | IVF nprobe 512, rerank 128 | 23.2 | 195.5 | 2,265 | 12,968 | 15 / 22 | 50 / 125 | 710 / 2,122 | 5,061 / 16,080 | 2,687 / 7,799 | 21,935 / 63,708 | 15,976 / 41,736 | 11,202 / 28,179 |
 | FTS5 bm25 (AND) | 8.8 | 8.8 | 37 | – | 2.2 / 4.0 | 6.2 / 12 | 86 / 209 | 683 / 1,693 | 296 / 729 | 2,366 / 5,856 | 1,305 / 3,208 | 666 / 2,077 |
@@ -520,6 +535,9 @@ nDCG@10 by query kind:
 
 | Config | Rounds | Requests | KB | Ext. KB | none | lan | wifi | 4g | lte | slow-4g | 3g | lte-poor |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
+| graph ef 64, W 16 | 13.5 | 126.2 | 689 | 493 | 2.4 / 5.1 | 35 / 45 | 654 / 837 | 5,145 / 6,611 | 2,357 / 3,015 | 19,058 / 24,378 | 11,584 / 14,721 | 7,593 / 10,155 |
+| graph ef 128, W 64 | 12.0 | 338.5 | 1,538 | 1,342 | 3.4 / 4.4 | 78 / 89 | 1,496 / 1,713 | 11,795 / 13,506 | 5,397 / 6,178 | 43,662 / 49,976 | 26,508 / 30,247 | 14,434 / 16,800 |
+| graph ef 256, W 64 | 14.7 | 459.7 | 2,023 | 1,827 | 4.7 / 6.0 | 105 / 123 | 1,997 / 2,352 | 15,751 / 18,556 | 7,199 / 8,472 | 58,229 / 68,517 | 35,274 / 41,452 | 18,957 / 23,013 |
 | IVF nprobe 128, rerank 128 | 5.0 | 236.2 | 3,974 | 3,434 | 8.0 / 12 | 70 / 78 | 1,236 / 1,349 | 9,232 / 9,878 | 4,638 / 5,111 | 37,841 / 41,797 | 27,235 / 31,147 | 19,160 / 22,562 |
 | IVF nprobe 512, rerank 128 | 5.0 | 540.3 | 13,353 | 12,813 | 19 / 26 | 167 / 186 | 2,984 / 3,296 | 21,281 / 23,053 | 11,558 / 12,840 | 94,835 / 105,936 | 76,148 / 87,215 | 57,492 / 66,653 |
 | FTS5 bm25 (AND) | 354.0 | 354.0 | 1,530 | – | 26 / 67 | 387 / 770 | 7,204 / 14,184 | 58,722 / 115,566 | 25,310 / 49,809 | 203,490 / 400,424 | 111,678 / 219,722 | 59,664 / 126,255 |
@@ -533,6 +551,9 @@ nDCG@10 by query kind:
 
 | Config | Rounds | Requests | KB | Ext. KB | none | lan | wifi | 4g | lte | slow-4g | 3g | lte-poor |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
+| graph ef 64, W 16 | 13.5 | 126.2 | 689 | 493 | 2.4 / 5.1 | 21 / 28 | 382 / 490 | 2,874 / 3,746 | 1,400 / 1,797 | 11,351 / 14,598 | 7,476 / 9,488 | 6,287 / 8,824 |
+| graph ef 128, W 64 | 12.0 | 338.5 | 1,538 | 1,342 | 3.4 / 4.4 | 28 / 33 | 493 / 592 | 3,521 / 4,263 | 1,882 / 2,244 | 15,401 / 18,338 | 11,414 / 13,204 | 8,741 / 10,711 |
+| graph ef 256, W 64 | 14.7 | 459.7 | 2,023 | 1,827 | 4.7 / 6.0 | 36 / 42 | 622 / 746 | 4,419 / 5,315 | 2,391 / 2,841 | 19,585 / 23,264 | 14,611 / 17,098 | 11,266 / 13,786 |
 | IVF nprobe 128, rerank 128 | 5.0 | 236.2 | 3,974 | 3,434 | 8.0 / 12 | 47 / 56 | 768 / 885 | 4,940 / 5,655 | 3,098 / 3,571 | 25,642 / 29,578 | 21,878 / 25,383 | 16,773 / 20,227 |
 | IVF nprobe 512, rerank 128 | 5.0 | 540.3 | 13,353 | 12,813 | 19 / 26 | 134 / 155 | 2,326 / 2,676 | 14,503 / 16,660 | 9,549 / 11,004 | 79,311 / 91,422 | 70,223 / 81,044 | 55,107 / 63,969 |
 | FTS5 bm25 (AND) | 354.0 | 354.0 | 1,530 | – | 26 / 67 | 387 / 770 | 7,204 / 14,184 | 58,722 / 115,566 | 25,310 / 49,809 | 203,490 / 400,424 | 111,678 / 219,722 | 59,664 / 126,255 |
@@ -554,11 +575,27 @@ nDCG@10 by query kind:
 | FTS5 (fts-bm25) | cold | lte | 25,310 | 25,310 | 25,310 | 25,310 |
 | FTS5 (fts-bm25) | cold | slow-4g | 203,490 | 203,490 | 203,490 | 203,490 |
 | FTS5 (fts-bm25) | cold | wifi | 7,204 | 7,204 | 7,204 | 7,204 |
+| dense graph (graph-ef64) | warm | 4g | 3,890 | 3,890 | 2,067 | 2,057 |
+| dense graph (graph-ef64) | warm | lte | 1,757 | 1,757 | 979 | 972 |
+| dense graph (graph-ef64) | warm | slow-4g | 14,192 | 14,192 | 7,932 | 7,880 |
+| dense graph (graph-ef64) | warm | wifi | 491 | 491 | 269 | 267 |
+| dense graph (graph-ef64) | cold | 4g | 5,145 | 5,145 | 2,888 | 2,874 |
+| dense graph (graph-ef64) | cold | lte | 2,357 | 2,357 | 1,408 | 1,400 |
+| dense graph (graph-ef64) | cold | slow-4g | 19,058 | 19,058 | 11,417 | 11,351 |
+| dense graph (graph-ef64) | cold | wifi | 654 | 654 | 384 | 382 |
 
 **Simulated versus real** (real = wall time through the shaped server; own-trace = the same run's request log simulated; pipeline = the unshaped trace of the same query simulated, which is what the tables above use). Medians over the real-run subset:
 
 | Profile | Regime | Queries | Real p50 | Pipeline p50 | Real p95 | Pipeline p95 | Median real / own-trace | Median real / pipeline | Median real − pipeline, ms (per round) | Queries ≥ 20 ms | Abs. rel. error there, median / p90 |
 |---|---|---|---|---|---|---|---|---|---|---|---|
+| 4g,h1 (dense_graph) | warm | 120 | 9,455 | 9,355 | 15,195 | 14,978 | 1.012 | 1.012 | 92.3 (10.2) | 120 | 1.2 % / 1.5 % |
+| 4g,h1 (dense_graph) | cold | 24 | 12,182 | 12,063 | 17,411 | 17,246 | 1.012 | 1.011 | 117.7 (9.3) | 24 | 1.1 % / 1.4 % |
+| 4g,h2 (dense_graph) | warm | 120 | 2,658 | 2,627 | 3,965 | 3,922 | 1.011 | 1.011 | 31.4 (3.2) | 120 | 1.1 % / 1.5 % |
+| 4g,h2 (dense_graph) | cold | 24 | 3,543 | 3,502 | 5,048 | 4,995 | 1.011 | 1.011 | 40.1 (3.1) | 24 | 1.1 % / 1.3 % |
+| lte,h1 (dense_graph) | warm | 120 | 4,316 | 4,247 | 6,928 | 6,801 | 1.016 | 1.016 | 61.5 (6.6) | 120 | 1.6 % / 2.1 % |
+| lte,h1 (dense_graph) | cold | 24 | 5,595 | 5,516 | 8,012 | 7,867 | 1.016 | 1.016 | 82.7 (6.8) | 24 | 1.6 % / 1.9 % |
+| lte,h2 (dense_graph) | warm | 120 | 1,416 | 1,394 | 2,130 | 2,086 | 1.018 | 1.019 | 26.1 (2.7) | 120 | 1.9 % / 2.5 % |
+| lte,h2 (dense_graph) | cold | 24 | 1,910 | 1,876 | 2,719 | 2,670 | 1.016 | 1.017 | 31.3 (2.4) | 24 | 1.6 % / 2.3 % |
 | 4g,h1 (dense_ivf) | warm | 80 | 6,097 | 6,038 | 11,919 | 11,734 | 1.010 | 1.010 | 63.4 (16.9) | 80 | 1.1 % / 2.0 % |
 | 4g,h1 (dense_ivf) | cold | 16 | 15,229 | 15,076 | 22,743 | 22,616 | 1.010 | 1.009 | 117.0 (23.4) | 16 | 1.0 % / 1.5 % |
 | 4g,h2 (dense_ivf) | warm | 80 | 2,732 | 2,741 | 7,474 | 7,512 | 0.995 | 0.996 | -12.0 (-5.8) | 80 | 0.7 % / 1.4 % |
