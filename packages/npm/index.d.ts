@@ -16,6 +16,24 @@ export interface OpenOptions {
   coalesceGapBytes?: number;
   /** Concurrent requests per round (default unlimited). */
   maxParallel?: number;
+  /**
+   * Request budget per round: a round needing more range requests is merged
+   * into at most this many (nearby ranges joined when the cost model says it
+   * is faster) or, with `multipart`, sent as multi-range requests. 'auto'
+   * (default): 6 in browsers over HTTP/1.x or an unknown protocol, 100 over
+   * HTTP/2 and HTTP/3, 0 (off) in Node. 0 disables.
+   */
+  maxRequests?: number | 'auto';
+  /** Cost-model latency in ms (default 100); refitted when netAutoEstimate. */
+  rttMs?: number;
+  /** Cost-model bandwidth in kbit/s (default 10000); refitted when netAutoEstimate. */
+  bandwidthKbps?: number;
+  /** Refit rttMs and bandwidthKbps from observed rounds (default true). */
+  netAutoEstimate?: boolean;
+  /** Use multi-range requests (multipart/byteranges) when over budget (default false; falls back automatically). */
+  multipart?: boolean;
+  /** Ranges per multi-range request (default 100). */
+  maxRangesPerRequest?: number;
   /** Extra request headers. */
   headers?: Record<string, string>;
   /** fetch implementation (default globalThis.fetch). */
@@ -27,7 +45,8 @@ export interface OpenOptions {
   /** WebAssembly build: 'auto' (default) picks 'jspi' where supported, else 'asyncify'. */
   variant?: Variant;
   /** Sync variant only: blocking fetch of several ranges (default: a worker from sync-fetch.mjs). */
-  fetchSync?: (url: string, offsets: number[], lengths: number[]) => { buf: Uint8Array; total: number }[];
+  fetchSync?: (url: string, offsets: number[], lengths: number[], groups?: number[][]) =>
+    { buf: Uint8Array; total: number }[] & { multipartFailed?: boolean };
   /** Extra arguments for the Emscripten module factory. */
   moduleArgs?: Record<string, unknown>;
 }
@@ -40,7 +59,15 @@ export interface VfsStats {
   cachedBlocks: number; netMs: number;
 }
 
-export interface LogEntry { offset: number; length: number; round: number; tStart: number; tEnd: number }
+/** One range; the ranges of one multi-range request share `req` within their round. */
+export interface LogEntry { offset: number; length: number; round: number; tStart: number; tEnd: number; req: number }
+
+/** Request planner state (counters since open or resetStats). */
+export interface NetState {
+  protocol: string; maxRequests: number; rttMs: number; bandwidthKbps: number;
+  multipart: boolean; netAutoEstimate: boolean; overfetchBytes: number;
+  plannedRounds: number; multipartRequests: number; multipartFailed: boolean; observedRounds: number;
+}
 
 export declare class SqliteError extends Error {
   code: number;
@@ -58,6 +85,10 @@ export declare class Database {
   query<T = Record<string, SqlValue>>(sql: string, params?: Params): Promise<T[]>;
   stats(): VfsStats | null;
   log(): LogEntry[];
+  /** Request planner state. */
+  netState(): NetState | null;
+  /** Change request planning options (omitted ones keep their value). */
+  setNetOptions(opts: Pick<OpenOptions, 'maxRequests' | 'rttMs' | 'bandwidthKbps' | 'netAutoEstimate' | 'multipart' | 'maxRangesPerRequest'>): Promise<void>;
   resetStats(opts?: { clearCache?: boolean }): Promise<void>;
   close(): Promise<void>;
 }

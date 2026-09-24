@@ -91,6 +91,24 @@ export class SqliteError extends Error {
  *   readaheadBytes  maximum sequential readahead (default 1 MiB, 0 = off)
  *   coalesceGapBytes  merge ranges of one batch separated by at most this
  *   maxParallel     concurrent requests per round (default unlimited)
+ *   maxRequests     request budget per round: a round that needs more range
+ *                   requests is merged into at most this many (nearby ranges
+ *                   joined, over-fetching the pages between them, when the
+ *                   cost model says it is faster), or sent as multi-range
+ *                   requests with `multipart`. 'auto' (default): 6 in
+ *                   browsers over HTTP/1.x (or when the protocol cannot be
+ *                   seen), 100 over HTTP/2 and HTTP/3, 0 (off) in Node,
+ *                   whose fetch has no per-host connection limit. 0 = off.
+ *   rttMs, bandwidthKbps  initial cost-model latency (default 100 ms) and
+ *                   bandwidth (default 10000 kbit/s); only their product
+ *                   (bytes worth one extra round trip) matters
+ *   netAutoEstimate refit rttMs and bandwidthKbps from the observed rounds
+ *                   (default true)
+ *   multipart       send one multi-range request (multipart/byteranges) per
+ *                   connection instead of merging ranges (default false; many
+ *                   CDNs and S3 do not support it; a server that answers 200
+ *                   or a single range is detected and single ranges are used)
+ *   maxRangesPerRequest  ranges per multi-range request (default 100)
  *   headers         extra request headers
  *   fetch           fetch implementation (default globalThis.fetch)
  *   httpCache       fetch() cache mode (default 'no-store'; other modes let
@@ -151,11 +169,43 @@ export async function open(url, opts = {}) {
     }
     const d = new Database(M, db, name, url);
     d.variant = variant;
+    d.protocol = detectProtocol(String(url));
+    let maxRequests = opts.maxRequests ?? 'auto';
+    if (maxRequests === 'auto') maxRequests = autoMaxRequests(d.protocol);
+    d._netConfig({
+      maxRequests, rttMs: opts.rttMs, bandwidthKbps: opts.bandwidthKbps,
+      multipart: opts.multipart, netAutoEstimate: opts.netAutoEstimate,
+      maxRangesPerRequest: opts.maxRangesPerRequest,
+    });
     const kib = opts.sqliteCacheKiB ?? 2048;
     await d._exec(`PRAGMA cache_size=-${kib}`);
     return d;
   });
 }
+
+const isNode = typeof process !== 'undefined' && !!process.versions?.node;
+
+/** The protocol the first request of url used ('http/1.1', 'h2', ...), if the
+ * Resource Timing API shows it (cross-origin: needs Timing-Allow-Origin). */
+function detectProtocol(url) {
+  try {
+    const abs = new URL(url, globalThis.location?.href).href;
+    const es = performance.getEntriesByName(abs);
+    for (let i = es.length - 1; i >= 0; i--) if (es[i].nextHopProtocol) return es[i].nextHopProtocol;
+  } catch {}
+  return '';
+}
+
+/** Default request budget: browsers allow 6 connections per host over
+ * HTTP/1.x; HTTP/2 and HTTP/3 multiplex (100 streams is a common limit);
+ * Node's fetch opens as many connections as needed. */
+export function autoMaxRequests(protocol) {
+  if (isNode) return 0;
+  return /^(h2|h3|http\/2|http\/3)/i.test(protocol || '') ? 100 : 6;
+}
+
+const NET_NAMES = ['maxRequests', 'rttMs', 'bandwidthKbps', 'multipart', 'netAutoEstimate',
+  'overfetchBytes', 'plannedRounds', 'multipartRequests', 'multipartFailed', 'observedRounds'];
 
 export class Database {
   constructor(M, db, name, url) {
@@ -311,23 +361,60 @@ export class Database {
     }
   }
 
+  _netConfig(o) {
+    const num = (v, d = -1) => (v === undefined || v === null ? d : Number(v));
+    const flag = (v) => (v === undefined || v === null ? -1 : v ? 1 : 0);
+    this.M._httpvfs_net_config(this.db, num(o.maxRequests), num(o.rttMs), num(o.bandwidthKbps),
+      flag(o.multipart), flag(o.netAutoEstimate), num(o.maxRangesPerRequest));
+  }
+
+  /** Change the request planning options of open() on an open database
+   * (maxRequests, rttMs, bandwidthKbps, multipart, netAutoEstimate,
+   * maxRangesPerRequest); omitted ones keep their value. */
+  setNetOptions(o) {
+    return serial(this.M, async () => {
+      const x = { ...o };
+      if (x.maxRequests === 'auto') x.maxRequests = autoMaxRequests(this.protocol);
+      this._netConfig(x);
+    });
+  }
+
+  /** Request planner state: the budget, the current cost-model estimates and
+   * counters (over-fetched bytes, rounds the planner changed, multi-range
+   * requests; since open or resetStats). */
+  netState() {
+    const M = this.M;
+    const p = M._malloc(8 * NET_NAMES.length);
+    try {
+      if (M._httpvfs_net_state(this.db, p) !== SQLITE_OK) return null;
+      const out = { protocol: this.protocol };
+      NET_NAMES.forEach((k, i) => { out[k] = M.HEAPF64[(p >> 3) + i]; });
+      out.multipart = !!out.multipart; out.netAutoEstimate = !!out.netAutoEstimate;
+      out.multipartFailed = !!out.multipartFailed;
+      return out;
+    } finally {
+      M._free(p);
+    }
+  }
+
   /**
-   * Request log: [{offset, length, round, tStart, tEnd}], times in ms from
-   * performance.now().
+   * Request log: [{offset, length, round, tStart, tEnd, req}], times in ms
+   * from performance.now(). One entry per range; the ranges of one
+   * multi-range request share `req` (the request's number in its round).
    */
   log() {
     const M = this.M;
     const n = M._httpvfs_log_count(this.db);
     if (n === 0) return [];
-    const p = M._malloc(40 * n);
+    const p = M._malloc(48 * n);
     try {
       const got = M._httpvfs_log_copy(this.db, 0, n, p);
       const out = new Array(got);
       const b = p >> 3;
       for (let i = 0; i < got; i++) {
         const F = M.HEAPF64;
-        out[i] = { offset: F[b + 5 * i], length: F[b + 5 * i + 1], round: F[b + 5 * i + 2],
-                   tStart: F[b + 5 * i + 3], tEnd: F[b + 5 * i + 4] };
+        out[i] = { offset: F[b + 6 * i], length: F[b + 6 * i + 1], round: F[b + 6 * i + 2],
+                   tStart: F[b + 6 * i + 3], tEnd: F[b + 6 * i + 4], req: F[b + 6 * i + 5] };
       }
       return out;
     } finally {

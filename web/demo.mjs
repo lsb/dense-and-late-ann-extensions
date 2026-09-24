@@ -67,14 +67,21 @@ async function openDb() {
     state.ix = null;
     resetEncoderUi();
     const t0 = performance.now();
+    const net = {};
+    // ?maxRequests=6|0|auto&multipart=1: request budget per round (see wasm/NOTES.md)
+    if (params.get('maxRequests')) net.maxRequests = params.get('maxRequests') === 'auto' ? 'auto' : Number(params.get('maxRequests'));
+    if (params.get('multipart')) net.multipart = params.get('multipart') === '1';
     const ix = await openIndex($('dbUrl').value, {
       variant: $('variant').value,
       modelCache: $('modelCache').checked,
+      ...net,
     });
     state.ix = ix;
     const s = ix.openStats;
     $('dbStatus').textContent = `${ix.variant} build; ${fmtMB(s.fileSize)} file; indexes: ${ix.indexes.map((i) => i.table).join(', ')}; ` +
-      `open ${fmtMs(performance.now() - t0)} ms, ${s.rounds} rounds, ${fmtKB(s.bytes)} KB`;
+      `open ${fmtMs(performance.now() - t0)} ms, ${s.rounds} rounds, ${fmtKB(s.bytes)} KB` +
+      (ix.net ? `; ${ix.net.protocol || 'protocol unknown'}, ${ix.net.maxRequests ? `≤ ${ix.net.maxRequests} requests per round` +
+        (ix.net.multipart ? ' (multi-range)' : '') : 'no request budget'}` : '');
     const dense = ix.indexes.filter((i) => i.kind === 'dense');
     $('denseTable').innerHTML = dense.map((i) => `<option value="${esc(i.table)}">${esc(i.table)} (${i.layout})</option>`).join('');
     updateKnobs();

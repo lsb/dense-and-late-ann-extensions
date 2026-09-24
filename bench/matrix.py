@@ -436,19 +436,29 @@ def step_trace(cfg, corpus, args):
 
 def record_trace(rec):
     """netsim Trace from a runner record: one round per VFS backend call,
-    CPU gaps between rounds from the request timestamps."""
+    CPU gaps between rounds from the request timestamps. Log entries are
+    [offset, length, round, t_start, t_end] or, from newer runners,
+    [..., req]: ranges of one multi-range request (equal req within a round)
+    become one read of their total length."""
     from netsim import simulate as sim
     log = rec.get("log") or []
     by = {}
-    for off, ln, rnd, ts, te in log:
-        by.setdefault(int(rnd), []).append((int(off), int(ln), ts, te))
+    for i, e in enumerate(log):
+        off, ln, rnd, ts, te = e[:5]
+        req = e[5] if len(e) > 5 else -1 - i
+        rs = by.setdefault(int(rnd), [])
+        if rs and req >= 0 and rs[-1][4] == req:
+            o, n, a, b, _ = rs[-1]
+            rs[-1] = (o, n + int(ln), min(a, ts), max(b, te), req)
+        else:
+            rs.append((int(off), int(ln), ts, te, req))
     reads, cpu = [], {}
     prev_end = 0.0
     for j, rnd in enumerate(sorted(by)):
         rs = by[rnd]
         start = min(r[2] for r in rs)
         cpu[j] = max(0.0, start - prev_end)
-        for off, ln, ts, te in rs:
+        for off, ln, ts, te, _ in rs:
             reads.append(sim.Read(off, ln, j, 0.0, None, len(reads)))
         prev_end = max(r[3] for r in rs)
     tail = max(0.0, rec["wall_ms"] - prev_end)

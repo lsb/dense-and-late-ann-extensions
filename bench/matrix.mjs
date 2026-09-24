@@ -103,7 +103,9 @@ async function runOne(db, run, qi, t0, regime) {
   if (err) rec.error = err;
   if (run.log) {
     rec.t0 = t0; rec.t_end = tEnd;
-    rec.log = db.log().map((r) => [r.offset, r.length, r.round, +(r.tStart - t0).toFixed(3), +(r.tEnd - t0).toFixed(3)]);
+    // [offset, length, round, tStart, tEnd, req]: ranges of one multi-range
+    // request share req within their round
+    rec.log = db.log().map((r) => [r.offset, r.length, r.round, +(r.tStart - t0).toFixed(3), +(r.tEnd - t0).toFixed(3), r.req]);
   }
   return rec;
 }

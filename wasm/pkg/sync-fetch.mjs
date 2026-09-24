@@ -34,13 +34,13 @@ export async function createSyncFetcher({ fetchHeaders } = {}) {
   await ready;   // the worker must be running before we ever block
   if (isNode) worker.unref();
 
-  function fetchSync(fileUrl, offs, lens) {
+  function fetchSync(fileUrl, offs, lens, groups) {
     const n = offs.length;
     const total = lens.reduce((a, b) => a + b, 0);
     const metaOff = 16, dataOff = 16 + 32 * n;
     const sab = new SharedArrayBuffer(dataOff + total);
     const ctrl = new Int32Array(sab, 0, 4);
-    post({ url: String(fileUrl), offs, lens, sab, metaOff, dataOff, headers: fetchHeaders });
+    post({ url: String(fileUrl), offs, lens, groups, sab, metaOff, dataOff, headers: fetchHeaders });
     Atomics.wait(ctrl, 0, 0);
     if (Atomics.load(ctrl, 0) !== 1) {
       throw new Error('httpvfs sync fetch failed: ' + new TextDecoder().decode(
@@ -56,6 +56,7 @@ export async function createSyncFetcher({ fetchHeaders } = {}) {
                  t1: meta[4 * i + 3] - performance.timeOrigin };
       p += lens[i];
     }
+    out.multipartFailed = ctrl[2] === 1;
     return out;
   }
   fetchSync.terminate = () => worker.terminate();

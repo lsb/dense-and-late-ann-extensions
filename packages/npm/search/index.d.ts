@@ -3,7 +3,8 @@ import type { IndexInfo, SearchParams, SearchResult } from './search-core.js';
 
 export type EncoderName = 'minilm' | 'lateon';
 
-export interface OpenIndexOptions extends Pick<OpenOptions, 'pageCacheBytes' | 'blockSize' | 'readaheadBytes' | 'maxParallel'> {
+export interface OpenIndexOptions extends Pick<OpenOptions, 'pageCacheBytes' | 'blockSize' | 'readaheadBytes' | 'maxParallel' |
+  'maxRequests' | 'multipart' | 'rttMs' | 'bandwidthKbps' | 'netAutoEstimate'> {
   variant?: Exclude<Variant, 'sync'>;
   /** URL of the SQLite module (default: this package's index.mjs). */
   sqliteModule?: string;

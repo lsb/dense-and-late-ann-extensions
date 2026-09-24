@@ -140,11 +140,11 @@ While speculating, uncached blocks read as zeros and are only recorded; SQLite m
 
 - **Block cache.** LRU over fixed-size blocks (default 4096 bytes; set it to the database page size or a multiple). Size from `pageCacheBytes` (JS) or `cache_kb` (URI), default 4 MiB. A read larger than the cache still works (copied straight from the fetched buffers). SQLite's own page cache sits on top (the JS API sets `PRAGMA cache_size` to 2 MiB by default).
 - **Readahead** (as in sql.js-httpvfs): when a read starts where the previous one ended, the miss is extended by 1, 2, 4, … blocks up to `readaheadBytes` (default 1 MiB, 0 disables). A full scan of the `docs` table in the 2.2 MB test database takes 12 requests (2.1 MB) instead of 336 (1.4 MB) without readahead; the extra bytes are readahead running past the end of the table.
-- **Coalescing.** Adjacent missing blocks in a batch become one request; `coalesceGapBytes` also merges ranges separated by small gaps.
+- **Coalescing.** Adjacent missing blocks in a batch become one request; `coalesceGapBytes` also merges ranges separated by small gaps. A per-round request budget (`maxRequests`, 6 over HTTP/1.1 in browsers) merges or groups the rest; see [Request budget per round](#request-budget-per-round-http11).
 - **Size discovery.** The first request (block 0, which SQLite reads first anyway) learns the file size from `Content-Range`, so opening costs one round.
 - **Read-only.** `SQLITE_IOCAP_IMMUTABLE`, writes return `SQLITE_READONLY`; a WAL-mode header is presented as rollback mode. Non-main files (temp, journals) go to the default VFS.
 - **Instrumentation.** Every request is logged as `{offset, length, round, tStart, tEnd}` (ms, `performance.now()` clock of the calling thread). `round` is the number of the backend call; the requests of one batch share a round. Counters: `requests`, `bytes`, `rounds`, `reads`, `cacheHits`, `cacheMisses`, `prefetchCalls`, `prefetchBlocks`, `specMisses`, `netMs` (wall time blocked on the network), plus `fileSize`, `blockSize`, `cacheBlocks`, `cachedBlocks`.
-- **URI parameters** (native and WASM): `cache_kb`, `block`, `readahead_kb`, `gap_kb`, `log_max`, and natively `latency_ms`.
+- **URI parameters** (native and WASM): `cache_kb`, `block`, `readahead_kb`, `gap_kb`, `log_max`, `max_req`, `rtt_ms`, `bw_kbps`, `multipart`, `max_parts`, `net_auto`, and natively `latency_ms`.
 
 Chunked databases (sql.js-httpvfs "chunked" mode) are not implemented; the backend interface would take them without changes to the C side.
 
@@ -155,11 +155,12 @@ import { open } from './wasm/pkg/index.mjs';
 const db = await open('https://host/db.sqlite', {
   pageCacheBytes: 8 << 20, blockSize: 4096, readaheadBytes: 1 << 20,
   coalesceGapBytes: 0, maxParallel: undefined, variant: 'auto',
+  maxRequests: 'auto', multipart: false,   // request budget per round, see below
 });
 await db.query('SELECT rowid FROM t_fts WHERE t_fts MATCH ? LIMIT 10', ['word']);  // [{rowid: …}]
 await db.queryRaw(sql, params);   // {columns, rows: [[…]]}
 await db.exec(sql);               // several statements, no results
-db.stats(); db.log();
+db.stats(); db.log(); db.netState();   await db.setNetOptions({ multipart: true });
 await db.resetStats({ clearCache: true });   // cold start for the next query
 await db.close();
 ```
@@ -204,6 +205,130 @@ Native is Python's `sqlite3` on the same SQLite 3.53.4 build (default VFS). WASM
 
 For short queries the cost is a fixed 0.1–0.25 ms per query in the JS wrapper and stack switching. For compute-bound work (the prefix query) Asyncify costs roughly 1.3–1.8× native, and JSPI and the sync build roughly 1.0–1.3×. Both are small next to a single mobile round trip (70–300 ms), which is why round counts, not CPU, are the thing to optimise. Raw results: `results/wasm-overhead.json` (rerun with `node wasm/bench/overhead.mjs --out …` on an idle machine for cleaner numbers).
 
+## Request budget per round (HTTP/1.1)
+
+Over HTTP/1.1 a browser runs at most six requests per host at once. A round of the dense graph (16 nodes, 7–8 rounds), of IVF (16–128 lists) or of warp (up to about 100 posting and document ranges) therefore becomes several waves of latency, and on `4g` this cost more than the dependent rounds themselves (web/NOTES.md). The VFS now plans every round against a **request budget** *C*. Extension code is unchanged: the planning happens in `hvFetchBlocks`, below every prefetch, speculation and `xRead` miss.
+
+### Design
+
+- **Input.** A round's uncached blocks, sorted, after adjacent blocks and `gap_kb` gaps have been merged into *m* ranges. If *m* ≤ *C* nothing changes.
+- **Coalescing** (the default when *m* > *C*). `httpvfs_plan()` chooses *g* contiguous requests. It minimises the estimated round time
+  *T*(*g*) = ⌈*g*/*C*⌉ · RTT + bytes(*g*) / bandwidth,
+  where bytes(*g*) is the smallest total span of *g* requests, obtained by cutting at the *g*−1 largest gaps. Between multiples of *C* the number of waves is constant and more requests fetch fewer bytes, so only *g* = *m* and *g* = *C*, 2*C*, … can be optimal. All candidates are evaluated exactly, in O(*m* log *m*); a test checks the result against brute force over every set of cuts. The total span is capped at half the block cache. Blocks fetched in the gaps are real data and go into the cache. They are inserted *before* the requested blocks, so a round never evicts its own blocks.
+- **Only RTT × bandwidth matters.** The decision depends only on the bandwidth-delay product, the number of bytes worth one extra wave. That product is similar across the profiles: 167 KB on `4g`, 105 KB on `lte`, 101 KB on `slow-4g` and 125 KB on `wifi`. The defaults (100 ms, 10 Mbit/s: 125 KB) are therefore close everywhere. Scaling the RTT given to the planner by 0.5–2× changed the simulated warm `4g` p50 by less than 1 % for graph and IVF and by at most 7 % for warp (2× was 2 % *better*: the model slightly underestimates a wave). Too-large values cost a lot, because the planner then over-fetches: 8× costs 26 % (graph) to 79 % (IVF).
+- **Online estimate** (`netAutoEstimate`, on by default). The VFS keeps the last 64 rounds that ran without client-side queueing (at most *C* requests), as pairs of bytes and wall time. The bandwidth estimate is the slope between the medians of the smaller and larger halves, used only when their sizes differ by 2× or more. The RTT estimate is a low quartile of *T* − *B*/bandwidth over the smaller half. In Chromium on `4g,h1` it converged to RTT 167–169 ms (true value 165) and 4.8–7.4 Mbit/s (true 8.1); against a localhost server it converged to 1.3 ms.
+- **Multi-range requests** (`multipart: true`, opt-in). The ranges are split in offset order into min(*C*, *m*) requests of similar byte size, each with at most `maxRangesPerRequest` (100) ranges, sent as `Range: bytes=a-b,c-d,…`. Nothing is over-fetched. The `multipart/byteranges` parser (`wasm/pkg/multipart.mjs`) takes each part's length from its `Content-Range`, so bodies that contain the boundary string are safe. It accepts parts in any order, and parts the server merged. The same module is compiled into the glue as a `--pre-js`, with its `export`s stripped, and is imported by the sync fetch worker.
+- **Fallback.** Until a URL is known to support multi-range requests, the first multi-range request of a round is sent alone:
+  - a `200` reply is aborted after its headers, so the whole file is never downloaded;
+  - on a `416`/`4xx` reply, a single range that does not cover everything, or a multipart reply that lacks some ranges, the missing ranges are fetched singly.
+
+  The URL is then marked as unsupported, shared by every connection in the module. The C side is told through a flag and switches to coalescing. The detection costs one extra round trip, once per URL.
+- **Default *C*** (`maxRequests: 'auto'`). After the open request, the Resource Timing entry's `nextHopProtocol` gives the protocol. The default is 6 for `http/1.x` or when the protocol is not visible (for example, sync-variant fetches run in a nested worker), 100 for `h2`/`h3`, and 0 (off) in Node, whose `fetch` has no per-host connection limit. The benchmark matrix, which runs in Node, is therefore unchanged. In the web demo Chromium detected `http/1.1` and used 6.
+- **API.** Options of `open()` and `openIndex()`: `maxRequests`, `rttMs`, `bandwidthKbps`, `netAutoEstimate`, `multipart`, `maxRangesPerRequest`. Runtime calls: `db.setNetOptions({...})` and `db.netState()`, which returns the budget, the estimates, over-fetched bytes, planned rounds, multi-range requests and the fallback flag. URI parameters: `max_req`, `rtt_ms`, `bw_kbps`, `multipart`, `max_parts`, `net_auto`. `PRAGMA httpvfs_stats` shows the counters. The demo page accepts `?maxRequests=0|6|auto&multipart=1`. The request log has one entry per range; `req` numbers the request within its round, so the ranges of one multi-range request share it. `bench/matrix.mjs` logs record it, and `bench/matrix.py` merges those ranges back into one read.
+- **Cross-origin caveat.** A multi-range `Range` header is not CORS-safelisted (only a single `bytes=a-b` is), so a cross-origin page sends one preflight per URL (cached for `Access-Control-Max-Age`). Same-origin hosting avoids it.
+
+### Evaluation: re-simulated matrix traces
+
+`bench/coalesce_eval.py words-10k` re-simulates the recorded queries of `build/matrix/words-10k.trace.jsonl` round by round. It uses `httpvfs_plan` from `build/native/httpvfs.so` through ctypes, so the planner is the C code itself. The simulator is netsim's, with the recorded CPU gaps kept. It covers 500 warm queries and 200 cold queries per configuration, on four configurations: FTS5 `fts-bm25`, dense graph `graph-ef64`, dense IVF `ivf-np64`, and late `warp-np8-rr64`. Each multipart part is charged 100 bytes of framing.
+
+Two effects are left out, so coalescing is evaluated slightly pessimistically:
+- the over-fetched blocks are not fed back into the cache;
+- the fixed-default and oracle RTT and bandwidth are used in place of the online estimate.
+
+Columns:
+- *h1* is `<profile>,h1` (six requests in service, FIFO); *h2* is `<profile>,h2` (100 streams).
+- *coalesce* uses the profile's RTT and bandwidth (with the defaults of 100 ms and 10 Mbit/s the results are within ±5 %; see `results/coalesce/words-10k.json`).
+- *h2 coalesce C=6* is HTTP/2 mistaken for HTTP/1.1.
+- *h2 coalesce C=100*, the HTTP/2 default, equals *h2 baseline* everywhere, because no round has more than 100 requests. It is omitted.
+
+
+**Warm** (within a session; p50 / p95 ms; requests per query; over-fetch per query with coalescing):
+
+| Profile | System | h1 baseline | h1 coalesce | h1 multipart | h2 baseline | h2, C = 6 | Requests h1: base / coal. / multi | Over-fetch |
+|---|---|---|---|---|---|---|---|---|
+| 4g | FTS5 | 0 / 169 | 0 / 169 | 0 / 169 | 0 / 169 | 0 / 169 | 0 / 0 / 0 | 0 KB |
+| 4g | dense graph | 2600 / 3251 | 2582 / 3119 | 1429 / 1809 | 1423 / 1802 | 1444 / 1935 | 65 / 64 / 35 | 40 KB |
+| 4g | dense IVF | 1128 / 1771 | 946 / 1467 | 471 / 974 | 468 / 971 | 550 / 1086 | 31 / 23 / 7 | 90 KB |
+| 4g | late warp | 2086 / 2602 | 1915 / 2325 | 628 / 954 | 622 / 948 | 735 / 1093 | 61 / 57 / 12 | 79 KB |
+| lte | dense graph | 1176 / 1450 | 1168 / 1412 | 676 / 847 | 671 / 843 | 679 / 877 | 65 / 65 / 35 | 17 KB |
+| lte | dense IVF | 513 / 782 | 436 / 663 | 236 / 451 | 234 / 449 | 267 / 479 | 31 / 25 / 7 | 50 KB |
+| lte | late warp | 954 / 1179 | 923 / 1092 | 342 / 480 | 338 / 476 | 375 / 510 | 61 / 58 / 12 | 39 KB |
+| slow-4g | dense graph | 9503 / 11698 | 9426 / 11407 | 5477 / 6861 | 5440 / 6823 | 5486 / 7106 | 65 / 65 / 35 | 16 KB |
+| slow-4g | dense IVF | 4145 / 6301 | 3531 / 5411 | 1917 / 3649 | 1899 / 3632 | 2172 / 3889 | 31 / 25 / 7 | 48 KB |
+| slow-4g | late warp | 7691 / 9492 | 7465 / 8796 | 2781 / 3881 | 2745 / 3847 | 3026 / 4142 | 61 / 58 / 12 | 37 KB |
+| wifi | dense graph | 328 / 406 | 326 / 394 | 185 / 233 | 184 / 232 | 186 / 242 | 65 / 64 / 35 | 22 KB |
+| wifi | dense IVF | 144 / 220 | 121 / 185 | 64 / 125 | 63 / 124 | 73 / 134 | 31 / 25 / 7 | 64 KB |
+| wifi | late warp | 268 / 332 | 251 / 307 | 92 / 131 | 91 / 130 | 103 / 140 | 61 / 58 / 12 | 51 KB |
+
+**Cold** (new connection per query; p50 / p95 ms; requests per query; over-fetch per query with coalescing):
+
+| Profile | System | h1 baseline | h1 coalesce | h1 multipart | h2 baseline | h2, C = 6 | Requests h1: base / coal. / multi | Over-fetch |
+|---|---|---|---|---|---|---|---|---|
+| 4g | FTS5 | 2538 / 2880 | 2538 / 2880 | 2538 / 2880 | 2538 / 2880 | 2538 / 2880 | 15 / 15 / 15 | 0 KB |
+| 4g | dense graph | 3930 / 4477 | 3929 / 4461 | 2453 / 2963 | 2446 / 2956 | 2448 / 2956 | 83 / 83 / 40 | 7 KB |
+| 4g | dense IVF | 4152 / 4409 | 3181 / 3338 | 2103 / 2147 | 2093 / 2138 | 2683 / 2825 | 94 / 42 / 16 | 580 KB |
+| 4g | late warp | 5760 / 6286 | 5328 / 5735 | 3347 / 3454 | 3337 / 3443 | 3518 / 3705 | 105 / 93 / 22 | 166 KB |
+| lte | FTS5 | 1093 / 1241 | 1093 / 1241 | 1093 / 1241 | 1093 / 1241 | 1093 / 1241 | 15 / 15 / 15 | 0 KB |
+| lte | dense graph | 1826 / 2071 | 1825 / 2065 | 1202 / 1421 | 1197 / 1417 | 1198 / 1417 | 83 / 83 / 40 | 2 KB |
+| lte | dense IVF | 1976 / 2105 | 1641 / 1747 | 1172 / 1202 | 1166 / 1196 | 1409 / 1479 | 94 / 53 / 16 | 347 KB |
+| lte | late warp | 2981 / 3213 | 2844 / 3043 | 1973 / 2046 | 1966 / 2037 | 2032 / 2136 | 105 / 96 / 22 | 94 KB |
+| slow-4g | FTS5 | 8781 / 9974 | 8781 / 9974 | 8781 / 9974 | 8781 / 9974 | 8781 / 9974 | 15 / 15 / 15 | 0 KB |
+| slow-4g | dense graph | 14780 / 16762 | 14779 / 16719 | 9762 / 11538 | 9718 / 11498 | 9739 / 11498 | 83 / 83 / 40 | 2 KB |
+| slow-4g | dense IVF | 16033 / 17083 | 13414 / 14292 | 9622 / 9875 | 9568 / 9819 | 11433 / 12094 | 94 / 54 / 16 | 325 KB |
+| slow-4g | late warp | 24310 / 26165 | 23234 / 24841 | 16226 / 16811 | 16167 / 16746 | 16702 / 17489 | 105 / 96 / 22 | 93 KB |
+| wifi | FTS5 | 312 / 354 | 312 / 354 | 312 / 354 | 312 / 354 | 312 / 354 | 15 / 15 / 15 | 0 KB |
+| wifi | dense graph | 504 / 572 | 504 / 570 | 325 / 387 | 324 / 386 | 324 / 386 | 83 / 83 / 40 | 3 KB |
+| wifi | dense IVF | 540 / 575 | 431 / 463 | 303 / 310 | 301 / 308 | 368 / 395 | 94 / 49 / 16 | 412 KB |
+| wifi | late warp | 792 / 861 | 751 / 809 | 502 / 523 | 501 / 521 | 520 / 551 | 105 / 95 / 22 | 113 KB |
+
+(Warm FTS5 is almost always answered from the cache, the same on every profile; shown for `4g` only.)
+
+- **Multi-range requests make HTTP/1.1 as fast as HTTP/2** (within 1 %) for every system and profile. The warm `4g` p50 is 2.6 → 1.4 s (graph), 1.1 → 0.47 s (IVF) and 2.1 → 0.63 s (warp). Cold p50s drop by 38–49 %.
+- **Coalescing helps where the ranges are clustered, and only there.** With merging alone, IVF is 15–16 % faster warm and 16–23 % faster cold, for 50–90 KB (warm) or 330–580 KB (cold) of over-fetch per query; warp is 3–8 % faster. The graph gains ≤ 1 %, because its 16 nodes per round lie anywhere in a 40 MB index, and merging even two of them costs more bytes than a wave is worth. The planner correctly declines. Coalescing closes 10–50 % of the gap between h1 and h2 for IVF and warp, not all of it.
+- **Guessing wrong is cheap.** Applying C = 6 on HTTP/2 costs 0–28 % (IVF most, cold). Applying no budget on HTTP/1.1 is the status quo.
+- **FTS5 is unaffected:** its rounds are single pages.
+
+### Evaluation: end to end
+
+**Node + WASM against `netsim/rangeserver.py --preset <profile>,h1.** `bench/coalesce_real.py words-10k --profiles 4g,lte` ran 20 warm and 8 cold queries per configuration and mode. Coalescing used the online estimate, starting from the defaults. Every mode returned identical top-10 lists. The table gives the p50 in ms, measured, with the prediction obtained by re-simulating the baseline run's own logs in brackets:
+
+| Profile | Regime | Config | Baseline | Coalesce | Multipart | Requests per query (base / coal. / multi) |
+|---|---|---|---|---|---|---|
+| 4g,h1 | warm | fts-bm25 | 177 (173) | 174 (173) | 176 (173) | 2 / 2 / 2 |
+| 4g,h1 | cold | fts-bm25 | 2423 (2378) | 2406 (2378) | 2417 (2378) | 14 / 14 / 14 |
+| 4g,h1 | warm | graph-ef64 | 2780 (2752) | 2745 (2712) | 1319 (1293) | 68 / 68 / 35 |
+| 4g,h1 | cold | graph-ef64 | 3974 (3932) | 3981 (3932) | 2578 (2537) | 82 / 82 / 39 |
+| 4g,h1 | warm | ivf-np64 | 1326 (1304) | 980 (1012) | 514 (503) | 41 / 25 / 8 |
+| 4g,h1 | cold | ivf-np64 | 4113 (4138) | 3175 (3142) | 2140 (2108) | 93 / 39 / 16 |
+| 4g,h1 | warm | warp-np8-rr64 | 2220 (2236) | 1967 (1917) | 635 (619) | 65 / 58 / 12 |
+| 4g,h1 | cold | warp-np8-rr64 | 6082 (6046) | 5544 (5548) | 3457 (3411) | 116 / 100 / 22 |
+| lte,h1 | warm | fts-bm25 | 77 (73) | 78 (73) | 77 (73) | 2 / 2 / 2 |
+| lte,h1 | cold | fts-bm25 | 1068 (1030) | 1051 (1030) | 1059 (1030) | 14 / 14 / 14 |
+| lte,h1 | warm | graph-ef64 | 1268 (1238) | 1242 (1235) | 647 (626) | 68 / 68 / 35 |
+| lte,h1 | cold | graph-ef64 | 1865 (1829) | 1863 (1829) | 1272 (1239) | 82 / 82 / 39 |
+| lte,h1 | warm | ivf-np64 | 599 (591) | 461 (500) | 263 (257) | 41 / 28 / 8 |
+| lte,h1 | cold | ivf-np64 | 1990 (1968) | 1648 (1618) | 1198 (1178) | 93 / 51 / 16 |
+| lte,h1 | warm | warp-np8-rr64 | 1030 (1014) | 902 (893) | 347 (336) | 65 / 61 / 12 |
+| lte,h1 | cold | warp-np8-rr64 | 3149 (3115) | 2964 (2942) | 2053 (2020) | 116 / 100 / 22 |
+
+The simulator predicts real multipart and coalesce times within 2–4 %. The exception is warm coalescing on IVF, where the real run is 5–8 % *faster* than predicted: the over-fetched blocks it caches are hit by later queries, an effect the re-simulation leaves out.
+
+**Chromium (Playwright, JSPI worker) with the web demo** (`web/test/profile_run.mjs --profiles '4g,h1' --queries 11 --setup-unshaped`). The page and the encoders loaded unshaped; then the profile was switched and the database reopened. Medians are over 10 queries after the first:
+
+| `4g,h1`, Chromium | FTS5 (+ docs) | Dense graph | Late warp | Requests per query (graph / warp) | Estimate at the end |
+|---|---|---|---|---|---|
+| no budget (before) | 0.92 s | 3.48 s | 3.42 s | 81 / 95 | — |
+| auto = 6, coalescing | 0.92 s | 3.33 s | 2.98 s | 80 / 86 | 167 ms, 4.8 Mbit/s |
+| 6, multi-range | 0.74 s | 1.82 s | 1.02 s | 40 / 18 | 169 ms, 7.4 Mbit/s |
+
+`node --test web/test/web.test.mjs` passes with the default (`auto`: `http/1.1`, 6). Its results equal the native build's row for row. On the unshaped server the planner never merged anything: the estimated RTT was about 1 ms, so the bandwidth-delay product was tiny.
+
+### Recommendation
+
+- Keep `maxRequests: 'auto'` (on by default in browsers).
+- Serve over HTTP/2 where possible.
+- On an HTTP/1.1 host that supports multi-range requests (nginx, Apache, Caddy and netsim do), turn on `multipart: true`. It is the only way to reach HTTP/2 latency over six connections. When the server lacks support, the fallback costs one round trip once.
+
 ## Things learned on the way
 
 - **Chromium serialises parallel range requests for the same URL** unless `fetch()` uses `cache: 'no-store'`: its HTTP cache takes a per-URL lock while an entry is being written. With the default cache mode, 16 "parallel" requests completed one after another (430 ms instead of about 60 ms). Both backends now default to `no-store` (option `httpCache`).
@@ -215,6 +340,8 @@ For short queries the cost is a fixed 0.1–0.25 ms per query in the JS wrapper 
 
 - `make test-native`: Python against `build/native` (FTS5 results equal to the default VFS, read-only, speculative batching with simulated latency, `PRAGMA httpvfs_stats`).
 - `make test-node`: `node --test wasm/test/node.test.mjs`. Builds `build/test/fts-test.db` natively (4,000 40-word documents from the project word list, FTS5 index, a blob table), serves it with `netsim/rangeserver.py` in a child process (or `wasm/test/rangeserver.mjs` if netsim is absent), and for the asyncify and sync builds checks FTS5 results against the native CLI, the log/counter invariants, speculative batching (at most 4 rounds, at least 8 requests in one round, overlapping in time), readahead on a full scan, parameters and blobs, errors, and serialisation of concurrent queries.
+- `make test-node` also runs `wasm/test/coalesce.test.mjs`. It unit-tests `multipart.mjs`: `Content-Range` and boundary parsing, bodies with CRLF and LF line ends, and bodies containing the boundary string. It tests `hvFetchMultiRange` against a fake server that answers multipart (reordered, merged parts), one covering range, only the first range, 200 (the body must be cancelled) or 416. Against netsim limited to six concurrent requests, for asyncify and sync, it checks that baseline, coalescing and multi-range runs return identical rows with at most 6 requests per round. It checks the fallback against `wasm/test/rangeserver.mjs --multi refuse|ignore|first`: exactly one multi-range request is ever sent, and the results are correct. It also checks the online RTT and bandwidth estimate.
+- `make test-native` also checks `httpvfs_plan` (ctypes on `httpvfs.so`) against brute force over every set of cuts for 300 random rounds, the multi-range grouping invariants, and `max_req` natively: at most 6 requests per round, over-fetch counted and cached, and results unchanged.
 - `make test-browser`: the same checks in a Chromium Worker via Playwright for asyncify (with and without cross-origin isolation), jspi, auto (must pick jspi) and sync.
 
 ## Open issues
@@ -224,4 +351,4 @@ For short queries the cost is a fixed 0.1–0.25 ms per query in the JS wrapper 
 - No native HTTP backend: native runs read a local file and simulate latency per round. A libcurl-multi backend would let native benchmarks run through `netsim`.
 - Speculation relies on SQLite tolerating zero-filled pages (it reports `SQLITE_CORRUPT` and moves on). It is tested for rowid lookups; extensions that speculate through virtual tables should test their own paths, and should cap passes (the demo caps at 16).
 - The WASM build is single-threaded (`THREADSAFE=0`, no `-pthread`): pthread calls in extension code (for example `ext/dense/hnsw.c`) link against Emscripten's stubs, so index construction belongs in the native build.
-- Chunked databases, a `maxParallel` default tuned for HTTP/1.1 (six connections), and an eviction policy that pins blocks of the current batch are not done.
+- Chunked databases and an eviction policy that pins blocks of the current batch are not done. (The HTTP/1.1 connection limit is handled by the request budget.)
