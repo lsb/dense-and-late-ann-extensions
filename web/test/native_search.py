@@ -26,6 +26,7 @@ import build_db  # noqa: E402
 
 req = json.load(sys.stdin)
 db = build_db.connect(req["db"])  # loads dense_ann and late_plaid
+db.load_extension(str(NATIVE / "ext" / "fts5rank"))  # bm25c() for the default FTS ranking
 out = []
 for q in req["queries"]:
     args = list(q["args"])

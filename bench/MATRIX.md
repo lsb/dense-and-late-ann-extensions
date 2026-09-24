@@ -76,6 +76,17 @@ python3 bench/matrix.py report
 - **The dense exhaustive baseline (`exact=1`) reads its vector table one page per round** (2,006 rounds per query at 10k): the scan is neither prefetched nor detected as sequential by readahead. It is a baseline for quality only; over a network it would need batching.
 - **Cold starts are dominated by static data.** Late interaction's centroid table (1.7 MB at K = 16,384) makes its first query 2.5–3.5 s on 4g even though a warm warp query is 0.2 s.
 
+## FTS5 ranking
+
+FTS5's `bm25()` reads one `fts_docsize` row per matching document, one round trip each: 685 rounds for a cold single-word query at 1M. The client therefore ranks with `bm25c()` (`ext/fts5rank`, bm25 at the average document length) by default. The configuration `fts-bm25c-or` measures it next to `fts-bm25-or` in future matrix runs. The current `results/matrix/` tables predate it and show `bm25()`.
+
+The comparison of ranking methods is not part of the matrix:
+
+- `bench/fts5_rank.py quality|cost|report` compares bm25, bm25c, bm25-rerank, bm25-prefetch and rowid order on quality, cold and warm rounds and bytes, and simulated and real 4G/LTE latency, through `web/lib/search-core.mjs` in the WASM build;
+- `bench/fts5_options.py` compares the FTS5 table options.
+
+Results are in `results/fts5-rank/*.json`, write-up in `docs/fts5-httpvfs.md`.
+
 ## Caveats
 
 - The machine was shared with an LLM generation job and other agents' builds (load average 8–11 during these runs), so CPU gaps in the traces, and hence the `none` and `lan` latencies, are pessimistic. Round, request and byte counts are exact.

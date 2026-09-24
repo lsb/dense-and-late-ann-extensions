@@ -82,6 +82,14 @@
       "sql": "SELECT rowid AS id FROM {table} WHERE {table} MATCH :q ORDER BY rank LIMIT :k"
     },
     {
+      "id": "fts-bm25c-or",
+      "index": "fts",
+      "input": "fts_or",
+      "label": "FTS5 bm25c (OR)",
+      "sql": "SELECT rowid AS id FROM {table} WHERE {table} MATCH :q AND rank MATCH 'bm25c()' ORDER BY rank LIMIT :k",
+      "ref": "fts-bm25-or"
+    },
+    {
       "id": "fts-unranked",
       "index": "fts",
       "input": "fts_and",

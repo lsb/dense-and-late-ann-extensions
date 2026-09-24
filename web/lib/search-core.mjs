@@ -21,7 +21,15 @@ function delta(a, b) {
 
 /** Default query parameters per index kind (see the extensions' NOTES.md). */
 export const DEFAULT_PARAMS = {
-  fts: { mode: 'or' },
+  // rank: 'bm25c' (default) ranks with ext/fts5rank's bm25c(): bm25 with
+  // every document at the average length, which reads no per-document
+  // lengths; 'bm25' is FTS5's built-in bm25() (exact, but one %_docsize row,
+  // i.e. one sequential round trip, per matching document); 'bm25-prefetch'
+  // is the exact bm25() after fetching those rows in one batch;
+  // 'bm25-rerank' re-scores bm25c's top 50 with their stored lengths (exact
+  // bm25 formula on the candidates); 'none' is rowid order. See
+  // docs/fts5-httpvfs.md.
+  fts: { mode: 'or', rank: 'bm25c' },
   'dense:graph': { ef: 64, beam: 16, rerank: 2 },
   'dense:ivf': { nprobe: 16, rerank_k: 64, rerank: 2 },
   late: { nprobe: 8, layout: 'warp', stoplist: 0.02, rerank: 64 },
@@ -86,11 +94,19 @@ export function ftsQuery(text, mode = 'or') {
   return uniq.map((w) => `"${w}"`).join(mode === 'and' ? ' AND ' : ' OR ');
 }
 
+/** FTS5 ranking methods (params.rank); see DEFAULT_PARAMS. */
+export const FTS_RANKS = ['bm25c', 'bm25', 'bm25-prefetch', 'bm25-rerank', 'none'];
+
 /** The SQL of one search: {sql, extra} where extra are parameters after ?1. */
 export function buildSql(ix, k, params) {
   const t = q(ix.table);
   if (ix.kind === 'fts') {
-    return { sql: `SELECT rowid AS id, rank AS score FROM ${t} WHERE ${t} MATCH ?1 ORDER BY rank LIMIT ${intParam(k, 'k')}` };
+    const rank = params.rank || 'bm25';
+    if (!FTS_RANKS.includes(rank)) throw new Error(`unknown FTS rank ${rank} (use ${FTS_RANKS.join(', ')})`);
+    const lim = `LIMIT ${intParam(k, 'k')}`;
+    if (rank === 'none') return { sql: `SELECT rowid AS id, NULL AS score FROM ${t} WHERE ${t} MATCH ?1 ${lim}` };
+    if (rank === 'bm25c') return { sql: `SELECT rowid AS id, rank AS score FROM ${t} WHERE ${t} MATCH ?1 AND rank MATCH 'bm25c()' ORDER BY rank ${lim}` };
+    return { sql: `SELECT rowid AS id, rank AS score FROM ${t} WHERE ${t} MATCH ?1 ORDER BY rank ${lim}` };
   }
   if (ix.kind === 'dense') {
     const allowed = ix.layout === 'ivf' ? ['nprobe', 'rerank_k', 'rerank', 'exact'] : ['ef', 'beam', 'rerank', 'exact'];
@@ -148,21 +164,74 @@ export class SearchDb {
   }
 
   /**
+   * Fetch the %_docsize rows of documents `ids` in one batch with
+   * httpvfs_warm (speculative batching: about one round per uncached b-tree
+   * level), so that later per-row length lookups hit the cache.
+   */
+  async warmDocsizes(ix, ids) {
+    if (!ids.length) return false;
+    const lookup = `SELECT sz FROM ${q(ix.table + '_docsize')} WHERE id = ?`;
+    try { await this.db.query('SELECT httpvfs_warm(?, ?)', [lookup, ids.map((x) => intParam(x, 'id')).join(',')]); } catch { return false; }
+    return true;
+  }
+
+  /**
+   * Run one FTS5 query with the ranking method params.rank (FTS_RANKS):
+   *  bm25-prefetch: list the matching rowids (reads only the doclists), fetch
+   *    their %_docsize rows in one batch, then run bm25() on a warm cache; the
+   *    batch is skipped when more than params.prefetchCap (4000) documents
+   *    match, since the rows would not fit the block cache.
+   *  bm25-rerank: the top params.rerankDepth (50) documents by bm25c(), their
+   *    %_docsize rows in one batch, then those candidates re-scored with the
+   *    exact bm25 formula (bm25dl() with the stored length).
+   * Returns {res, sql, ext}.
+   */
+  async ftsRun(ix, arg, k, params) {
+    const { db } = this;
+    const t = q(ix.table);
+    const rank = params.rank;
+    if (rank === 'bm25-prefetch') {
+      const cap = intParam(params.prefetchCap ?? 4000, 'prefetchCap');
+      const ids = (await db.queryRaw(`SELECT rowid FROM ${t} WHERE ${t} MATCH ?1 LIMIT ${cap + 1}`, [arg])).rows.map((r) => r[0]);
+      const warmed = ids.length <= cap && await this.warmDocsizes(ix, ids);
+      const { sql } = buildSql(ix, k, params);
+      return { res: await db.queryRaw(sql, [arg]), sql, ext: { matches: ids.length, warmed } };
+    }
+    if (rank === 'bm25-rerank') {
+      const depth = Math.max(intParam(params.rerankDepth ?? 50, 'rerankDepth'), intParam(k, 'k'));
+      const cand = (await db.queryRaw(buildSql(ix, depth, { ...params, rank: 'bm25c' }).sql, [arg])).rows.map((r) => r[0]);
+      if (!cand.length) return { res: { columns: ['id', 'score'], rows: [] }, sql: null, ext: { candidates: 0 } };
+      const warmed = await this.warmDocsizes(ix, cand);
+      const list = cand.map((x) => intParam(x, 'id')).join(',');
+      // The candidate test sits in the select list, not in WHERE, so that it is
+      // not handed to FTS5 as a rowid constraint (one xFilter per value).
+      const sql = `SELECT id, score FROM (SELECT rowid AS id, CASE WHEN rowid IN (${list}) THEN `
+        + `bm25dl(${t}, (SELECT sz FROM ${q(ix.table + '_docsize')} WHERE id = ${t}.rowid)) END AS score `
+        + `FROM ${t} WHERE ${t} MATCH ?1) WHERE score IS NOT NULL ORDER BY score LIMIT ${intParam(k, 'k')}`;
+      return { res: await db.queryRaw(sql, [arg]), sql, ext: { candidates: cand.length, warmed } };
+    }
+    const { sql } = buildSql(ix, k, params);
+    return { res: await db.queryRaw(sql, [arg]), sql, ext: null };
+  }
+
+  /**
    * One search. `system` or `table` names the index; FTS takes `text`, dense
    * and late take `vector` (Float32Array: [384] for MiniLM, [n × 48] for
    * LateOn). `params` are the extension's query parameters; missing ones take
    * DEFAULT_PARAMS. Returns {rows: [{id, score, text}], ext, sql, stats}.
    */
-  async search({ system, table, text, vector, k = 10, params = {}, cold = false, fetchDocs = true, ftsMode = 'or' }) {
+  async search({ system, table, text, match, vector, k = 10, params = {}, cold = false, fetchDocs = true, ftsMode = 'or' }) {
     const { db } = this;
     const ix = table ? this.indexes.find((i) => i.table === table) : this.resolve(system || 'fts');
     if (!ix) throw new Error(`no index ${table}`);
     params = { ...DEFAULT_PARAMS[paramsKey(ix)], ...params };
+    if (ix.kind === 'fts' && this.noBm25c && /^bm25-?(c|rerank)$/.test(params.rank)) params.rank = 'bm25';
     if (cold) await db.resetStats({ clearCache: true });
-    const { sql, extra = [] } = buildSql(ix, k, params);
+    let { sql, extra = [] } = buildSql(ix, k, params);
     let arg;
     if (ix.kind === 'fts') {
-      arg = ftsQuery(text, params.mode || ftsMode);
+      // `match`: a ready FTS5 expression (benchmarks); else built from `text`.
+      arg = match ?? ftsQuery(text, params.mode || ftsMode);
       if (!arg) return { table: ix.table, kind: ix.kind, rows: [], sql, match: arg, stats: {} };
     } else {
       if (!(vector instanceof Float32Array)) throw new Error(`${ix.table}: vector must be a Float32Array`);
@@ -170,12 +239,24 @@ export class SearchDb {
     }
     const s0 = db.stats();
     const t0 = performance.now();
-    const res = await db.queryRaw(sql, [arg, ...extra]);
+    let res, ext = null;
+    if (ix.kind === 'fts') {
+      try {
+        ({ res, sql, ext } = await this.ftsRun(ix, arg, k, params));
+      } catch (e) {
+        // A SQLite build without ext/fts5rank: fall back to the built-in bm25().
+        if (!/no such function: bm25(c|dl)|bm25c|bm25dl/.test(String(e.message || e)) || params.rank === 'bm25') throw e;
+        this.noBm25c = true;
+        params.rank = 'bm25';
+        ({ res, sql, ext } = await this.ftsRun(ix, arg, k, params));
+      }
+    } else {
+      res = await db.queryRaw(sql, [arg, ...extra]);
+    }
     const t1 = performance.now();
     const s1 = db.stats();
     const ci = Object.fromEntries(res.columns.map((c, i) => [c, i]));
     const rows = res.rows.map((r) => ({ id: r[ci.id], score: r[ci.score] }));
-    let ext = null;
     if (ci.stats !== undefined && res.rows.length) {
       try { ext = JSON.parse(res.rows[0][ci.stats]); } catch { ext = res.rows[0][ci.stats]; }
     }

@@ -195,7 +195,7 @@ test: test-native test-node test-browser
 test-native: native
 	LD_LIBRARY_PATH=$(NATIVE_DIR) python3 wasm/test/test_native.py
 test-node: native wasm
-	$(NODE) --test wasm/test/node.test.mjs
+	$(NODE) --test wasm/test/node.test.mjs web/test/search-core.test.mjs
 test-browser: native wasm
 	$(NODE) --test wasm/test/browser.test.mjs
 
