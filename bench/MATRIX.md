@@ -67,6 +67,10 @@ Index parameters at 1M:
 - **Dense:** same parameters as at 10k (nlist = 4√N = 4,000).
 - **Quality:** measured on 250 queries per kind (`max_per_kind`). Exhaustive rows are skipped (`skip_exhaustive`). Float-exact MaxSim is not computed above 60 M token vectors, so late R@10-vs-exact is empty at 1M.
 
+**Client cache at 1M.** The WASM client opens words-1m with a 64 MiB VFS block cache (`corpora.words-1m.open` in the config) instead of the default 4 MiB. At 1M a single query can prefetch more than the default cache allows in one round (the VFS caps a round at half the cache). IVF nprobe 128 reads about 870 pages (3.5 MB), and warp nprobe 32 about 3.8 MB. The overflow was evicted before use and fetched again page by page. With 4 MiB the VFS counted 110 rounds for IVF nprobe 128, although the extension issued 2, with no hint misses or fallbacks. With 16 MiB it counted 16 rounds, and with 64 MiB 1.9 rounds, which also cut the bytes from 3.6 to 2.0 MB. A browser deployment at this scale needs the larger cache too. The per-corpus sets at 10k and below stay within 4 MiB per query and use the default. Ranked FTS5 (bm25) at 1M needs 250–900 rounds per query whatever the cache size: that is the known sequential `fts_docsize` lookup, and bm25c avoids it.
+
+The words-1m real runs use 20 queries per kind warm and 4 cold (`real_per_kind`), because cold bm25 alone takes about two minutes per query on `4g`.
+
 Recipe, by hand:
 
 ```sh

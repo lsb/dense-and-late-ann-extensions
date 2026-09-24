@@ -17,7 +17,11 @@
       "queries": "data/queries/words-1m.jsonl",
       "emb": "words-1m",
       "max_per_kind": 250,
-      "skip_exhaustive": true
+      "skip_exhaustive": true,
+      "open": {
+        "pageCacheBytes": 67108864
+      },
+      "real_per_kind": 20
     },
     "llm-100": {
       "text": "data/corpora/llm-100.txt",

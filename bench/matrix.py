@@ -142,6 +142,12 @@ def session_prefix(cfg, meta, per_kind, exhaustive=False):
     return out
 
 
+def open_opts(cfg, corpus):
+    """Per-corpus options for the WASM open() (matrix_config corpora.*.open), e.g. a
+    larger VFS block cache at 1M, where one query's prefetch exceeds the default 4 MiB."""
+    return cfg["corpora"].get(base(corpus), {}).get("open", {})
+
+
 def query_set(cfg, meta, c):
     if c.get("exhaustive"):
         return interleave_kinds(meta, cfg["run"]["exhaustive_max_queries"] // 2)
@@ -431,7 +437,7 @@ def step_trace(cfg, corpus, args):
         parts = [BUILD / f"{corpus}.trace.part{i}.jsonl" for i in range(len(halves))]
         t = time.time()
         with ThreadPoolExecutor(len(halves)) as ex:
-            futs = [ex.submit(run_node, {"url": f"{srv.base}/{man['file']}", "queries": str(QDIR / f"{base(corpus)}.json"),
+            futs = [ex.submit(run_node, {"url": f"{srv.base}/{man['file']}", "queries": str(QDIR / f"{base(corpus)}.json"), "open": open_opts(cfg, corpus),
                                          "phases": [{"runs": h}]}, p) for h, p in zip(halves, parts)]
             for f in futs:
                 f.result()
@@ -546,6 +552,7 @@ def step_real(cfg, corpus, args):
         p = spec.split(",")[0]
         slow = p in run["slow_profiles"]
         per_kind = run["real_per_kind_slow"] if slow else run["real_per_kind"]
+        per_kind = min(per_kind, cfg["corpora"].get(base(corpus), {}).get("real_per_kind", per_kind))
         runs = []
         for c in confs:
             if c.get("exhaustive") and p not in fast:
@@ -564,7 +571,7 @@ def step_real(cfg, corpus, args):
         out = BUILD / f"{corpus}.real.{spec.replace(',', '_')}{tag}.jsonl"
         t = time.time()
         try:
-            run_node({"url": f"{srv.base}/{man['file']}", "queries": str(QDIR / f"{base(corpus)}.json"),
+            run_node({"url": f"{srv.base}/{man['file']}", "queries": str(QDIR / f"{base(corpus)}.json"), "open": open_opts(cfg, corpus),
                       "phases": [{"profile": None, "runs": runs}]}, out)
         finally:
             srv.close()
