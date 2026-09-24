@@ -36,27 +36,37 @@ The only difference is that the combined schema occupies a second page, which th
 
 **Simulated latency for all queries, real latency for a subset.** Every query's request log is recorded against the unshaped server with timestamps, so the CPU time between rounds (WASM, Asyncify) is known; the log is turned into a netsim trace (one round per backend call) and simulated under every profile with `h1` and `h2`. The real-network runs use the same runner against a server shaped with each profile (one server per profile, four profiles at a time) on 50 queries per kind (10 on `slow-4g`, `3g`, `lte-poor`) warm and a fifth of that cold; exhaustive configurations run for real only on `none`, `lan` and `wifi`. The report compares the real wall times with the pipeline estimate for the same queries.
 
-## Recipes for the remaining corpora
+## Corpora
 
-The inputs for `words-1m` (MiniLM and LateOn embeddings) and for the LLM corpora (`data/corpora/llm-{100,10k}.txt`, `data/queries/llm-{100,10k}.jsonl`, embeddings `data/emb/llm-10k.*`) are still being produced. Once they exist:
+| Corpus | Status | Notes |
+|---|---|---|
+| words-100, words-10k | complete: quality, traces, simulation, real runs on all 8 profiles × h1/h2 | |
+| llm-100 | complete, as above | 200 queries: 100 `word`, 100 `llmq` |
+| llm-10k | quality, traces and simulation complete; real runs on `4g` and `lte` | 20,000 queries in the set; the first 1,000 of each kind are evaluated (`max_per_kind` in the config) |
+| words-1m | recipe below | embeddings still being encoded |
+
+The LLM query kinds: `word` is the word the paragraph was written about; `llmq` is the model's own search query for it (the `contains_word` flag records whether the model used the word anyway; the report does not yet break results down by it).
+
+## Recipe for words-1m
+
+Once `data/emb/words-1m.minilm.npy` and `data/emb/words-1m.lateon.*` exist:
 
 ```sh
-# LLM corpora (after scripts/make_llm_corpus.py and
-#   python3 -m enc.encode_corpus data/corpora/llm-10k.txt --model both --name llm-10k)
-python3 tools/build_db.py llm-10k && python3 tools/build_db.py llm-100   # llm-100 uses the first 100 llm-10k vectors
-python3 tools/encode_queries.py llm-100 llm-10k
-python3 bench/matrix.py all llm-100 llm-10k
-
-# words-1m (after enc.encode_corpus data/corpora/words-1m.txt --model both)
 python3 tools/build_db.py words-1m          # hours: late K = 65,536 with fast_assign, graph build
 python3 tools/encode_queries.py words-1m
 python3 bench/matrix.py quality words-1m    # float-exact MaxSim is skipped above 60 M token vectors
 python3 bench/matrix.py trace words-1m && python3 bench/matrix.py sim words-1m
-python3 bench/matrix.py real words-1m --parallel 4
+python3 bench/matrix.py real words-1m --parallel 4 --profiles 4g,lte
 python3 bench/matrix.py report
 ```
 
-Expected cost at 1M, from the extension notes: database of roughly 4 GB (graph) + 0.3 GB (IVF, with f16 vectors 0.8 GB) + 3.9 GB (late, both layouts) + 0.7 GB (docs and FTS5), about 9–10 GB in one file, so disk must be freed first (the words-1m LateOn input alone is 10.7 GB). If that is too large, build the late index with `layout=warp` or split per index (`--split`), which the attribution check above shows gives the same costs. The exhaustive configurations should be dropped at 1M (their quality run is capped automatically; their cost runs read the whole index per query).
+Expected cost at 1M, from the extension notes: roughly 4 GB (graph) + 0.9 GB (IVF with float16 vectors) + 3.9 GB (late, both layouts) + 0.7 GB (docs and FTS5), about 9–10 GB in one file. Disk must therefore be freed first; the words-1m LateOn input alone is 10.7 GB. If that is too large, build the late index with `layout=warp` (per-corpus override in the config) or build per index with `--split`, which the attribution check above shows gives the same costs. The exhaustive configurations should be removed for 1M (`"exhaustive"` rows): their cost runs read the whole index per query, and the dense one does so one page per round (below). With 1,000 queries per kind and cold subsets of 200, the trace step is about 30 minutes at 10k and will be dominated by the graph and late configurations at 1M.
+
+## Findings worth knowing when reading the tables
+
+- **Warm sessions cache a lot.** At 10k the VFS block cache (4 MiB) holds a large share of the smaller indexes after a few hundred queries: FTS5 needs 0.2–0.3 rounds per warm query, and at llm-10k the warp posting stream (about 8 MB) is served almost entirely from cache (3 KB transferred against 125 KB read by the extension). The *Ext. KB* column shows the extension's own reads before the cache.
+- **The dense exhaustive baseline (`exact=1`) reads its vector table one page per round** (2,006 rounds per query at 10k): the scan is neither prefetched nor detected as sequential by readahead. It is a baseline for quality only; over a network it would need batching.
+- **Cold starts are dominated by static data.** Late interaction's centroid table (1.7 MB at K = 16,384) makes its first query 2.5–3.5 s on 4g even though a warm warp query is 0.2 s.
 
 ## Caveats
 

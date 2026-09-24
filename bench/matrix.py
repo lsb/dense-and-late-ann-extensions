@@ -574,6 +574,9 @@ def aggregate(cfg, corpus):
                   "latency": {}}
             if regime == "warm":
                 rr["rounds_p95"] = pct([r["rounds"] for r in recs], 95)
+            eb = [r["ext"]["bytes"] for r in recs if isinstance(r.get("ext"), dict)
+                  and isinstance(r["ext"].get("bytes"), (int, float))]
+            rr["ext_kb"] = float(np.mean(eb)) / 1024 if eb else None   # read by the extension, before the VFS cache
             for j, s in enumerate(specs):
                 xs = [r["ms"][j] for r in recs]
                 rr["latency"][s] = {"p50": pct(xs, 50), "p95": pct(xs, 95), "mean": float(np.mean(xs))}
@@ -706,8 +709,8 @@ def md_corpus(cfg, r):
             specs = [f"{p},{conc}" for p in prof]
             L.append(f"**{title}, {conc}** ({'HTTP/2-like, 100 concurrent requests' if conc == 'h2' else 'HTTP/1.1, 6 connections'}); "
                      "p50 / p95 simulated latency in ms from the recorded traces:\n")
-            L.append("| Config | Rounds | Requests | KB | " + " | ".join(prof) + " |")
-            L.append("|---|---|---|---|" + "---|" * len(prof))
+            L.append("| Config | Rounds | Requests | KB | Ext. KB | " + " | ".join(prof) + " |")
+            L.append("|---|---|---|---|---|" + "---|" * len(prof))
             for c in r["configs"]:
                 d = c.get(regime)
                 if not d:
@@ -716,7 +719,8 @@ def md_corpus(cfg, r):
                 for s in specs:
                     lt = d["latency"].get(s)
                     cells.append(f"{ms(lt['p50'])} / {ms(lt['p95'])}" if lt else "–")
-                L.append(f"| {c['label']} | {d['rounds']:.1f} | {d['requests']:.1f} | {d['kb']:,.0f} | " + " | ".join(cells) + " |")
+                ek = "–" if d.get("ext_kb") is None else f"{d['ext_kb']:,.0f}"
+                L.append(f"| {c['label']} | {d['rounds']:.1f} | {d['requests']:.1f} | {d['kb']:,.0f} | {ek} | " + " | ".join(cells) + " |")
             L.append("")
     sv = r.get("sim_vs_real")
     if sv:

@@ -3,6 +3,7 @@ import html as H
 import math
 import time
 
+HEADLINE = ("fts-bm25-or", "graph-ef64", "ivf-np64", "warp-np8", "warp-np8-rr64", "late-exact")
 FAMILY = {"FTS5": 0, "dense graph": 1, "dense IVF": 1, "late": 2}
 SHAPE = {"FTS5": "circle", "dense graph": "circle", "dense IVF": "square", "late": "circle"}
 
@@ -38,7 +39,7 @@ def readme(cfg, results, md_corpus):
              "overlap of the top 10 with the system's own exact search: float32 cosine over the MiniLM vectors, "
              "float MaxSim over the float16 LateOn token vectors, and bm25 over all matches for FTS5.")
     L.append("- **Costs** are the WASM VFS's counters per query: *rounds* (dependent batches of parallel range "
-             "requests), *requests* and *KB* transferred. *Warm*: one connection answers every query in turn "
+             "requests), *requests* and *KB* transferred. *Ext. KB* is what the vector extension itself read per query, according to its own `stats` (before the VFS block cache), so the difference from *KB* is the effect of caching across queries in the session. *Warm*: one connection answers every query in turn "
              "after one warm-up query, with the default 4 MiB block cache, so per-connection static data "
              "(PQ codebooks, entry set, IVF centroids, late centroids) is already loaded and pages repeated "
              "across queries are cache hits. *Cold*: a new connection per query, so the numbers include "
@@ -51,6 +52,27 @@ def readme(cfg, results, md_corpus):
     L.append("- Exhaustive rows read the whole index and are measured on at most "
              f"{cfg['run']['exhaustive_max_queries']} queries for costs; their quality uses all queries.")
     L.append("- Profiles: " + ", ".join(f"`{p}`" for p in cfg["profiles"]) + " (see `netsim/NOTES.md`).")
+    L.append("")
+    L.append("## Headline")
+    L.append("")
+    L.append("One configuration per method, all corpora. Latency is the simulated p50 on `4g` (165 ms, 8.1 Mbit/s) "
+             "with HTTP/2-like concurrency; *warm* is a query within a session, *cold* a first query on a new "
+             "connection.")
+    L.append("")
+    L.append("| Corpus | Config | Index MB | nDCG@10 | AUC@100 | Warm rounds | Warm KB | Warm p50 ms | Warm p95 ms | Cold KB | Cold p50 ms |")
+    L.append("|---|---|---|---|---|---|---|---|---|---|---|")
+    for r in results:
+        for c in r["configs"]:
+            if c["id"] not in HEADLINE:
+                continue
+            q = (c.get("quality") or {}).get("all", {})
+            w, co = c.get("warm") or {}, c.get("cold") or {}
+            lw = (w.get("latency") or {}).get("4g,h2", {})
+            lc = (co.get("latency") or {}).get("4g,h2", {})
+            n = lambda v, d=0: "–" if v is None else f"{v:,.{d}f}"  # noqa: E731
+            L.append(f"| {r['corpus']} | {c['label']} | {n((c.get('index_bytes') or 0) / 1e6, 1)} | "
+                     f"{n(q.get('ndcg@10'), 3)} | {n(q.get('auc@100'), 3)} | {n(w.get('rounds'), 1)} | {n(w.get('kb'))} | "
+                     f"{n(lw.get('p50'))} | {n(lw.get('p95'))} | {n(co.get('kb'))} | {n(lc.get('p50'))} |")
     L.append("")
     L.append("## Query encoding time")
     L.append("")
