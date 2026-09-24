@@ -1,0 +1,219 @@
+{
+  "_doc": "Configuration of the benchmark matrix. 'indexes' says what tools/build_db.py puts into a corpus database; 'configs' says how bench/matrix.py queries it. A config runs only if its index is present in the database manifest, so a new layout drops in by adding one index entry and its configs. Values under 'per_corpus' override an index's params for that corpus. SQL uses named parameters :q (query text or float32 blob) and :k; {table} is the index's table name.",
+  "page_size": 4096,
+  "corpora": {
+    "words-100": {
+      "text": "data/corpora/words-100.txt",
+      "queries": "data/queries/words-100.jsonl",
+      "emb": "words-100"
+    },
+    "words-10k": {
+      "text": "data/corpora/words-10k.txt",
+      "queries": "data/queries/words-10k.jsonl",
+      "emb": "words-10k"
+    },
+    "words-1m": {
+      "text": "data/corpora/words-1m.txt",
+      "queries": "data/queries/words-1m.jsonl",
+      "emb": "words-1m"
+    },
+    "llm-100": {
+      "text": "data/corpora/llm-100.txt",
+      "queries": "data/queries/llm-100.jsonl",
+      "emb": "llm-10k",
+      "emb_prefix": 100
+    },
+    "llm-10k": {
+      "text": "data/corpora/llm-10k.txt",
+      "queries": "data/queries/llm-10k.jsonl",
+      "emb": "llm-10k"
+    }
+  },
+  "indexes": {
+    "fts": {
+      "kind": "fts5",
+      "system": "FTS5",
+      "table": "fts",
+      "desc": "FTS5 external-content index over docs(body), unicode61 tokenizer, 'optimize'd"
+    },
+    "dense_graph": {
+      "kind": "dense_ann",
+      "system": "dense graph",
+      "table": "dense_graph",
+      "embedding": "minilm",
+      "params": "dim=384, layout=colocated, vectors=inline, store_vectors=f16, M=16, ef_construction=200, threads=2",
+      "desc": "HNSW-built layer-0 graph, co-located PQ-64 neighbour codes, inline float16 vectors, page hints"
+    },
+    "dense_ivf": {
+      "kind": "dense_ann",
+      "system": "dense IVF",
+      "table": "dense_ivf",
+      "embedding": "minilm",
+      "params": "dim=384, layout=ivf, store_vectors=f16, threads=2",
+      "desc": "IVF-PQ (IVFADC, PQ-64 residual codes), nlist = 4 sqrt(N), float16 vectors in a table for reranking"
+    },
+    "late": {
+      "kind": "late_plaid",
+      "system": "late",
+      "table": "late",
+      "embedding": "lateon",
+      "params": "dim=48 nbits=2 centroids=0 layout=both order=1 threads=2 input=f16",
+      "per_corpus": {
+        "words-1m": "centroids=65536 fast_assign=1 mem_mb=1024"
+      },
+      "desc": "LateOn-Code-edge token vectors, 2-bit residuals, K = fast-plaid formula (65,536 at 1M), warp postings + plaid rows + IVF"
+    }
+  },
+  "configs": [
+    {
+      "id": "fts-bm25",
+      "index": "fts",
+      "input": "fts_and",
+      "label": "FTS5 bm25 (AND)",
+      "sql": "SELECT rowid AS id FROM {table} WHERE {table} MATCH :q ORDER BY rank LIMIT :k"
+    },
+    {
+      "id": "fts-bm25-or",
+      "index": "fts",
+      "input": "fts_or",
+      "label": "FTS5 bm25 (OR)",
+      "sql": "SELECT rowid AS id FROM {table} WHERE {table} MATCH :q ORDER BY rank LIMIT :k"
+    },
+    {
+      "id": "fts-unranked",
+      "index": "fts",
+      "input": "fts_and",
+      "label": "FTS5 unranked (AND)",
+      "sql": "SELECT rowid AS id FROM {table} WHERE {table} MATCH :q LIMIT :k",
+      "ref": "fts-bm25"
+    },
+    {
+      "id": "graph-ef32",
+      "index": "dense_graph",
+      "input": "minilm",
+      "label": "graph ef 32, W 16",
+      "sql": "SELECT rowid AS id, stats FROM {table} WHERE embedding MATCH :q AND k = :k AND ef = 32 AND beam = 16 AND rerank = 2"
+    },
+    {
+      "id": "graph-ef64",
+      "index": "dense_graph",
+      "input": "minilm",
+      "label": "graph ef 64, W 16",
+      "sql": "SELECT rowid AS id, stats FROM {table} WHERE embedding MATCH :q AND k = :k AND ef = 64 AND beam = 16 AND rerank = 2"
+    },
+    {
+      "id": "graph-ef128",
+      "index": "dense_graph",
+      "input": "minilm",
+      "label": "graph ef 128, W 16",
+      "sql": "SELECT rowid AS id, stats FROM {table} WHERE embedding MATCH :q AND k = :k AND ef = 128 AND beam = 16 AND rerank = 2"
+    },
+    {
+      "id": "graph-ef128-w64",
+      "index": "dense_graph",
+      "input": "minilm",
+      "label": "graph ef 128, W 64",
+      "sql": "SELECT rowid AS id, stats FROM {table} WHERE embedding MATCH :q AND k = :k AND ef = 128 AND beam = 64 AND rerank = 2"
+    },
+    {
+      "id": "ivf-np16",
+      "index": "dense_ivf",
+      "input": "minilm",
+      "label": "IVF nprobe 16, rerank 64",
+      "sql": "SELECT rowid AS id, stats FROM {table} WHERE embedding MATCH :q AND k = :k AND nprobe = 16 AND rerank_k = 64 AND rerank = 2"
+    },
+    {
+      "id": "ivf-np64",
+      "index": "dense_ivf",
+      "input": "minilm",
+      "label": "IVF nprobe 64, rerank 64",
+      "sql": "SELECT rowid AS id, stats FROM {table} WHERE embedding MATCH :q AND k = :k AND nprobe = 64 AND rerank_k = 64 AND rerank = 2"
+    },
+    {
+      "id": "ivf-np128",
+      "index": "dense_ivf",
+      "input": "minilm",
+      "label": "IVF nprobe 128, rerank 128",
+      "sql": "SELECT rowid AS id, stats FROM {table} WHERE embedding MATCH :q AND k = :k AND nprobe = 128 AND rerank_k = 128 AND rerank = 2"
+    },
+    {
+      "id": "dense-exact",
+      "index": "dense_ivf",
+      "input": "minilm",
+      "label": "dense exhaustive (f16 vectors)",
+      "exhaustive": true,
+      "sql": "SELECT rowid AS id, stats FROM {table} WHERE embedding MATCH :q AND k = :k AND exact = 1"
+    },
+    {
+      "id": "warp-np8",
+      "index": "late",
+      "input": "lateon",
+      "label": "warp nprobe 8",
+      "sql": "SELECT rowid AS id, stats FROM {table} WHERE {table} MATCH :q AND k = :k AND nprobe = 8 AND opts = 'layout=warp stoplist=0.02'"
+    },
+    {
+      "id": "warp-np32",
+      "index": "late",
+      "input": "lateon",
+      "label": "warp nprobe 32",
+      "sql": "SELECT rowid AS id, stats FROM {table} WHERE {table} MATCH :q AND k = :k AND nprobe = 32 AND opts = 'layout=warp stoplist=0.02'"
+    },
+    {
+      "id": "warp-np8-rr64",
+      "index": "late",
+      "input": "lateon",
+      "label": "warp nprobe 8 + rerank 64",
+      "sql": "SELECT rowid AS id, stats FROM {table} WHERE {table} MATCH :q AND k = :k AND nprobe = 8 AND opts = 'layout=warp stoplist=0.02 rerank=64'"
+    },
+    {
+      "id": "warp-np16-rr64",
+      "index": "late",
+      "input": "lateon",
+      "label": "warp nprobe 16 + rerank 64",
+      "sql": "SELECT rowid AS id, stats FROM {table} WHERE {table} MATCH :q AND k = :k AND nprobe = 16 AND opts = 'layout=warp stoplist=0.02 rerank=64'"
+    },
+    {
+      "id": "plaid-ivf-np8",
+      "index": "late",
+      "input": "lateon",
+      "label": "plaid approx=ivf nprobe 8, ndocs 64",
+      "sql": "SELECT rowid AS id, stats FROM {table} WHERE {table} MATCH :q AND k = :k AND nprobe = 8 AND opts = 'layout=plaid approx=ivf ndocs=64 stoplist=0.02'"
+    },
+    {
+      "id": "late-exact",
+      "index": "late",
+      "input": "lateon",
+      "label": "late exhaustive (decompressed)",
+      "exhaustive": true,
+      "sql": "SELECT rowid AS id, stats FROM {table} WHERE {table} MATCH :q AND k = :k AND opts = 'layout=plaid exact=1'"
+    }
+  ],
+  "profiles": [
+    "none",
+    "lan",
+    "wifi",
+    "4g",
+    "lte",
+    "slow-4g",
+    "3g",
+    "lte-poor"
+  ],
+  "concurrency": [
+    "h1",
+    "h2"
+  ],
+  "run": {
+    "k": 10,
+    "k_deep": 100,
+    "cold_queries": 200,
+    "real_per_kind": 50,
+    "real_per_kind_slow": 10,
+    "slow_profiles": [
+      "slow-4g",
+      "3g",
+      "lte-poor"
+    ],
+    "exhaustive_max_queries": 200,
+    "sim_seeds": 1
+  }
+}

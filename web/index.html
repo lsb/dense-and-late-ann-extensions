@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dense and Late Search Demo</title>
+<link rel="stylesheet" href="demo.css">
+</head>
+<body>
+<header>
+  <h1>Dense and late-interaction search in the browser</h1>
+  <p class="sub">One SQLite file read with HTTP range requests: FTS5, dense ANN (MiniLM, <code>dense_ann</code>) and late interaction (LateOn-Code-edge, <code>late_plaid</code>). Queries are encoded in the browser with ONNX Runtime Web.</p>
+</header>
+
+<section class="panel" id="setup">
+  <div class="row">
+    <label>Database <input id="dbUrl" size="44" spellcheck="false"></label>
+    <label>SQLite build
+      <select id="variant">
+        <option value="auto">auto (JSPI if available)</option>
+        <option value="asyncify">asyncify</option>
+        <option value="jspi">jspi</option>
+      </select>
+    </label>
+    <button id="openBtn">Open</button>
+    <span id="dbStatus" class="status">not open</span>
+  </div>
+  <div class="row">
+    <label>Network profile
+      <select id="netProfile" disabled><option>not served by netsim</option></select>
+    </label>
+    <span id="netStatus" class="status"></span>
+  </div>
+  <div class="row encoders">
+    <div class="enc" id="enc-minilm"><b>MiniLM</b> <span class="state">not loaded</span><div class="bar"><i></i></div></div>
+    <div class="enc" id="enc-lateon"><b>LateOn-Code-edge</b> <span class="state">not loaded</span><div class="bar"><i></i></div></div>
+    <button id="loadEnc">Load encoders</button>
+    <label class="check"><input type="checkbox" id="modelCache" checked> keep models in Cache Storage</label>
+  </div>
+</section>
+
+<section class="panel" id="querybox">
+  <form id="searchForm" class="row">
+    <input id="q" type="search" placeholder="Query, e.g. pinwheel" autocomplete="off" spellcheck="false">
+    <select id="system">
+      <option value="all">All side by side</option>
+      <option value="fts">FTS5</option>
+      <option value="dense">Dense</option>
+      <option value="late">Late interaction</option>
+    </select>
+    <label>k <input id="k" type="number" value="10" min="1" max="100" class="num"></label>
+    <label class="check" title="Empty the VFS block cache and SQLite's page cache before each query (the extensions keep their own per-connection caches of static data)"><input type="checkbox" id="cold"> cold cache</label>
+    <button type="submit" id="searchBtn" disabled>Search</button>
+  </form>
+  <div class="row examples" id="examples"></div>
+  <details id="knobs" open>
+    <summary>Parameters</summary>
+    <div class="knobgrid">
+      <fieldset data-kind="fts"><legend>FTS5</legend>
+        <label>terms <select name="mode"><option value="or">OR</option><option value="and">AND</option></select></label>
+      </fieldset>
+      <fieldset data-kind="dense"><legend>Dense</legend>
+        <label>index <select name="table" id="denseTable"></select></label>
+        <span data-layout="graph">
+          <label>ef <input name="ef" type="number" value="64" class="num"></label>
+          <label>beam <input name="beam" type="number" value="16" class="num"></label>
+        </span>
+        <span data-layout="ivf">
+          <label>nprobe <input name="nprobe" type="number" value="16" class="num"></label>
+          <label>rerank_k <input name="rerank_k" type="number" value="64" class="num"></label>
+        </span>
+        <label>rerank <select name="rerank"><option>2</option><option>1</option><option>0</option><option>3</option></select></label>
+      </fieldset>
+      <fieldset data-kind="late"><legend>Late</legend>
+        <label>layout <select name="layout"><option>warp</option><option>plaid</option></select></label>
+        <label>nprobe <input name="nprobe" type="number" value="8" class="num"></label>
+        <label>stoplist <input name="stoplist" type="number" value="0.02" step="0.01" class="num"></label>
+        <label>rerank <input name="rerank" type="number" value="64" class="num" title="warp: re-score the best N documents exactly (one more round)"></label>
+        <label>approx <select name="approx"><option value="ivf">ivf</option><option value="codes">codes</option></select></label>
+        <label>ndocs <input name="ndocs" type="number" value="64" class="num" title="plaid: documents decompressed and scored exactly"></label>
+      </fieldset>
+    </div>
+  </details>
+</section>
+
+<section id="results" class="results"></section>
+
+<footer>
+  <p>Timings: <b>wall</b> is from pressing Search to the rows being ready (including waiting for the other systems, which share one SQLite worker); <b>enc</b> is query encoding; <b>sql</b> the search statement; <b>docs</b> fetching the document text. <b>rounds</b> are dependent network round trips, <b>req</b> HTTP range requests, <b>KB</b> bytes fetched. See <a href="NOTES.md">web/NOTES.md</a>.</p>
+</footer>
+<script type="module" src="demo.mjs"></script>
+</body>
+</html>

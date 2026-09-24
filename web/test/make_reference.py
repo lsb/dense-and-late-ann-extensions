@@ -13,6 +13,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
+import onnxruntime as ort
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
@@ -64,6 +65,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out-dir", default=str(REPO / "build" / "web"))
     ap.add_argument("--n-tokens", type=int, default=3000)
+    ap.add_argument("--n-embed", type=int, default=100, help="extra queries from data/queries/words-10k.jsonl")
     a = ap.parse_args()
     out = Path(a.out_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -78,15 +80,44 @@ def main():
         {"texts": texts, "minilm": ml_ids, "lateon_query": lo_ids,
          "minilm_max_len": MAX_SEQ_LENGTH, "lateon_query_length": lo.cfg["query_length"]}))
 
+    # The same encoders with ONNX Runtime graph optimisations disabled. enc/ uses
+    # ORT_ENABLE_ALL, whose fused x86 kernels round floats slightly differently;
+    # with dynamic int8 quantisation such differences can flip a quantisation
+    # step and move a vector by a cosine of up to ~0.01 (see web/NOTES.md).
+    ml0 = MiniLM(threads=1)
+    lo0 = LateOn(threads=1)
+    for enc in (ml0, lo0):
+        so = ort.SessionOptions()
+        so.intra_op_num_threads = 1
+        so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+        enc.session = ort.InferenceSession(enc.session._model_path, so, providers=["CPUExecutionProvider"])
+
+    qs = [json.loads(l) for l in open(REPO / "data/queries/words-10k.jsonl")]
+    kinds = {}
+    for q in qs:
+        kinds.setdefault(q["kind"], []).append(q["text"])
+    queries = list(EMBED_QUERIES)
+    for k in sorted(kinds):
+        queries += kinds[k][: a.n_embed // len(kinds)]
     emb = []
-    for q in EMBED_QUERIES:  # one query per batch, as in the browser
-        m = ml.encode([q], batch_size=1)[0]
-        l = lo.encode_queries([q], batch_size=1)[0]
-        emb.append({"text": q, "minilm": np.round(m, 7).tolist(),
+    for q in queries:  # one query per batch, as in the browser
+        emb.append({"text": q,
+                    "minilm": np.round(ml.encode([q], batch_size=1)[0], 7).tolist(),
+                    "minilm_noopt": np.round(ml0.encode([q], batch_size=1)[0], 7).tolist(),
                     "minilm_ids": ml.tokenize([q])[0].ids,
-                    "lateon": np.round(l, 7).tolist(),
+                    "lateon": np.round(lo.encode_queries([q], batch_size=1)[0], 7).tolist(),
+                    "lateon_noopt": np.round(lo0.encode_queries([q], batch_size=1)[0], 7).tolist(),
                     "lateon_ids": lo.token_ids([q], True)[0]})
-    (out / "reference-embeddings.json").write_text(json.dumps({"queries": emb}))
+    # Noise floor: the same Python encoder with and without graph optimisations.
+    def cos_rows(x, y):
+        x, y = np.atleast_2d(np.asarray(x, np.float64)), np.atleast_2d(np.asarray(y, np.float64))
+        return (x * y).sum(1) / np.linalg.norm(x, axis=1) / np.linalg.norm(y, axis=1)
+    floor = {}
+    for key in ("minilm", "lateon"):
+        c = np.concatenate([cos_rows(e[key], e[key + "_noopt"]) for e in emb])
+        floor[key] = {"min": float(c.min()), "mean": float(c.mean()), "frac_ge_0999": float((c >= 0.999).mean()), "n": int(len(c))}
+    print("python ENABLE_ALL vs DISABLE_ALL:", json.dumps(floor))
+    (out / "reference-embeddings.json").write_text(json.dumps({"queries": emb, "python_opt_vs_noopt": floor}))
     print(f"wrote {len(texts)} tokenizations and {len(emb)} encodings to {out}")
 
 

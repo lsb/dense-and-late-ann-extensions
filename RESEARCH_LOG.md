@@ -193,3 +193,44 @@ The warp rows use the stoplist described below. Faithful PLAID needs only two ro
 - *Build.* About 3 hours and 2.5 GB RAM.
 - *Size.* The warp layout would take 0.96 / 1.63 / 2.98 GB at nbits 1 / 2 / 4.
 - *Query cost.* Roughly 0.65 MB in one round per query. Recall at that scale is still to be measured.
+
+## 2026-09-24 — Browser demo and client library (`web/`)
+
+**What was built.**
+- `web/lib/index.mjs` provides `openIndex(url)` and `search(text, {system, k, ...})`. SQLite runs in one Web Worker, and each query encoder runs in its own worker using onnxruntime-web 1.30.0 and `@huggingface/tokenizers` (vendored in `web/vendor/`; no CDN).
+- The library discovers the FTS5, `dense_ann` and `late_plaid` tables from the schema. Every result carries its stats: encode, SQL and network time, rounds, requests and bytes.
+- `web/index.html` shows the three systems side by side, with a network-profile selector that drives `netsim/rangeserver.py`.
+- `make web` builds the demo database and runs the Playwright test (3 tests pass); `make serve PRESET=4g` serves the repository at `http://localhost:8000/web/`.
+
+**Browser and Python agree.** Tokenization is identical to Python for 6,540 texts. Two edge cases had to be fixed: a word-final Σ is lower-cased differently in Rust and JS, and Python's `strip()` removes a different set of whitespace from JS `trim()`.
+
+The encodings are close but not bit-identical:
+
+| Model | Mean cosine | Minimum cosine | Exact top-10 overlap with Python |
+|---|---|---|---|
+| MiniLM | 0.9989 | 0.981 | 0.975 |
+| LateOn | 0.9997 | 0.987 | 0.995 |
+
+The integer matrix products in onnxruntime-web are bit-exact. Float operators such as LayerNorm differ by about 10⁻⁶, which occasionally flips a step of the dynamic int8 quantisation, and the difference then grows through the layers; the same effect appears inside Python's onnxruntime between optimised and unoptimised graphs. This is smaller than the batch-composition effect. For the same query vector, the browser returns exactly the rows the native build returns.
+
+**Sizes and first-visit cost** (raw / gzip):
+
+| Component | Raw | gzip |
+|---|---|---|
+| Library JS | 40 KB | 14 KB |
+| SQLite WASM (JSPI) | 1.55 MB | 0.62 MB |
+| ONNX Runtime WASM | 14.2 MB | 3.7 MB |
+| MiniLM model | 23.0 MB | 17.4 MB |
+| LateOn model and tokenizer | 20.8 MB | 14.0 MB |
+
+A first visit using both encoders transfers about 60 MB: 41 s on `lte` and 60 s on `4g`. Later visits load the encoders from Cache Storage in about 2.5 s, mostly ONNX session creation. Warm query encoding takes 7–11 ms (MiniLM) and 3.5–4 ms (LateOn) for a short query.
+
+**End-to-end query times** in headless Chromium, words-10k, HTTP/1.1 (6 connections), after the first query:
+
+| System | Unshaped | `lte` | `4g` |
+|---|---|---|---|
+| FTS5 | 0.08 s | 0.58 s | 1.3 s |
+| Dense graph | 0.22 s | 1.5 s | 3.1 s |
+| Late (warp) | 0.30 s | 1.5 s | 3.3 s |
+
+The first query of a session takes 4.7–6.5 s on `4g` because it also loads each index's static data. On `4g` the browser's six-connections-per-host limit costs more than the round trips themselves: a round of 16–100 requests becomes several waits in sequence. HTTP/2 hosting, or fewer and larger range requests per round, is therefore a priority.

@@ -64,18 +64,31 @@ def synth(n, nq, dim=384, seed=0):
     return gen(n, rng), gen(nq, np.random.default_rng(seed + 1))
 
 
-def words_queries(nq_docs=200, nq_words=200):
-    """Held-out documents 10000.. of the corpus stream, and single words."""
-    path = CACHE / f"queries-words-{nq_docs}-{nq_words}.npy"
+def heldout_docs(start, n):
+    """Documents start .. start+n-1 of the random-word stream (see
+    scripts/make_corpora.py): not in a corpus of `start` documents."""
+    sys.path.insert(0, str(REPO / "scripts"))
+    from make_corpora import load_words, WORDS_PER_DOC
+    from detshuffle import shuffled
+    words = load_words()
+    first, last = start * WORDS_PER_DOC, (start + n) * WORDS_PER_DOC
+    out, passes = [], {}
+    for w in range(first, last):
+        p = w // len(words)
+        if p not in passes:
+            passes[p] = shuffled(words, p)
+        out.append(passes[p][w % len(words)])
+    return [" ".join(out[i:i + WORDS_PER_DOC]) for i in range(0, len(out), WORDS_PER_DOC)]
+
+
+def words_queries(n_corpus, nq_docs=200, nq_words=200):
+    """200 held-out documents (the next ones in the stream after the corpus)
+    and 200 single words, encoded with enc/minilm.py (batch size 1)."""
+    suffix = "" if n_corpus == 10000 else f"-from{n_corpus}"
+    path = CACHE / f"queries-words-{nq_docs}-{nq_words}{suffix}.npy"
     if path.exists():
         return np.load(path)
-    docs = []
-    with open(REPO / "data" / "corpora" / "words-1m.txt") as f:
-        for i, line in enumerate(f):
-            if i >= 10000:
-                docs.append(line.strip())
-            if len(docs) == nq_docs:
-                break
+    docs = heldout_docs(n_corpus, nq_docs)
     with open(REPO / "data" / "words" / "shuffled-seed0.txt") as f:
         words = [w.strip() for _, w in zip(range(nq_words), f)]
     sys.path.insert(0, str(REPO))
@@ -90,8 +103,9 @@ def load_data(args):
     if args.data == "synth":
         return synth(args.n, args.queries, seed=args.seed)
     if args.data.startswith("words-") or args.data == "llm-paragraphs":
-        X = np.load(REPO / "data" / "emb" / f"{args.data}.minilm.npy").astype(np.float32)
-        return normalize(X), normalize(words_queries())
+        X = np.load(REPO / "data" / "emb" / f"{args.data}.minilm.npy", mmap_mode="r")
+        X = np.ascontiguousarray(X, dtype=np.float32)
+        return normalize(X), normalize(words_queries(len(X)))
     raise SystemExit(f"unknown dataset {args.data}")
 
 
@@ -287,6 +301,8 @@ SWEEPS = {
     "ivf": ([_i(np_, 64, 0) for np_ in (8, 32, 128)]
             + [_i(np_, rk, 2) for np_ in (4, 8, 16, 32, 64, 128, 256) for rk in (32, 64, 128)]
             + [_i(512, 128, 2), _i(512, 256, 2)]),
+    "ivfw": [_i(np_, rk, 2) for np_ in (32, 64, 128, 256, 512, 1024) for rk in (64, 128, 256)],
+    "graphw": [_g(ef, beam, 2) for ef in (64, 128, 256, 512) for beam in (16, 32, 64)],
     "ivfs": [_i(8, 64, 0), _i(32, 64, 0)] + [_i(np_, rk, 2) for np_ in (8, 16, 32, 64, 128, 256) for rk in (32, 64, 128)],
 }
 
