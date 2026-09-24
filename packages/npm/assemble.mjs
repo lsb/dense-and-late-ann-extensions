@@ -42,7 +42,7 @@ copy(path.join(ROOT, 'LICENSE'), path.join(HERE, 'LICENSE'));
 if (process.argv.includes('--check')) {
   // A stale build silently lacks newer index layouts (web/NOTES.md), so
   // compare its time with the newest C source that goes into it.
-  const srcs = ['ext/dense', 'ext/late', 'wasm/src'].flatMap((d) =>
+  const srcs = ['ext/dense', 'ext/late', 'ext/fts5rank', 'wasm/src'].flatMap((d) =>
     fs.readdirSync(path.join(ROOT, d)).filter((f) => /\.[ch]$|\.js$/.test(f)).map((f) => path.join(ROOT, d, f)));
   const newest = Math.max(...srcs.map((f) => fs.statSync(f).mtimeMs));
   const stale = BUILDS.filter((b) => fs.statSync(path.join(WASM_PKG, 'dist', b + '.wasm')).mtimeMs < newest);

@@ -58,6 +58,7 @@
     <div class="knobgrid">
       <fieldset data-kind="fts"><legend>FTS5</legend>
         <label>terms <select name="mode"><option value="or">OR</option><option value="and">AND</option></select></label>
+        <label title="docs/fts5-httpvfs.md">rank <select name="rank"><option value="bm25c">bm25c (no length reads)</option><option value="bm25-rerank">bm25c + exact rerank of top 50</option><option value="bm25-prefetch">bm25, lengths prefetched</option><option value="bm25">bm25 (one round per match)</option><option value="none">none (rowid order)</option></select></label>
       </fieldset>
       <fieldset data-kind="dense"><legend>Dense</legend>
         <label>index <select name="table" id="denseTable"></select></label>

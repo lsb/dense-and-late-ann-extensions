@@ -32,6 +32,7 @@ Full tables and charts: [results/matrix/README.md](results/matrix/README.md) and
 |---|---|
 | `ext/dense/` | `dense_ann` virtual table: PQ-64, HNSW-built graph with co-located neighbour codes, IVF-PQ layout, page hints, parallel prefetch |
 | `ext/late/` | `late_plaid` virtual table: fast-plaid residual codec, PLAID and centroid-major layouts, bit-packed ids |
+| `ext/fts5rank/` | FTS5 ranking functions `bm25c()` and `bm25dl()`: bm25 without per-document length reads, so ranked full-text search stays cheap over HTTP ([docs/fts5-httpvfs.md](docs/fts5-httpvfs.md)) |
 | `wasm/` | SQLite 3.53.4 build (native and WebAssembly), HTTP VFS with parallel range fetching (Asyncify, JSPI or SharedArrayBuffer variants) |
 | `web/` | Browser client library and demo page with in-browser query encoding (onnxruntime-web) |
 | `netsim/` | Byte-range HTTP server with configurable latency, bandwidth and concurrency, and a matching simulator |
@@ -40,7 +41,7 @@ Full tables and charts: [results/matrix/README.md](results/matrix/README.md) and
 | `bench/` | FTS5 baseline, metrics (recall, MRR, nDCG, AUC) and the benchmark matrix |
 | `models/` | all-MiniLM-L6-v2 (qint8), LateOn-Code-edge (int8) and LFM2.5-350M (q4f16, in four chunks) |
 | `data/` | Word list, corpora, LLM-generated paragraphs and queries, query sets with relevance labels |
-| `docs/` | Specifications, including the PLAID write-up (`docs/plaid.md`) |
+| `docs/` | Specifications, including the PLAID write-up (`docs/plaid.md`) and ranked FTS5 over HTTP (`docs/fts5-httpvfs.md`) |
 
 ## Datasets
 
