@@ -100,6 +100,7 @@ static void cfg_default(LtCfg *c) {
   c->dim = 48; c->nbits = 2; c->K = 0; c->layout = LAY_PLAID | LAY_WARP;
   c->iters = 4; c->ppc = 256; c->threads = 4; c->seed = 42;
   c->mem_mb = 1024; c->heldout_max = 50000; c->aprobe = 8; c->sample_tokens = 4000000; c->order = 1; c->refine = 2;
+  c->cq = CQ_INT8;              /* as good as float16 at half the static data (NOTES.md) */
 }
 
 static int cfg_parse(LtCfg *c, int argc, const char *const *argv, char **pzErr) {

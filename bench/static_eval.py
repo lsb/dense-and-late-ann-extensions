@@ -103,10 +103,9 @@ def cmd_downgrade(a):
     for i in range(0, len(v2), ref.chunk):
         db.execute(f"INSERT INTO {t}_meta(id, data) VALUES (?, ?)", (i // ref.chunk + 1, v2[i:i + ref.chunk]))
     db.commit()
-    db.execute("VACUUM")
     db.close()
-    # page hints of the streams moved with VACUUM: finalize would rewrite format 3,
-    # so re-run it on a scratch copy only to check nothing else is needed
+    # no VACUUM: it would move the stream pages and make the page hints stale
+    # ('finalize' would fix them, but it rewrites the static data in format 3)
     Path(str(dst) + ".json").write_text(json.dumps(man, indent=1))
     print(f"{dst}: static data {len(blob)} -> {len(v2)} bytes (format 2)")
 
