@@ -131,3 +131,31 @@ The JS API (`wasm/pkg/index.mjs`) picks JSPI when available and otherwise Asynci
 ## 2026-09-24 — CPU contention
 
 With the LLM job, the 1M MiniLM encoding and the agents' builds and benchmarks all running at once (load average 15–18 on 4 cores), LLM generation fell to 46 tokens/s and encoding to 12 documents/s. ONNX Runtime's intra-op threads spin-wait by default, which wastes CPU when cores are oversubscribed. All ONNX sessions now set `session.intra_op.allow_spinning = 0`. The 1M encoding is paused, at a chunk boundary (120,000 documents done), until the LLM corpus is finished. The LLM job restarted at 79 tokens/s. Timings measured during this period are marked as noisy.
+
+## 2026-09-24 — Dense ANN extension, first version (`ext/dense/`)
+
+**Design.** `dense_ann` is a virtual table.
+- *Build.* Vectors inserted before the first `'build'` command are buffered. `'build'` trains PQ-64 (64 sub-quantizers of 6 dimensions × 256 centroids, 64 bytes per vector) on them and builds an HNSW graph in memory from full-precision vectors, with 4 threads natively.
+- *Storage.* Only layer 0 of HNSW is stored. The upper layers are replaced by an *entry set* (the 1,024 highest-level nodes, kept with the PQ codebook in `_blobs` and fetched once per connection), so the descent through the upper layers costs no network rounds.
+- *Node rows.* Each node is one fixed 3,152-byte row that fits in one 4 KiB page: its own PQ code and fp16 vector, 32 neighbour ids, *each neighbour's PQ code* (co-location, as in DiskANN), and a *page hint* per neighbour.
+- *Search.* A beam search expands W nodes per step, the step's pages are prefetched in one round, and final candidates are reranked with the stored fp16 vectors.
+- *Page hints.* `'finalize'` records the b-tree leaf page of every row. Queries then read those pages directly and parse the cells, so they never walk b-tree interior pages.
+
+API and all options are in `ext/dense/NOTES.md`; 12 tests pass. The round counter agrees exactly with the WASM VFS's own counter.
+
+**Layout comparison** (100k synthetic vectors, ef = 64, W = 4, all variants at recall@10 = 0.991):
+
+| Variant | Rounds | Pages | KiB/query |
+|---|---|---|---|
+| co-located codes, inline vectors (default) | 17.3 | 68 | 272 |
+| neighbour codes in a separate table (naive) | 34.3 | 622 | 2,487 |
+| vectors in a separate table | 18.3 | 136 | 544 |
+| 64 KiB pages | 16.1 | 38 | 2,405 |
+
+Co-location halves the rounds and cuts bytes about 9×. 64 KiB pages cut rounds only slightly while reading about 9× more bytes, so 4 KiB pages are preferred.
+
+**1M synthetic vectors** (4 KiB pages, W = 16): recall@10 = 0.966 at ef = 64 costs 7.5 rounds and 427 KiB per query; 0.993 at ef = 128 costs 7.0 rounds (W = 32) and 826 KiB. Setup is about 3 rounds and 300 KiB once per connection. Rounds ≈ expanded/W + 2 and pages ≈ ef + W. On the `4g` profile that is roughly 1.1 s per query. Building took 25 minutes (HNSW 22 minutes on 4 contended threads). The database is 4,119 bytes per document (3.9 GiB).
+
+**Real MiniLM embeddings (words-10k).** Exhaustive search over the 64-byte PQ codes reaches only recall@10 = 0.57, and faiss `IndexPQ(384, 64, 8)` gives the same 0.567, so the codec is behaving as expected. Random-word documents are nearly tied (cosine similarity of the 1st, 10th and 100th neighbours: 0.686, 0.655, 0.620). The true top 10 is almost always inside the PQ top 100 (0.98), so reranking with stored vectors recovers quality: recall@10 = 0.81 / 0.89 / 0.95 at ef = 64 / 128 / 256, costing 6.7 / 9.9 / 17.3 rounds. In faiss, an OPQ rotation raises exhaustive PQ-64 recall to 0.650 (top 10 within the top 100: 0.998); the extension's own OPQ option reaches 0.614.
+
+**Observation on size.** The PQ code is 64 bytes, but co-location and inline vectors make the stored row about 4 KB per document, 64 times more. This buys fewer rounds, since one page read gives the distances to all 32 neighbours. For a strict size budget, the alternative is an IVF-PQ layout (≈70 bytes per document plus centroids, with posting lists clustered on contiguous pages), which also needs only one or two dependent rounds after the centroids are cached. It is scheduled as a comparison.

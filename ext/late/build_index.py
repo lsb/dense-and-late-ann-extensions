@@ -55,6 +55,12 @@ def main():
     ap.add_argument("--mem-mb", type=int, default=1024)
     ap.add_argument("--page-size", type=int, default=4096)
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--coarse", type=int, default=0, help="two-level centroids: number of coarse cells")
+    ap.add_argument("--assign-probe", type=int, default=8)
+    ap.add_argument("--order", type=int, default=1, help="renumber centroids for locality")
+    ap.add_argument("--sample-tokens", type=int, default=4000000)
+    ap.add_argument("--refine", type=int, default=2, help="two-level: global Lloyd iterations")
+    ap.add_argument("--fast-assign", type=int, default=0, help="flat: approximate assignment via centroid groups")
     a = ap.parse_args()
     vec = a.vectors or str(REPO / "data" / "emb" / f"{a.data}.lateon.vectors.npy")
     off = a.offsets or str(REPO / "data" / "emb" / f"{a.data}.lateon.offsets.npy")
@@ -69,7 +75,8 @@ def main():
     con.execute(
         f"CREATE VIRTUAL TABLE t USING late_plaid(dim=48, nbits={a.nbits}, centroids={a.centroids}, "
         f"layout={a.layout}, kmeans_iters={a.iters}, kmeans_ppc={a.ppc}, sample_docs={a.sample_docs}, "
-        f"threads={a.threads}, mem_mb={a.mem_mb}, seed={a.seed}, verbose=1)")
+        f"threads={a.threads}, mem_mb={a.mem_mb}, seed={a.seed}, coarse={a.coarse}, "
+        f"assign_probe={a.assign_probe}, order={a.order}, sample_tokens={a.sample_tokens}, refine={a.refine}, fast_assign={a.fast_assign}, verbose=1)")
     t0 = time.time()
     con.execute("INSERT INTO t(t) VALUES (?)", (f"build_npy {vec} {off}",))
     t_build = time.time() - t0
@@ -82,6 +89,8 @@ def main():
         "data": a.data, "vectors": vec, "offsets": off, "nbits": a.nbits, "centroids": a.centroids,
         "layout": a.layout, "ppc": a.ppc, "iters": a.iters, "sample_docs": a.sample_docs,
         "threads": a.threads, "page_size": a.page_size, "seed": a.seed,
+        "coarse": a.coarse, "assign_probe": a.assign_probe, "order": a.order,
+        "sample_tokens": a.sample_tokens, "refine": a.refine, "fast_assign": a.fast_assign,
         "build_s": round(t_build, 2), "finalize_s": round(t_fin, 2),
         "db_bytes": os.path.getsize(out), "tables": sizes,
     }

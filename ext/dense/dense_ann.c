@@ -332,7 +332,7 @@ static int save_params(DenseVtab *vt) {
   S("dim", c->dim); S("pq_m", c->m); S("M", c->M); S("M0", c->M0);
   S("ef_construction", c->efc); S("metric", c->metric); S("store_vectors", c->vtype);
   S("vectors_inline", c->vinline); S("layout", c->layout); S("entry_points", c->n_entry);
-  S("pq_train", c->train_max); S("kmeans_iters", c->iters); S("seed", c->seed); S("opq", c->opq);
+  S("dnpq_train", c->train_max); S("kmeans_iters", c->iters); S("seed", c->seed); S("opq", c->opq);
   S("reorder", c->reorder); S("page_size_hint", c->page_hint); S("threads", c->nthreads);
   S("ef_search", c->ef_default); S("beam", c->beam_default); S("verbose", c->verbose);
 #undef S
@@ -364,7 +364,7 @@ static int load_config(DenseVtab *vt) {
     G("dim", c->dim); G("pq_m", c->m); G("M", c->M); G("M0", c->M0);
     G("ef_construction", c->efc); G("metric", c->metric); G("store_vectors", c->vtype);
     G("vectors_inline", c->vinline); G("layout", c->layout); G("entry_points", c->n_entry);
-    G("pq_train", c->train_max); G("kmeans_iters", c->iters); G("seed", c->seed); G("opq", c->opq);
+    G("dnpq_train", c->train_max); G("kmeans_iters", c->iters); G("seed", c->seed); G("opq", c->opq);
     G("reorder", c->reorder); G("page_size_hint", c->page_hint); G("threads", c->nthreads);
     G("ef_search", c->ef_default); G("beam", c->beam_default); G("verbose", c->verbose);
     G("built", vt->built); G("n_nodes", vt->n_nodes); G("n_deleted", vt->n_deleted);
@@ -380,10 +380,10 @@ static int load_config(DenseVtab *vt) {
 /* Parse "key=value" module arguments into cfg. */
 static int parse_args(DenseCfg *c, int argc, const char *const *argv, char **pzErr) {
   memset(c, 0, sizeof *c);
-  c->M = 16; c->efc = 200; c->metric = METRIC_COSINE; c->vtype = VT_F16; c->vinline = 0;
+  c->M = 16; c->efc = 200; c->metric = METRIC_COSINE; c->vtype = VT_F16; c->vinline = 1;
   c->layout = LAYOUT_COLOCATED; c->n_entry = 1024; c->train_max = 65536; c->iters = 25;
   c->seed = 42; c->alpha = 1.0; c->reorder = REORDER_AUTO; c->nthreads = 4;
-  c->ef_default = 64; c->beam_default = 4;
+  c->ef_default = 64; c->beam_default = 16;
   for (int i = 3; i < argc; i++) {
     char key[64], val[64];
     const char *a = argv[i], *eq = strchr(a, '=');
@@ -402,7 +402,7 @@ static int parse_args(DenseCfg *c, int argc, const char *const *argv, char **pzE
     else if (!strcmp(key, "ef_search") || !strcmp(key, "ef")) c->ef_default = (int)iv;
     else if (!strcmp(key, "beam")) c->beam_default = (int)iv;
     else if (!strcmp(key, "entry_points")) c->n_entry = (int)iv;
-    else if (!strcmp(key, "pq_train")) c->train_max = iv;
+    else if (!strcmp(key, "dnpq_train")) c->train_max = iv;
     else if (!strcmp(key, "kmeans_iters")) c->iters = (int)iv;
     else if (!strcmp(key, "opq")) c->opq = (int)iv;
     else if (!strcmp(key, "seed")) c->seed = iv;
@@ -523,7 +523,7 @@ typedef struct RowReq {
 } RowReq;
 
 static int ensure_pr(DenseVtab *vt) {
-  if (vt->pr_state == 0) vt->pr_state = pr_open(&vt->pr, vt->db, vt->zDb) == 0 ? 1 : -1;
+  if (vt->pr_state == 0) vt->pr_state = dnpr_open(&vt->pr, vt->db, vt->zDb) == 0 ? 1 : -1;
   return vt->pr_state == 1;
 }
 
@@ -553,12 +553,12 @@ static int q_fetch(QCtx *qc, int t, RowReq *r, int n) {
     for (int i = 0; i < nneed; i++) if (u == 0 || need[i] != need[u - 1]) need[u++] = need[i];
     nneed = u;
     if (nneed) {
-      pr_prefetch(&vt->pr, need, nneed);
+      dnpr_prefetch(&vt->pr, need, nneed);
       if (st->trace) sqlite3_str_appendf(st->trace, "%s[", st->ntrace++ ? "," : "");
       for (int i = 0; i < nneed; i++) {
         uint8_t *buf = (uint8_t *)malloc(vt->pr.pgsz);
         if (!buf) { rc = SQLITE_NOMEM; break; }
-        if (pr_read(&vt->pr, need[i], buf) != SQLITE_OK) { free(buf); continue; }
+        if (dnpr_read(&vt->pr, need[i], buf) != SQLITE_OK) { free(buf); continue; }
         pc_put(&qc->pc, need[i], buf);
         st->pages++; st->bytes += vt->pr.pgsz;
         if (st->trace) sqlite3_str_appendf(st->trace, "%s%u", i ? "," : "", need[i]);
@@ -568,8 +568,8 @@ static int q_fetch(QCtx *qc, int t, RowReq *r, int n) {
     for (int i = 0; i < n; i++) {
       const uint8_t *page, *pl, *blob; int len, blen;
       if (!r[i].page || !(page = pc_get(&qc->pc, r[i].page))) continue;
-      if (pr_leaf_find(&vt->pr, page, r[i].page, r[i].id, &pl, &len) &&
-          pr_record_blob(pl, len, 1, &blob, &blen)) {
+      if (dnpr_leaf_find(&vt->pr, page, r[i].page, r[i].id, &pl, &len) &&
+          dnpr_record_blob(pl, len, 1, &blob, &blen)) {
         r[i].data = blob; r[i].len = blen;
       }
     }
@@ -647,8 +647,8 @@ static int ensure_loaded(DenseVtab *vt, int raw, QStats *st) {
   const DenseCfg *c = &vt->cfg;
   size_t cb_vals = (size_t)c->m * PQ_KSUB * (c->dim / c->m);
   if (rc == SQLITE_OK) {
-    pq_free(&vt->pq);
-    if (pq_init(&vt->pq, c->dim, c->m)) rc = SQLITE_NOMEM;
+    dnpq_free(&vt->pq);
+    if (dnpq_init(&vt->pq, c->dim, c->m)) rc = SQLITE_NOMEM;
   }
   /* Concatenate the codebook chunks (float16 values). */
   size_t pos = 0;
@@ -752,7 +752,7 @@ static int ann_core(DenseVtab *vt, QCtx *qc, const float *tab, const float *qexa
     const uint8_t *ent = vt->entries + (size_t)e * estride;
     uint32_t id = dn_rd32(ent);
     idset_add(&vis, id);
-    cand_insert(L, &nL, ef, pq_adc(tab, ent + 8, m), id, dn_rd32(ent + 4));
+    cand_insert(L, &nL, ef, dnpq_adc(tab, ent + 8, m), id, dn_rd32(ent + 4));
     st->entry_dist++;
   }
 
@@ -804,7 +804,7 @@ static int ann_core(DenseVtab *vt, QCtx *qc, const float *tab, const float *qexa
         uint32_t nid = dn_rd32(e);
         if (!idset_add(&vis, nid)) continue;
         if (vt->cfg.layout == LAYOUT_COLOCATED) {
-          float d = pq_adc(tab, row + rl->off_nbrcode + j * m, m);
+          float d = dnpq_adc(tab, row + rl->off_nbrcode + j * m, m);
           st->dist++;
           cand_insert(L, &nL, ef, d, nid, dn_rd32(e + 4));
         } else if (np < npend_cap) {
@@ -820,7 +820,7 @@ static int ann_core(DenseVtab *vt, QCtx *qc, const float *tab, const float *qexa
       for (int i = 0; i < np; i++) {
         if (!pend[i].data || pend[i].len < m) continue;
         st->dist++;
-        cand_insert(L, &nL, ef, pq_adc(tab, pend[i].data, m), pend[i].id, pend_page[i]);
+        cand_insert(L, &nL, ef, dnpq_adc(tab, pend[i].data, m), pend[i].id, pend_page[i]);
       }
     }
   }
@@ -850,7 +850,7 @@ static int ann_search(DenseVtab *vt, const float *q, int k, int ef, int W, int r
   st->ann = 1;
 
   float *tab = (float *)malloc(sizeof(float) * c->m * PQ_KSUB);
-  pq_adc_table(&vt->pq, q, c->metric, tab);
+  dnpq_adc_table(&vt->pq, q, c->metric, tab);
   QCtx qc; qc_init(&qc, vt, raw, st);
   Cand *L = (Cand *)calloc(ef, sizeof(Cand));
   Cand *exp = NULL;
@@ -929,7 +929,7 @@ static int exact_search(DenseVtab *vt, const float *q, int k, int mode, Result *
     rc = ensure_loaded(vt, 0, st);
     if (rc) return rc;
     tab = (float *)malloc(sizeof(float) * c->m * PQ_KSUB);
-    pq_adc_table(&vt->pq, q, c->metric, tab);
+    dnpq_adc_table(&vt->pq, q, c->metric, tab);
     rc = prep_fmt(vt->db, &s, "SELECT r.rowid, n.data FROM \"%w\".\"%w_rowids\" r JOIN \"%w\".\"%w_nodes\" n ON n.id = r.node",
                   vt->zDb, vt->zName, vt->zDb, vt->zName);
   } else if (c->vinline) {
@@ -954,7 +954,7 @@ static int exact_search(DenseVtab *vt, const float *q, int k, int mode, Result *
       d = dn_distance(c->metric, q, v, c->dim);
     } else if (tab) {
       if (len < rl->size) continue;
-      d = pq_adc(tab, b + rl->off_code, c->m);
+      d = dnpq_adc(tab, b + rl->off_code, c->m);
     } else if (c->vinline) {
       if (len < rl->size) continue;
       vec_decode(c, b + rl->off_vec, v);
@@ -1011,7 +1011,7 @@ static void order_nodes(const Hnsw *h, int per_page, uint32_t *perm) {
     seen[start] = 1; bfs[tail++] = start;
     while (head < tail) {
       uint32_t u = bfs[head++];
-      const uint32_t *l = hnsw_list(h, u, 0);
+      const uint32_t *l = dnhnsw_list(h, u, 0);
       for (uint32_t j = 1; j <= l[0]; j++) if (!seen[l[j]]) { seen[l[j]] = 1; bfs[tail++] = l[j]; }
     }
   }
@@ -1029,7 +1029,7 @@ static void order_nodes(const Hnsw *h, int per_page, uint32_t *perm) {
       if (done[u]) continue;
       done[u] = 1; perm[next++] = u;
       if (next % per_page == 0) break;            /* page full */
-      const uint32_t *l = hnsw_list(h, u, 0);
+      const uint32_t *l = dnhnsw_list(h, u, 0);
       for (uint32_t j = 1; j <= l[0] && qt < qcap; j++) if (!done[l[j]]) lq[qt++] = l[j];
     }
   }
@@ -1073,12 +1073,12 @@ static int do_build(DenseVtab *vt) {
   /* 2. Train PQ and encode everything. The codebook is rounded to float16
   **    first, because that is what is stored. */
   PQ pq;
-  if (pq_train(&pq, X, n, dim, m, c->train_max, c->iters, c->opq, (uint64_t)c->seed, c->nthreads)) {
+  if (dnpq_train(&pq, X, n, dim, m, c->train_max, c->iters, c->opq, (uint64_t)c->seed, c->nthreads)) {
     free(X); free(rowids); return SQLITE_NOMEM;
   }
-  pq_round_f16(&pq);
+  dnpq_round_f16(&pq);
   uint8_t *codes = (uint8_t *)malloc((size_t)n * m);
-  pq_encode_many(&pq, X, n, codes, c->nthreads);
+  dnpq_encode_many(&pq, X, n, codes, c->nthreads);
   double t_pq = now_ms();
   if (c->verbose) fprintf(stderr, "dense_ann: pq trained+encoded in %.1fs\n", (t_pq - t_load) / 1e3);
 
@@ -1086,7 +1086,7 @@ static int do_build(DenseVtab *vt) {
   Hnsw h; memset(&h, 0, sizeof h);
   h.dim = dim; h.M = c->M; h.M0 = c->M0; h.efc = c->efc; h.metric = c->metric;
   h.alpha = (float)c->alpha; h.seed = (uint64_t)c->seed; h.n = n; h.x = X;
-  if (hnsw_build(&h, c->nthreads, c->verbose)) { rc = SQLITE_NOMEM; goto done; }
+  if (dnhnsw_build(&h, c->nthreads, c->verbose)) { rc = SQLITE_NOMEM; goto done; }
   double t_graph = now_ms();
 
   /* 4. Storage order. */
@@ -1109,7 +1109,7 @@ static int do_build(DenseVtab *vt) {
   rc = PREP(vt, &st, "INSERT INTO \"%w\".\"%w_nodes\"(id, data) VALUES (?1, ?2)");
   for (int64_t j = 0; j < n && rc == SQLITE_OK; j++) {
     uint32_t o = perm[j];
-    const uint32_t *l = hnsw_list(&h, o, 0);
+    const uint32_t *l = dnhnsw_list(&h, o, 0);
     memset(row, 0, rl->size);
     dn_wr16(row + 2, (uint16_t)l[0]);
     dn_wr64(row + 8, rowids[o]);
@@ -1201,7 +1201,7 @@ static int do_build(DenseVtab *vt) {
   if (rc == SQLITE_OK) {
     vt->built = 1; vt->n_nodes = n; vt->n_deleted = 0; vt->next_id = (uint32_t)n;
     vt->hints_valid = 0; vt->n_entry = ne;
-    pq_free(&vt->pq); vt->pq = pq; memset(&pq, 0, sizeof pq);
+    dnpq_free(&vt->pq); vt->pq = pq; memset(&pq, 0, sizeof pq);
     free(vt->entries); vt->entries = ent; ent = NULL;
     vt->loaded = 1;
     double t_write = now_ms();
@@ -1217,8 +1217,8 @@ static int do_build(DenseVtab *vt) {
   free(ent); free(row); free(perm); free(inv);
 
 done:
-  hnsw_free(&h);
-  pq_free(&pq);
+  dnhnsw_free(&h);
+  dnpq_free(&pq);
   free(codes); free(X); free(rowids);
   if (rc && !vt->base.zErrMsg) set_err(vt, "dense_ann: build failed: %s", sqlite3_errmsg(vt->db));
   return rc;
@@ -1260,7 +1260,7 @@ static int table_root(DenseVtab *vt, const char *suffix, uint32_t *root) {
 static int walk_ids(DenseVtab *vt, const char *suffix, WalkMap *w) {
   uint32_t root;
   int rc = table_root(vt, suffix, &root);
-  if (rc == SQLITE_OK) rc = pr_walk_table(&vt->pr, root, walk_map_cb, w);
+  if (rc == SQLITE_OK) rc = dnpr_walk_table(&vt->pr, root, walk_map_cb, w);
   return rc;
 }
 
@@ -1359,7 +1359,7 @@ static int do_finalize(DenseVtab *vt) {
   bm.n[0] /= 8; bm.n[1] /= 8; bm.n[2] /= 8;
   uint32_t broot;
   if (rc == SQLITE_OK) rc = table_root(vt, "blobs", &broot);
-  if (rc == SQLITE_OK) rc = pr_walk_table(&vt->pr, broot, walk_blob_cb, &bm);
+  if (rc == SQLITE_OK) rc = dnpr_walk_table(&vt->pr, broot, walk_blob_cb, &bm);
   if (rc == SQLITE_OK) rc = CFG_BLOB(vt, "codebook_chunks", bm.lists[0], bm.n[0] * 8);
   if (rc == SQLITE_OK) rc = CFG_BLOB(vt, "entry_chunks", bm.lists[1], bm.n[1] * 8);
   if (rc == SQLITE_OK && bm.n[2]) rc = CFG_BLOB(vt, "rotation_chunks", bm.lists[2], bm.n[2] * 8);
@@ -1410,9 +1410,9 @@ static int insert_built(DenseVtab *vt, int64_t rowid, const float *x) {
     return SQLITE_CONSTRAINT;
   }
   uint8_t *code = (uint8_t *)malloc(m);
-  pq_encode(&vt->pq, x, code);
+  dnpq_encode(&vt->pq, x, code);
   float *tab = (float *)malloc(sizeof(float) * m * PQ_KSUB);
-  pq_adc_table(&vt->pq, x, c->metric, tab);
+  dnpq_adc_table(&vt->pq, x, c->metric, tab);
 
   QStats st; memset(&st, 0, sizeof st);
   QCtx qc; qc_init(&qc, vt, 0, &st);
@@ -1428,13 +1428,13 @@ static int insert_built(DenseVtab *vt, int64_t rowid, const float *x) {
   int *cpos = (int *)malloc(sizeof(int) * (nL + 1));
   for (int i = 0; i < nL; i++) {
     if (!L[i].row || (L[i].row[0] & NODE_FLAG_DELETED)) continue;
-    pq_decode(&vt->pq, L[i].row + rl->off_code, cv + (size_t)nc * dim);
+    dnpq_decode(&vt->pq, L[i].row + rl->off_code, cv + (size_t)nc * dim);
     cidx[nc] = (uint32_t)nc; cd[nc] = L[i].d; cpos[nc] = i;
     nc++;
   }
   uint32_t *sel = (uint32_t *)malloc(sizeof(uint32_t) * M0);
   IdxVec iv = { cv, dim };
-  int nsel = hnsw_select(c->metric, dim, (float)c->alpha, cidx, cd, nc, M0, idx_vec, &iv, sel);
+  int nsel = dnhnsw_select(c->metric, dim, (float)c->alpha, cidx, cd, nc, M0, idx_vec, &iv, sel);
 
   uint32_t newid = vt->next_id;
   uint8_t *row = (uint8_t *)calloc(1, rl->size);
@@ -1514,12 +1514,12 @@ static int insert_built(DenseVtab *vt, int64_t rowid, const float *x) {
         free(cr);
       }
       memcpy(ncodes + (size_t)deg * m, code, m);
-      pq_decode(&vt->pq, nrow + rl->off_code, base);
+      dnpq_decode(&vt->pq, nrow + rl->off_code, base);
       /* Sort candidate slots by distance to the base node. */
       int ncand = deg + 1;
       Result *order = (Result *)malloc(sizeof(Result) * ncand);
       for (int t = 0; t < ncand; t++) {
-        pq_decode(&vt->pq, ncodes + (size_t)t * m, nv + (size_t)t * dim);
+        dnpq_decode(&vt->pq, ncodes + (size_t)t * m, nv + (size_t)t * dim);
         order[t].rowid = t;
         order[t].d = dn_distance(c->metric, base, nv + (size_t)t * dim, dim);
       }
@@ -1529,7 +1529,7 @@ static int insert_built(DenseVtab *vt, int64_t rowid, const float *x) {
       for (int t = 0; t < ncand; t++) { oid[t] = (uint32_t)order[t].rowid; od[t] = order[t].d; }
       uint32_t *keep = (uint32_t *)malloc(sizeof(uint32_t) * M0);
       IdxVec niv = { nv, dim };
-      int nkeep = hnsw_select(c->metric, dim, (float)c->alpha, oid, od, ncand, M0, idx_vec, &niv, keep);
+      int nkeep = dnhnsw_select(c->metric, dim, (float)c->alpha, oid, od, ncand, M0, idx_vec, &niv, keep);
       /* Rebuild the entry arrays from the kept slots. */
       uint8_t *old = (uint8_t *)malloc(rl->size);
       memcpy(old, nrow, rl->size);
@@ -1665,7 +1665,7 @@ static int dense_connect(sqlite3 *db, void *pAux, int argc, const char *const *a
 static int dense_disconnect(sqlite3_vtab *pVtab) {
   DenseVtab *vt = (DenseVtab *)pVtab;
   for (int t = 0; t < T_COUNT; t++) sqlite3_finalize(vt->st_get[t]);
-  pq_free(&vt->pq);
+  dnpq_free(&vt->pq);
   free(vt->entries);
   sqlite3_free(vt->zDb); sqlite3_free(vt->zName);
   sqlite3_free(vt);
@@ -1775,7 +1775,8 @@ static int dense_filter(sqlite3_vtab_cursor *pCur, int idxNum, const char *idxSt
     int a = 0;
     sqlite3_value *qv = argv[a++];
     cur->k = 10; cur->ef = vt->cfg.ef_default; cur->beam = vt->cfg.beam_default;
-    cur->rerank = 0; cur->exact = 0; cur->trace = 0;
+    cur->rerank = vt->cfg.vtype != VT_NONE ? 2 : 0;   /* rerank everything expanded when vectors exist */
+    cur->exact = 0; cur->trace = 0;
     int have_k = 0;
     if (idxNum & F_K) { cur->k = sqlite3_value_int64(argv[a++]); have_k = 1; }
     if (idxNum & F_EF) cur->ef = sqlite3_value_int64(argv[a++]);

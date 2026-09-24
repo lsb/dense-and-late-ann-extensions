@@ -36,7 +36,7 @@ static int get_varint(const uint8_t *p, const uint8_t *end, uint64_t *v) {
   return 9;
 }
 
-int pr_open(PageReader *pr, sqlite3 *db, const char *zDb) {
+int dnpr_open(PageReader *pr, sqlite3 *db, const char *zDb) {
   memset(pr, 0, sizeof *pr);
   pr->db = db; pr->zDb = zDb;
   sqlite3_file *fd = NULL;
@@ -54,7 +54,7 @@ int pr_open(PageReader *pr, sqlite3 *db, const char *zDb) {
   return pr->ok ? 0 : 1;
 }
 
-int pr_read(PageReader *pr, uint32_t pgno, uint8_t *buf) {
+int dnpr_read(PageReader *pr, uint32_t pgno, uint8_t *buf) {
   if (!pr->ok || pgno == 0) return SQLITE_ERROR;
   return pr->fd->pMethods->xRead(pr->fd, buf, pr->pgsz, (sqlite3_int64)(pgno - 1) * pr->pgsz);
 }
@@ -64,21 +64,28 @@ static int cmp_i64(const void *a, const void *b) {
   return x < y ? -1 : x > y;
 }
 
-void pr_prefetch(PageReader *pr, const uint32_t *pgnos, int n) {
+void dnpr_prefetch(PageReader *pr, const uint32_t *pgnos, int n) {
   if (!pr->ok || n <= 0) return;
   sqlite3_int64 *off = (sqlite3_int64 *)malloc(sizeof(sqlite3_int64) * n);
-  if (!off) return;
+  unsigned int *pg = (unsigned int *)malloc(sizeof(unsigned int) * n);
+  if (!off || !pg) { free(off); free(pg); return; }
   int m = 0;
   for (int i = 0; i < n; i++) if (pgnos[i]) off[m++] = (sqlite3_int64)(pgnos[i] - 1) * pr->pgsz;
   qsort(off, m, sizeof *off, cmp_i64);
   int u = 0;
   for (int i = 0; i < m; i++) if (u == 0 || off[i] != off[u - 1]) off[u++] = off[i];
-  dense_ann_prefetch_req req = { u, pr->pgsz, off };
+  for (int i = 0; i < u; i++) pg[i] = (unsigned int)(off[i] / pr->pgsz + 1);
   if (u > 0) {
-    if (g_prefetch_fn) g_prefetch_fn(g_prefetch_ctx, pr->db, pr->zDb, &req);
-    else sqlite3_file_control(pr->db, pr->zDb, DENSE_ANN_FCNTL_PREFETCH, &req);
+    dense_ann_prefetch_req req = { u, pr->pgsz, off };
+    if (g_prefetch_fn) {
+      g_prefetch_fn(g_prefetch_ctx, pr->db, pr->zDb, &req);
+    } else {
+      dense_httpvfs_pages hp = { pg, u, pr->pgsz };
+      if (sqlite3_file_control(pr->db, pr->zDb, HTTPVFS_FCNTL_PREFETCH_PAGES_DN, &hp) == SQLITE_NOTFOUND)
+        sqlite3_file_control(pr->db, pr->zDb, DENSE_ANN_FCNTL_PREFETCH, &req);
+    }
   }
-  free(off);
+  free(off); free(pg);
 }
 
 /* Parse leaf cell i: returns rowid, payload pointer and length, and whether
@@ -99,7 +106,7 @@ static int leaf_cell(const PageReader *pr, const uint8_t *page, int hdroff, int 
   return 1;
 }
 
-int pr_leaf_find(const PageReader *pr, const uint8_t *page, uint32_t pgno, int64_t rowid,
+int dnpr_leaf_find(const PageReader *pr, const uint8_t *page, uint32_t pgno, int64_t rowid,
                  const uint8_t **payload, int *plen) {
   int hdroff = (pgno == 1) ? 100 : 0;
   if (page[hdroff] != 0x0d) return 0;          /* not a table leaf */
@@ -126,7 +133,7 @@ static int serial_size(uint64_t t) {
   return (int)((t - 12) / 2);
 }
 
-int pr_record_blob(const uint8_t *rec, int len, int col, const uint8_t **p, int *n) {
+int dnpr_record_blob(const uint8_t *rec, int len, int col, const uint8_t **p, int *n) {
   const uint8_t *end = rec + len;
   uint64_t hsz;
   int k = get_varint(rec, end, &hsz);
@@ -148,11 +155,11 @@ int pr_record_blob(const uint8_t *rec, int len, int col, const uint8_t **p, int 
   return 0;
 }
 
-static int walk(PageReader *pr, uint32_t pgno, pr_walk_cb cb, void *ctx, int depth) {
+static int walk(PageReader *pr, uint32_t pgno, dnpr_walk_cb cb, void *ctx, int depth) {
   if (depth > 20) return SQLITE_CORRUPT;
   uint8_t *page = (uint8_t *)malloc(pr->pgsz);
   if (!page) return SQLITE_NOMEM;
-  int rc = pr_read(pr, pgno, page);
+  int rc = dnpr_read(pr, pgno, page);
   int hdroff = (pgno == 1) ? 100 : 0;
   if (rc == SQLITE_OK) {
     int n = (int)get2(page + hdroff + 3);
@@ -176,7 +183,7 @@ static int walk(PageReader *pr, uint32_t pgno, pr_walk_cb cb, void *ctx, int dep
   return rc;
 }
 
-int pr_walk_table(PageReader *pr, uint32_t root, pr_walk_cb cb, void *ctx) {
+int dnpr_walk_table(PageReader *pr, uint32_t root, dnpr_walk_cb cb, void *ctx) {
   if (!pr->ok) return SQLITE_ERROR;
   return walk(pr, root, cb, ctx, 0);
 }

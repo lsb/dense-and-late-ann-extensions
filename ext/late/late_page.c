@@ -148,6 +148,7 @@ static int read_round(LpReader *r, uint32_t *pgs, int *pn, uint8_t **bufs, char 
       bufs[i] = (uint8_t *)malloc(r->pgsz); owned[i] = 1;
       if (!bufs[i]) { rc = SQLITE_NOMEM; break; }
       rc = r->fd->pMethods->xRead(r->fd, bufs[i], r->pgsz, (sqlite3_int64)(pgs[i] - 1) * r->pgsz);
+      if (rc == SQLITE_IOERR_SHORT_READ) rc = SQLITE_OK;   /* past EOF (stale hint): zero page */
       trace_add(r, pgs[i]);
     }
   }

@@ -87,8 +87,8 @@ static inline float hdist(const Hnsw *h, uint32_t a, const float *q) {
 
 /* ------------------------------------------------ neighbour selection */
 
-int hnsw_select(int metric, int dim, float alpha, const uint32_t *cand, const float *dist,
-                int ncand, int cap, hnsw_vec_fn vec, void *vctx, uint32_t *out) {
+int dnhnsw_select(int metric, int dim, float alpha, const uint32_t *cand, const float *dist,
+                int ncand, int cap, dnhnsw_vec_fn vec, void *vctx, uint32_t *out) {
   int nout = 0;
   for (int i = 0; i < ncand && nout < cap; i++) {
     const float *vc = vec(vctx, cand[i]);
@@ -134,7 +134,7 @@ static int search_layer(Hnsw *h, Priv *p, Scratch *s, const float *q, uint32_t e
     HItem c = heap_pop(&s->cand);
     if (c.d > -s->res.a[0].d && s->res.n >= ef) break;
     LOCK_NODE(p, c.id);
-    uint32_t *l = hnsw_list(h, c.id, lv);
+    uint32_t *l = dnhnsw_list(h, c.id, lv);
     memcpy(buf, l, sizeof(uint32_t) * (l[0] + 1));
     UNLOCK_NODE(p, c.id);
     for (uint32_t k = 1; k <= buf[0]; k++) {
@@ -162,7 +162,7 @@ static int search_layer(Hnsw *h, Priv *p, Scratch *s, const float *q, uint32_t e
 static void link_back(Hnsw *h, Priv *p, uint32_t s, uint32_t node, int lv) {
   int cap = (lv == 0 ? h->M0 : h->M);
   LOCK_NODE(p, s);
-  uint32_t *l = hnsw_list(h, s, lv);
+  uint32_t *l = dnhnsw_list(h, s, lv);
   if ((int)l[0] < cap) {
     l[1 + l[0]] = node; l[0]++;
   } else {
@@ -175,7 +175,7 @@ static void link_back(Hnsw *h, Priv *p, uint32_t s, uint32_t node, int lv) {
     uint32_t *ids = (uint32_t *)alloca(sizeof(uint32_t) * nc);
     float *ds = (float *)alloca(sizeof(float) * nc);
     for (int k = 0; k < nc; k++) { ids[k] = it[k].id; ds[k] = it[k].d; }
-    l[0] = (uint32_t)hnsw_select(h->metric, h->dim, h->alpha, ids, ds, nc, cap, vec_of, h, l + 1);
+    l[0] = (uint32_t)dnhnsw_select(h->metric, h->dim, h->alpha, ids, ds, nc, cap, vec_of, h, l + 1);
   }
   UNLOCK_NODE(p, s);
 }
@@ -197,7 +197,7 @@ static void insert_node(Hnsw *h, Priv *p, Scratch *s, uint32_t i) {
     while (changed) {
       changed = 0;
       LOCK_NODE(p, ep);
-      uint32_t *l = hnsw_list(h, ep, lv);
+      uint32_t *l = dnhnsw_list(h, ep, lv);
       uint32_t cnt = l[0];
       uint32_t buf[256];
       if (cnt > 256) cnt = 256;
@@ -217,9 +217,9 @@ static void insert_node(Hnsw *h, Priv *p, Scratch *s, uint32_t i) {
     float *ds = (float *)alloca(sizeof(float) * nres);
     for (int k = 0; k < nres; k++) { ids[k] = s->tmp[k].id; ds[k] = s->tmp[k].d; }
     uint32_t *sel = (uint32_t *)alloca(sizeof(uint32_t) * cap);
-    int nsel = hnsw_select(h->metric, h->dim, h->alpha, ids, ds, nres, cap, vec_of, h, sel);
+    int nsel = dnhnsw_select(h->metric, h->dim, h->alpha, ids, ds, nres, cap, vec_of, h, sel);
     LOCK_NODE(p, i);
-    uint32_t *l = hnsw_list(h, i, lv);
+    uint32_t *l = dnhnsw_list(h, i, lv);
     memcpy(l + 1, sel, sizeof(uint32_t) * nsel);
     l[0] = (uint32_t)nsel;
     UNLOCK_NODE(p, i);
@@ -255,7 +255,7 @@ static void insert_offset_task(void *vctx, int64_t i, int thread) {
   insert_task(c->h, c->off + i, thread);
 }
 
-int hnsw_build(Hnsw *h, int nthreads, int verbose) {
+int dnhnsw_build(Hnsw *h, int nthreads, int verbose) {
   if (nthreads < 1) nthreads = 1;
 #ifndef DENSE_ANN_THREADS
   nthreads = 1;
@@ -315,7 +315,7 @@ int hnsw_build(Hnsw *h, int nthreads, int verbose) {
   return 0;
 }
 
-void hnsw_free(Hnsw *h) {
+void dnhnsw_free(Hnsw *h) {
   if (h->up) for (int64_t i = 0; i < h->n; i++) free(h->up[i]);
   free(h->up); free(h->l0); free(h->level);
   h->up = NULL; h->l0 = NULL; h->level = NULL;

@@ -118,41 +118,78 @@ void lc_assign(const float *X, int64_t n, const float *C, const float *bias, int
   free(CT); free(B);
 }
 
+/* Two-level assignment. Coarse centroids and every cell's fine centroids
+** are stored transposed ([dim][width], width a multiple of 8) so the inner
+** loops run over centroids and vectorise. */
 typedef struct {
-  const float *X, *coarse, *C; const uint32_t *start; int G, aprobe, dim; uint32_t *out;
+  const float *X; int dim, G, Gp, ap;
+  const float *CoT;            /* dim x Gp */
+  const float *FT;             /* per cell: dim x W[g], at FO[g] */
+  const size_t *FO; const int *W; const uint32_t *start;
+  uint32_t *out;
 } HierCtx;
 
 static void hier_range(void *vctx, int64_t lo, int64_t hi, int tid) {
   (void)tid;
   HierCtx *h = (HierCtx *)vctx;
-  int ap = h->aprobe < 1 ? 1 : h->aprobe > h->G ? h->G : h->aprobe;
+  const int dim = h->dim, Gp = h->Gp, ap = h->ap;
+  int wmax = 8;
+  for (int g = 0; g < h->G; g++) if (h->W[g] > wmax) wmax = h->W[g];
+  float *acc = (float *)malloc(sizeof(float) * (Gp > wmax ? Gp : wmax));
+  if (!acc) return;
   float bs[64]; int bi[64];
-  if (ap > 64) ap = 64;
   for (int64_t p = lo; p < hi; p++) {
-    const float *x = h->X + (size_t)p * h->dim;
+    const float *x = h->X + (size_t)p * dim;
+    for (int j = 0; j < Gp; j++) acc[j] = 0;
+    for (int d = 0; d < dim; d++) {
+      const float *row = h->CoT + (size_t)d * Gp; float xd = x[d];
+      for (int j = 0; j < Gp; j++) acc[j] += xd * row[j];
+    }
     int n = 0;
     for (int g = 0; g < h->G; g++) {
       if (h->start[g + 1] == h->start[g]) continue;
-      float s = lt_dot(x, h->coarse + (size_t)g * h->dim, h->dim);
-      if (n == ap && s <= bs[n - 1]) continue;
+      float sc = acc[g];
+      if (n == ap && sc <= bs[n - 1]) continue;
       int j = n < ap ? n++ : ap - 1;
-      while (j > 0 && bs[j - 1] < s) { bs[j] = bs[j - 1]; bi[j] = bi[j - 1]; j--; }
-      bs[j] = s; bi[j] = g;
+      while (j > 0 && bs[j - 1] < sc) { bs[j] = bs[j - 1]; bi[j] = bi[j - 1]; j--; }
+      bs[j] = sc; bi[j] = g;
     }
     float best = -FLT_MAX; uint32_t arg = 0;
-    for (int k = 0; k < n; k++)
-      for (uint32_t c = h->start[bi[k]]; c < h->start[bi[k] + 1]; c++) {
-        float s = lt_dot(x, h->C + (size_t)c * h->dim, h->dim);
-        if (s > best) { best = s; arg = c; }
+    for (int k = 0; k < n; k++) {
+      int g = bi[k], W = h->W[g], kg = (int)(h->start[g + 1] - h->start[g]);
+      const float *ft = h->FT + h->FO[g];
+      for (int j = 0; j < W; j++) acc[j] = 0;
+      for (int d = 0; d < dim; d++) {
+        const float *row = ft + (size_t)d * W; float xd = x[d];
+        for (int j = 0; j < W; j++) acc[j] += xd * row[j];
       }
+      for (int j = 0; j < kg; j++) if (acc[j] > best) { best = acc[j]; arg = h->start[g] + (uint32_t)j; }
+    }
     h->out[p] = arg;
   }
+  free(acc);
 }
 
 void lc_assign_hier(const float *X, int64_t n, const float *coarse, int G, const float *C,
                     const uint32_t *cell_start, int aprobe, int dim, uint32_t *out, int nthreads) {
-  HierCtx h = { X, coarse, C, cell_start, G, aprobe, dim, out };
+  int Gp = (G + 7) & ~7;
+  int *W = (int *)malloc(sizeof(int) * G);
+  size_t *FO = (size_t *)malloc(sizeof(size_t) * G);
+  float *CoT = (float *)calloc((size_t)Gp * dim, sizeof(float));
+  if (!W || !FO || !CoT) { free(W); free(FO); free(CoT); return; }
+  size_t tot = 0;
+  for (int g = 0; g < G; g++) { W[g] = (int)((cell_start[g + 1] - cell_start[g] + 7) & ~7u); FO[g] = tot; tot += (size_t)W[g] * dim; }
+  float *FT = (float *)calloc(tot ? tot : 1, sizeof(float));
+  if (!FT) { free(W); free(FO); free(CoT); return; }
+  for (int g = 0; g < G; g++) {
+    for (int d = 0; d < dim; d++) CoT[(size_t)d * Gp + g] = coarse[(size_t)g * dim + d];
+    for (uint32_t c = cell_start[g]; c < cell_start[g + 1]; c++)
+      for (int d = 0; d < dim; d++) FT[FO[g] + (size_t)d * W[g] + (c - cell_start[g])] = C[(size_t)c * dim + d];
+  }
+  HierCtx h = { X, dim, G, Gp, aprobe < 1 ? 1 : aprobe > 64 ? 64 : aprobe, CoT, FT, FO, W, cell_start, out };
+  if (h.ap > G) h.ap = G;
   lt_parallel_for(n, 512, nthreads, hier_range, &h);
+  free(W); free(FO); free(CoT); free(FT);
 }
 
 /* --------------------------------------------------------------- k-means */

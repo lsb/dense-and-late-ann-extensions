@@ -21,18 +21,26 @@
 /* ---------------------------------------------------------------------
 ** Prefetch interface (for the HTTP VFS).
 **
-** Before each search step the extension announces the byte ranges it is
-** about to read, all of which are independent. A VFS that can fetch in
-** parallel should start all of them and return when they are cached; the
-** subsequent xRead calls must then be served from cache. Two ways to hook in:
+** Before each search step the extension announces the pages it is about to
+** read, all of which are independent. A VFS that can fetch in parallel should
+** start all of them and return when they are cached; the subsequent xRead
+** calls are then served from cache. Three ways to hook in, tried in order:
 **
-**  1. File control (preferred; works with loadable extensions): the VFS's
-**     xFileControl handles op DENSE_ANN_FCNTL_PREFETCH with a pointer to a
-**     dense_ann_prefetch_req. Unknown ops return SQLITE_NOTFOUND as usual,
-**     so natively this is a no-op.
-**  2. A function pointer registered with dense_ann_set_prefetch_hook(), for
-**     static builds that prefer a direct call.
+**  1. A function pointer registered with dense_ann_set_prefetch_hook().
+**  2. The project's httpvfs file control HTTPVFS_FCNTL_PREFETCH_PAGES
+**     (wasm/src/httpvfs.h; the struct is mirrored here so this extension
+**     has no build dependency on the VFS).
+**  3. If that returns SQLITE_NOTFOUND, DENSE_ANN_FCNTL_PREFETCH with byte
+**     offsets (used by the test VFS in test/countvfs.c).
+** Unknown opcodes return SQLITE_NOTFOUND, so natively this is a no-op.
 ** ------------------------------------------------------------------- */
+#define HTTPVFS_FCNTL_PREFETCH_PAGES_DN 0x48560002   /* = HTTPVFS_FCNTL_PREFETCH_PAGES */
+typedef struct dense_httpvfs_pages {                 /* = HttpvfsPages */
+  const unsigned int *pgnos;
+  int n;
+  int page_size;
+} dense_httpvfs_pages;
+
 #define DENSE_ANN_FCNTL_PREFETCH 0x44414e01   /* "DAN\1" */
 
 typedef struct dense_ann_prefetch_req {
@@ -58,27 +66,27 @@ typedef struct PageReader {
 } PageReader;
 
 /* Set up direct reads of database zDb. Returns 0 if possible. */
-int pr_open(PageReader *pr, sqlite3 *db, const char *zDb);
+int dnpr_open(PageReader *pr, sqlite3 *db, const char *zDb);
 
 /* Read page pgno (1-based) into buf[pgsz]. Returns SQLITE_OK on success. */
-int pr_read(PageReader *pr, uint32_t pgno, uint8_t *buf);
+int dnpr_read(PageReader *pr, uint32_t pgno, uint8_t *buf);
 
 /* Announce the pages about to be read (see above). pgnos need not be sorted. */
-void pr_prefetch(PageReader *pr, const uint32_t *pgnos, int n);
+void dnpr_prefetch(PageReader *pr, const uint32_t *pgnos, int n);
 
 /* In table-leaf page `page` (number pgno), find the cell with the given rowid.
 ** On success sets *payload and *plen to the record and returns 1. Returns 0 if
 ** the page is not a table leaf, the rowid is absent, or the payload spills
 ** to overflow pages. */
-int pr_leaf_find(const PageReader *pr, const uint8_t *page, uint32_t pgno, int64_t rowid,
+int dnpr_leaf_find(const PageReader *pr, const uint8_t *page, uint32_t pgno, int64_t rowid,
                  const uint8_t **payload, int *plen);
 
 /* Column `col` of a record, which must be a BLOB or TEXT. Returns 1 on success. */
-int pr_record_blob(const uint8_t *rec, int len, int col, const uint8_t **p, int *n);
+int dnpr_record_blob(const uint8_t *rec, int len, int col, const uint8_t **p, int *n);
 
 /* Walk every leaf cell of the table b-tree rooted at `root`, calling
 ** cb(ctx, rowid, leaf_pgno, overflows). Returns SQLITE_OK on success. */
-typedef void (*pr_walk_cb)(void *ctx, int64_t rowid, uint32_t pgno, int overflow);
-int pr_walk_table(PageReader *pr, uint32_t root, pr_walk_cb cb, void *ctx);
+typedef void (*dnpr_walk_cb)(void *ctx, int64_t rowid, uint32_t pgno, int overflow);
+int dnpr_walk_table(PageReader *pr, uint32_t root, dnpr_walk_cb cb, void *ctx);
 
 #endif

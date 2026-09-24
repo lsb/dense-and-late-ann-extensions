@@ -7,7 +7,7 @@
 #include <float.h>
 #include <stdio.h>
 
-int pq_init(PQ *pq, int dim, int m) {
+int dnpq_init(PQ *pq, int dim, int m) {
   memset(pq, 0, sizeof *pq);
   if (m <= 0 || dim % m != 0) return 1;
   pq->dim = dim; pq->m = m; pq->dsub = dim / m;
@@ -15,13 +15,13 @@ int pq_init(PQ *pq, int dim, int m) {
   return pq->cent ? 0 : 1;
 }
 
-void pq_free(PQ *pq) {
+void dnpq_free(PQ *pq) {
   free(pq->cent);
   free(pq->rot);
   memset(pq, 0, sizeof *pq);
 }
 
-void pq_round_f16(PQ *pq) {
+void dnpq_round_f16(PQ *pq) {
   size_t n = (size_t)pq->m * PQ_KSUB * pq->dsub;
   for (size_t i = 0; i < n; i++) pq->cent[i] = dn_f16_to_f32(dn_f32_to_f16(pq->cent[i]));
 }
@@ -219,9 +219,9 @@ static void gram_row(void *vctx, int64_t i, int thread) {   /* M[i,:] = sum_r S[
   free(acc);
 }
 
-int pq_train(PQ *pq, const float *x, int64_t n, int dim, int m,
+int dnpq_train(PQ *pq, const float *x, int64_t n, int dim, int m,
              int64_t max_train, int iters, int opq_iters, uint64_t seed, int nthreads) {
-  if (pq_init(pq, dim, m)) return 1;
+  if (dnpq_init(pq, dim, m)) return 1;
   /* Deterministic sample: Fisher-Yates prefix of a shuffled index list. */
   int64_t ns = (max_train > 0 && n > max_train) ? max_train : n;
   int64_t *idx = (int64_t *)malloc(sizeof(int64_t) * n);
@@ -255,8 +255,8 @@ int pq_train(PQ *pq, const float *x, int64_t n, int dim, int m,
       TrainCtx t = { Y, no, dim, pq->dsub, 4, it > 0, seed + (uint64_t)it, pq->cent };
       dn_parallel_for(m, nthreads, 1, train_subspace, &t);
       for (int64_t i = 0; i < no; i++) {
-        pq_encode(&plain, Y + i * dim, code);
-        pq_decode(&plain, code, Yh + i * dim);
+        dnpq_encode(&plain, Y + i * dim, code);
+        dnpq_decode(&plain, code, Yh + i * dim);
       }
       GramCtx g = { S, Yh, M, no, dim };
       dn_parallel_for(dim, nthreads, 1, gram_row, &g);
@@ -279,7 +279,7 @@ int pq_train(PQ *pq, const float *x, int64_t n, int dim, int m,
 /* ------------------------------------------------- encode / decode */
 
 /* Encoding uses transposed centroids; they are built on the fly per call
-** for single vectors and once per batch in pq_encode_many. */
+** for single vectors and once per batch in dnpq_encode_many. */
 static void encode_t(const PQ *pq, const float *cT, const float *cn, const float *x, uint8_t *code) {
   float acc[PQ_KSUB];
   for (int j = 0; j < pq->m; j++)
@@ -296,7 +296,7 @@ static void make_transposed(const PQ *pq, float **pcT, float **pcn) {
   *pcT = cT; *pcn = cn;
 }
 
-void pq_encode(const PQ *pq, const float *x, uint8_t *code) {
+void dnpq_encode(const PQ *pq, const float *x, uint8_t *code) {
   float *cT, *cn, *y = NULL;
   make_transposed(pq, &cT, &cn);
   if (pq->rot) { y = (float *)malloc(sizeof(float) * pq->dim); rotate(pq->rot, x, y, pq->dim); x = y; }
@@ -314,7 +314,7 @@ static void encode_one(void *vctx, int64_t i, int thread) {
   encode_t(e->pq, e->cT, e->cn, x, e->codes + i * e->pq->m);
 }
 
-void pq_encode_many(const PQ *pq, const float *x, int64_t n, uint8_t *codes, int nthreads) {
+void dnpq_encode_many(const PQ *pq, const float *x, int64_t n, uint8_t *codes, int nthreads) {
   float *cT, *cn;
   make_transposed(pq, &cT, &cn);
   EncCtx e = { pq, x, codes, cT, cn };
@@ -322,13 +322,13 @@ void pq_encode_many(const PQ *pq, const float *x, int64_t n, uint8_t *codes, int
   free(cT); free(cn);
 }
 
-void pq_decode(const PQ *pq, const uint8_t *code, float *out) {
+void dnpq_decode(const PQ *pq, const uint8_t *code, float *out) {
   for (int j = 0; j < pq->m; j++)
     memcpy(out + j * pq->dsub, pq->cent + ((size_t)j * PQ_KSUB + code[j]) * pq->dsub,
            sizeof(float) * pq->dsub);
 }
 
-void pq_adc_table(const PQ *pq, const float *q, int metric, float *tab) {
+void dnpq_adc_table(const PQ *pq, const float *q, int metric, float *tab) {
   int d = pq->dsub;
   float *y = NULL;
   if (pq->rot) { y = (float *)malloc(sizeof(float) * pq->dim); rotate(pq->rot, q, y, pq->dim); q = y; }

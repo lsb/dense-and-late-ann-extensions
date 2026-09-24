@@ -12,7 +12,7 @@
 #include <stdint.h>
 
 typedef struct Hnsw {
-  /* parameters (set before hnsw_build) */
+  /* parameters (set before dnhnsw_build) */
   int dim, M, M0, efc, metric;
   float alpha;          /* neighbour-pruning slack; 1.0 = classic HNSW heuristic */
   uint64_t seed;
@@ -31,10 +31,10 @@ typedef struct Hnsw {
 
 /* Build the graph over all n vectors. Returns 0 on success. When verbose,
 ** progress is printed to stderr. */
-int hnsw_build(Hnsw *h, int nthreads, int verbose);
-void hnsw_free(Hnsw *h);
+int dnhnsw_build(Hnsw *h, int nthreads, int verbose);
+void dnhnsw_free(Hnsw *h);
 
-static inline uint32_t *hnsw_list(const Hnsw *h, uint32_t i, int lv) {
+static inline uint32_t *dnhnsw_list(const Hnsw *h, uint32_t i, int lv) {
   return lv == 0 ? h->l0 + (size_t)i * (h->M0 + 1) : h->up[i] + (size_t)(lv - 1) * (h->M + 1);
 }
 
@@ -42,8 +42,8 @@ static inline uint32_t *hnsw_list(const Hnsw *h, uint32_t i, int lv) {
 ** dist[] to the base point) with the HNSW/Vamana pruning rule. vec(i) must
 ** return the full vector of id i. Writes the chosen ids to out and returns
 ** their number. Exposed so the SQLite-side incremental insert can reuse it. */
-typedef const float *(*hnsw_vec_fn)(void *ctx, uint32_t id);
-int hnsw_select(int metric, int dim, float alpha, const uint32_t *cand, const float *dist,
-                int ncand, int cap, hnsw_vec_fn vec, void *vctx, uint32_t *out);
+typedef const float *(*dnhnsw_vec_fn)(void *ctx, uint32_t id);
+int dnhnsw_select(int metric, int dim, float alpha, const uint32_t *cand, const float *dist,
+                int ncand, int cap, dnhnsw_vec_fn vec, void *vctx, uint32_t *out);
 
 #endif

@@ -50,12 +50,13 @@ PRESETS = ["4g,h2", "lte,h2", "slow-4g,h2", "4g,h1"]
 
 def load_queries(name):
     z = np.load(REPO / "build" / "late" / f"queries-{name}.npz", allow_pickle=True)
+    V, O, K, I, R = z["vectors"], z["offsets"], z["kinds"], z["qids"], z["relevant"]
     qs = []
-    for i in range(len(z["offsets"]) - 1):
+    for i in range(len(O) - 1):
         qs.append({
-            "vec": np.ascontiguousarray(z["vectors"][z["offsets"][i]:z["offsets"][i + 1]], np.float32),
-            "kind": str(z["kinds"][i]), "qid": str(z["qids"][i]),
-            "relevant": set(int(x) for x in z["relevant"][i]),
+            "vec": np.ascontiguousarray(V[O[i]:O[i + 1]], np.float32),
+            "kind": str(K[i]), "qid": str(I[i]),
+            "relevant": set(int(x) for x in R[i]),
         })
     return qs
 
@@ -192,6 +193,22 @@ def main():
     meta = json.loads(meta_path.read_text()) if meta_path.exists() else {}
     out = {"db": a.db, "build": meta, "queries": qname, "n_queries": len(qs), "warm": not a.cold,
            "session": session_start(a.db), "results": []}
+    # reference: exact MaxSim over the original float16 vectors
+    ref = []
+    for qi, q in enumerate(qs):
+        ranked = [int(x) for x in gt_ids[qi]]
+        ref.append({"kind": q["kind"], "recall10_exact": 1.0,
+                    "recall10": metrics.recall_at(ranked, q["relevant"], 10),
+                    "mrr10": metrics.mrr_at(ranked, q["relevant"], 10),
+                    "ndcg10": metrics.ndcg_at(ranked, q["relevant"], 10),
+                    "success1": metrics.success_at(ranked, q["relevant"], 1),
+                    "auc": metrics.auc(ranked, q["relevant"], n_docs)})
+    res = {"opts": "float-exact", "all": summarize(ref)}
+    for kind in sorted({r["kind"] for r in ref}):
+        res[kind] = summarize([r for r in ref if r["kind"] == kind])
+    out["results"].append(res)
+    s = res["all"]
+    print(f"{'float-exact (reference)':50s} nDCG={s['ndcg10']:.3f} MRR={s['mrr10']:.3f}", flush=True)
     con = connect(a.db)
     for opts in a.configs:
         t = time.time()

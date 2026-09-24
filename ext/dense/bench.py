@@ -224,6 +224,7 @@ SWEEPS = {
     "full": [(ef, beam, rr) for ef in (16, 32, 64, 128) for beam in (1, 4, 8) for rr in (0, 1, 2)],
     "small": [(ef, beam, rr) for ef in (32, 64, 128) for beam in (4,) for rr in (0, 1, 2)] + [(64, 1, 2), (64, 8, 2)],
     "main": [(ef, beam, rr) for ef in (32, 64, 128) for beam in (4, 8, 16) for rr in (0, 2)] + [(256, 16, 2)],
+    "wide": [(ef, beam, 2) for ef in (32, 64, 128) for beam in (8, 16, 32, 64)],
     "rr": [(ef, 4, rr) for ef in (16, 32, 64, 128, 256) for rr in (0, 2, 3)],
 }
 
@@ -306,8 +307,8 @@ def main():
             print(f"  warning: {r['fallback']:.1f} SQL fallbacks per query (stale page hints?)")
     db.close()
 
-    cold = cold_query_pages(path, Q, args.k, 64, 4, 1)
-    print(f"cold connection, one query (ef=64, W=4, rerank): {cold['distinct']:.0f} distinct pages, "
+    cold = cold_query_pages(path, Q, args.k, 64, 16, 2)
+    print(f"cold connection, one query (ef=64, W=16, rerank=2): {cold['distinct']:.0f} distinct pages, "
           f"{cold['reads']:.0f} reads, {cold['bytes'] / 1024:.0f} KiB", flush=True)
 
     out = HERE / "results"

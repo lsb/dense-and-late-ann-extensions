@@ -9,7 +9,8 @@
 **
 ** "distinct" counts distinct file offsets read since the last reset, i.e.
 ** pages that a cold HTTP VFS would have had to fetch. The shim also answers
-** the dense_ann prefetch file control, counting announced pages.
+** the prefetch file controls (httpvfs's page prefetch and dense_ann's own),
+** counting announced pages.
 */
 #include "sqlite3ext.h"
 SQLITE_EXTENSION_INIT1
@@ -20,6 +21,8 @@ SQLITE_EXTENSION_INIT1
 
 #define DENSE_ANN_FCNTL_PREFETCH 0x44414e01
 typedef struct { int n; int len; const sqlite3_int64 *offsets; } prefetch_req;
+#define HTTPVFS_FCNTL_PREFETCH_PAGES 0x48560002   /* as in wasm/src/httpvfs.h */
+typedef struct { const unsigned int *pgnos; int n; int page_size; } httpvfs_pages;
 
 typedef struct CountFile {
   sqlite3_file base;
@@ -76,6 +79,11 @@ static int cFileControl(sqlite3_file *f, int op, void *arg) {
   if (op == DENSE_ANN_FCNTL_PREFETCH) {
     const prefetch_req *r = (const prefetch_req *)arg;
     g.prefetch_calls++; g.prefetch_pages += r->n;
+    return SQLITE_OK;
+  }
+  if (op == HTTPVFS_FCNTL_PREFETCH_PAGES) {
+    const httpvfs_pages *p = (const httpvfs_pages *)arg;
+    g.prefetch_calls++; g.prefetch_pages += p->n;
     return SQLITE_OK;
   }
   return REAL(f)->pMethods->xFileControl(REAL(f), op, arg);
