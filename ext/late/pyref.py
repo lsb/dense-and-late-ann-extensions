@@ -95,7 +95,8 @@ class Index:
             cen, ivf, post, q = [], [], [], 0
             for g in range(G):
                 kg = int(start[g + 1] - start[g])
-                cen.append(np.frombuffer(cells, np.float16, kg * D, q).astype(np.float32).reshape(kg, D)); q += 2 * kg * D
+                c, q = decode_centroids(cells, q, kg, D, self.cq)
+                cen.append(c)
                 if self.layout & LAY_PLAID:
                     ivf.append(np.frombuffer(cells, np.uint32, kg, q)); q += 4 * kg
                 if self.layout & LAY_WARP:
@@ -119,6 +120,8 @@ class Index:
 
     def decode(self, codes, residuals):
         """codes [n], residuals uint8 [n, rbytes] -> unit vectors [n, dim]."""
+        if len(codes) == 0:
+            return np.zeros((0, self.dim), np.float32)
         b = self.byte_buckets[residuals].reshape(len(codes), -1)
         v = self.centroids[codes] + self.weights[b]
         return v / np.maximum(np.linalg.norm(v, axis=1, keepdims=True), 1e-12)

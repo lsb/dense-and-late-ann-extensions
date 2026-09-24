@@ -43,6 +43,37 @@ export class SearchIndex {
   constructor(opts) {
     this.opts = opts;
     this.encoders = {};   // which -> {call, worker, loaded: Promise<loadStats>}
+    this.warming = {};    // table -> Promise<warm stats>
+  }
+
+  /**
+   * Load the per-connection static data of indexes now (PQ codebooks, entry
+   * sets, IVF and late-interaction centroids, FTS5 structure), in the
+   * background: a search issued meanwhile is served first. systems: a list
+   * of 'fts' | 'dense' | 'late' | table names (default: every index); each
+   * index is warmed once. Resolves to [{table, ms, rounds, requests, bytes}].
+   */
+  warm(systems) {
+    const tables = new Set();
+    for (const s of systems || this.indexes.map((i) => i.table)) {
+      const hit = this.indexes.filter((i) => i.table === s || i.kind === s);
+      if (!hit.length) throw new Error(`this database has no ${s} index`);
+      for (const i of hit) tables.add(i.table);
+    }
+    return Promise.all([...tables].map((t) => {
+      this.warming[t] ||= this.sql('warm', { table: t }).catch((e) => ({ table: t, error: String(e.message || e) }));
+      return this.warming[t];
+    }));
+  }
+
+  /** opts.warm = 'auto': warm the indexes an encoder serves when it starts loading. */
+  _autoWarm(which) {
+    if ((this.opts.warm ?? 'auto') !== 'auto' || !this.indexes) return;
+    const kind = which === 'minilm' ? 'dense' : 'late';
+    // smallest static data first: the graph's entry set and codebook, then IVF
+    const order = (i) => (i.layout === 'graph' ? 0 : 1);
+    const idx = this.indexes.filter((i) => i.kind === kind).sort((a, b) => order(a) - order(b));
+    if (idx.length) this.warm(idx.map((i) => i.table));
   }
 
   /**
@@ -74,6 +105,7 @@ export class SearchIndex {
       e.loaded.catch(() => { delete this.encoders[which]; worker.terminate(); });
     }
     if (onProgress) e.listeners.add(onProgress);
+    this._autoWarm(which);
     return e.loaded;
   }
 
@@ -161,6 +193,11 @@ export class SearchIndex {
  *   preload          ['minilm', 'lateon']: start loading encoders now
  *   modelCache       keep model files in Cache Storage (default true)
  *   encoderThreads   ONNX Runtime threads (needs cross-origin isolation; default 1)
+ *   warm             load indexes' static data in the background, while the
+ *                    encoders load: 'auto' (default: FTS5 at once, and the
+ *                    indexes of each encoder as soon as it starts loading,
+ *                    e.g. through preload), true (every index at once),
+ *                    false, or a list of systems / tables
  */
 export async function openIndex(url, opts = {}) {
   const ix = new SearchIndex({ ...opts, modelBase: absUrl(opts.modelBase || PATHS.modelBase || './', 'modelBase') });
@@ -183,5 +220,12 @@ export async function openIndex(url, opts = {}) {
     encoder: i.kind === 'dense' ? 'minilm' : i.kind === 'late' ? 'lateon' : null,
     defaults: DEFAULT_PARAMS[paramsKey(i)],
   }));
+  const w = opts.warm ?? 'auto';
+  if (w === true) ix.warm();
+  else if (Array.isArray(w)) ix.warm(w);
+  else if (w === 'auto') {
+    if (ix.indexes.some((i) => i.kind === 'fts')) ix.warm(['fts']);
+    for (const which of Object.keys(ix.encoders)) ix._autoWarm(which);
+  }
   return ix;
 }

@@ -235,6 +235,29 @@ class LatePlaidTest(unittest.TestCase):
         got = [query(con, self.q, o, k=10)[:2] for o in ("layout=warp nprobe=8", "layout=plaid approx=ivf nprobe=4")]
         self.assertEqual(got, want)
 
+    def test_lazy_cells(self):
+        """lazy_cells=G: the flat centroids in G cells fetched on demand. With
+        every cell probed the results equal the flat index's; the static data
+        shrinks to the cell directory."""
+        flat = self._build("lazy-flat.db", "nbits=2, layout=warp, centroid_type=int8")
+        lazy = self._build("lazy.db", "nbits=2, layout=warp, centroid_type=int8, lazy_cells=16")
+        import sqlite3
+        ref = pyref.Index(sqlite3.connect(lazy))
+        self.assertEqual((ref.G, ref.cq), (16, 1))
+        np.testing.assert_array_equal(ref.centroids, pyref.Index(sqlite3.connect(flat)).centroids)
+        cf, cl = connect(flat), connect(lazy)
+        want, wsc, stf = query(cf, self.q, "nprobe=8")
+        got, gsc, stl = query(cl, self.q, "nprobe=8 cprobe=16")
+        self.assertEqual(want, got)
+        np.testing.assert_allclose(wsc, gsc, rtol=1e-6)
+        self.assertLess(stl["static_bytes"], stf["static_bytes"] / 4)
+        self.assertEqual(stl["cells_loaded"], 16)
+        cl2 = connect(lazy)
+        ids, _, st = query(cl2, self.q, "nprobe=8 cprobe=2")
+        self.assertIn(7, ids[:3])
+        self.assertLess(st["cells_loaded"], 16)
+        self.assertEqual(st["cell_rounds"], 1)
+
     def test_unknown_version_is_a_clear_error(self):
         import sqlite3
         import struct

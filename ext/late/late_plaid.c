@@ -89,7 +89,8 @@ typedef struct LtCfg {
   int order;                   /* renumber centroids so that similar ones are adjacent */
   int refine;                  /* two-level: global Lloyd iterations after the per-cell k-means */
   int fast_assign;             /* flat: assign through sqrt(K) groups of centroids (approximate) */
-  int cq;                      /* CQ_*: storage of the (flat) centroids in the static data */
+  int cq;                      /* CQ_*: storage of the centroids (flat table or cell blocks) */
+  int lazy_cells;              /* > 0: flat k-means centroids stored in this many cells, fetched on demand */
   int64_t sample_docs, mem_mb, heldout_max, sample_tokens;
   uint64_t seed;
 } LtCfg;
@@ -142,6 +143,7 @@ static int cfg_parse(LtCfg *c, int argc, const char *const *argv, char **pzErr) 
     else if (!strcmp(key, "refine")) c->refine = (int)iv;
     else if (!strcmp(key, "fast_assign")) c->fast_assign = (int)iv;
     else if (!strcmp(key, "input")) c->input_f16 = !strcmp(val, "f16");
+    else if (!strcmp(key, "lazy_cells")) c->lazy_cells = (int)iv;
     else if (!strcmp(key, "centroid_type")) {
       if (!strcmp(val, "f16")) c->cq = CQ_F16;
       else if (!strcmp(val, "int8")) c->cq = CQ_INT8;
@@ -161,7 +163,8 @@ typedef struct LtIndex {
   int loaded;
   LtCodec codec;
   int K, dim, nbits, layout, kbits, idbits, chunk, rowid_identity;
-  int cq;                             /* CQ_*: how the flat centroids are stored */
+  int cq;                             /* CQ_*: how the centroids are stored */
+  int lazy;                           /* build only: cells group flat centroids (exact assignment) */
   int64_t N, T, ivf_entries;
   uint32_t *ivf_cnt, *post_cnt;       /* K each (NULL if the layout is absent) */
   uint64_t *ivf_off, *post_off;       /* K+1 byte offsets in the streams */
@@ -235,8 +238,9 @@ static void ix_offsets(LtIndex *ix) {
 
 /* Size of cell g's block in the cells stream: fine centroids (float16) and
 ** the list lengths of each layout. */
+static size_t cq_bytes(int cq, int dim);
 static uint64_t cell_block_bytes(const LtIndex *ix, uint32_t kg) {
-  return (uint64_t)kg * (2u * ix->dim + ((ix->layout & LAY_PLAID) ? 4 : 0) + ((ix->layout & LAY_WARP) ? 4 : 0));
+  return (uint64_t)kg * (cq_bytes(ix->cq, ix->dim) + ((ix->layout & LAY_PLAID) ? 4 : 0) + ((ix->layout & LAY_WARP) ? 4 : 0));
 }
 
 /* Bytes of one stored centroid of type cq (dimension dim). */
@@ -308,7 +312,8 @@ static int get_varint(const uint8_t **q, const uint8_t *end, uint32_t *v) {
 /* Serialise the static data (see LtIndex). Version 2 appends G and the
 ** cells-stream run count to the version 1 header; version 3 appends the
 ** centroid storage type and stores the list lengths of the flat table as
-** LEB128 varints instead of u32 (the two-level cells stream is unchanged). */
+** LEB128 varints instead of u32; in two-level mode the centroid type also
+** applies to the fine centroids of the cell blocks (list lengths stay u32). */
 static void ix_serialize(const LtIndex *ix, LtBuf *b) {
   const LtCodec *cd = &ix->codec;
   lt_buf_u32(b, LT_MAGIC); lt_buf_u32(b, LT_VERSION);
@@ -318,7 +323,7 @@ static void ix_serialize(const LtIndex *ix, LtBuf *b) {
   lt_buf_add(b, cd->cutoffs, 64); lt_buf_add(b, cd->weights, 64); lt_buf_add(b, &cd->cluster_threshold, 4);
   lt_buf_u32(b, ix->n_ivf_runs); lt_buf_u32(b, ix->n_post_runs);
   lt_buf_u32(b, ix->G); lt_buf_u32(b, ix->n_cell_runs);
-  lt_buf_u32(b, ix->G ? CQ_F16 : ix->cq);
+  lt_buf_u32(b, ix->cq);
   if (ix->G == 0) {
     size_t cb = cq_bytes(ix->cq, ix->dim);
     uint8_t *tmp = (uint8_t *)malloc(cb);
@@ -418,8 +423,9 @@ static int cell_install(LtIndex *ix, int g, const uint8_t *blk) {
   uint32_t c0 = ix->cell_start[g], kg = ix->cell_start[g + 1] - c0;
   float *cc = (float *)malloc(sizeof(float) * (size_t)(kg ? kg : 1) * ix->dim);
   if (!cc) return SQLITE_NOMEM;
-  for (size_t i = 0; i < (size_t)kg * ix->dim; i++) cc[i] = lt_h2f((uint16_t)(blk[2 * i] | (blk[2 * i + 1] << 8)));
-  const uint8_t *q = blk + (size_t)kg * ix->dim * 2;
+  size_t cb = cq_bytes(ix->cq, ix->dim);
+  for (uint32_t j = 0; j < kg; j++) cq_decode(ix->cq, blk + j * cb, ix->dim, cc + (size_t)j * ix->dim);
+  const uint8_t *q = blk + (size_t)kg * cb;
   if (ix->layout & LAY_PLAID) {
     uint64_t o = ix->cell_ivf_base[g];
     for (uint32_t j = 0; j < kg; j++, q += 4) { ix->ivf_cnt[c0 + j] = lt_get_u32(q); ix->ivf_off[c0 + j] = o; o += seg_bytes(ix, 0, ix->ivf_cnt[c0 + j]); }
@@ -720,7 +726,8 @@ static void res_range(void *vctx, int64_t lo, int64_t hi, int tid) {
 
 /* Nearest centroid for n vectors (exact, or two-level approximate). */
 static void assign(const LtIndex *ix, const LtCfg *cfg, const float *X, int64_t n, uint32_t *out) {
-  if (ix->G) lc_assign_hier(X, n, ix->coarse, ix->G, ix->codec.centroids, ix->cell_start, cfg->aprobe, ix->dim, out, cfg->threads);
+  if (ix->G && (!ix->lazy || cfg->fast_assign))
+    lc_assign_hier(X, n, ix->coarse, ix->G, ix->codec.centroids, ix->cell_start, cfg->aprobe, ix->dim, out, cfg->threads);
   else if (ix->ag_G) lc_assign_hier(X, n, ix->ag_coarse, ix->ag_G, ix->codec.centroids, ix->ag_start, cfg->aprobe, ix->dim, out, cfg->threads);
   else lc_assign(X, n, ix->codec.centroids, NULL, ix->K, ix->dim, out, NULL, cfg->threads);
 }
@@ -863,6 +870,7 @@ static int order_centroids(LtVtab *vt) {
   int *members = NULL;                        /* flat: centroid ids grouped by group */
   if (!G) {
     G = 1; while ((int64_t)G * G < K) G++;
+    if (vt->cfg.lazy_cells > 0) G = vt->cfg.lazy_cells < K ? vt->cfg.lazy_cells : K;
     grp = (float *)malloc(sizeof(float) * (size_t)G * dim);
     uint32_t *ga = (uint32_t *)malloc(sizeof(uint32_t) * K);
     gstart = (uint32_t *)calloc(G + 1, sizeof(uint32_t));
@@ -911,7 +919,7 @@ static int order_centroids(LtVtab *vt) {
     }
   }
   free(nstart); free(ncoarse); free(perm); free(loc); free(tmp);
-  if (!ix->G && rc == SQLITE_OK && vt->cfg.fast_assign) {
+  if (!ix->G && rc == SQLITE_OK && (vt->cfg.fast_assign || vt->cfg.lazy_cells > 0)) {
     /* keep the groups (in their new order) for approximate assignment */
     ix->ag_coarse = (float *)malloc(sizeof(float) * (size_t)G * dim);
     ix->ag_start = (uint32_t *)malloc(sizeof(uint32_t) * (G + 1));
@@ -1029,7 +1037,15 @@ static int do_build(LtVtab *vt, DocSrc *src) {
   cd->K = K;
   free(X); X = NULL;
   if (cfg->order && K > 1) { rc = order_centroids(vt); if (rc) { free(H); goto out; } }
-  ix->cq = ix->G ? CQ_F16 : cfg->cq;       /* two-level cells keep float16 */
+  if (cfg->lazy_cells > 0 && !ix->G) {
+    /* lazy cells: the flat centroids stay as they are; the ordering groups
+    ** become the cells, fetched by a query only for the groups it probes */
+    if (!ix->ag_G) { free(H); set_err(vt, "late_plaid: lazy_cells needs order=1"); rc = SQLITE_ERROR; goto out; }
+    ix->G = ix->ag_G; ix->coarse = ix->ag_coarse; ix->cell_start = ix->ag_start;
+    ix->ag_G = 0; ix->ag_coarse = NULL; ix->ag_start = NULL;
+    ix->lazy = 1;
+  }
+  ix->cq = cfg->cq;
   cq_round_trip(ix->cq, cd->centroids, K, dim);
   vlog(vt, "k-means done in %.1f s (K=%d, G=%d)", (now_ms() - t0) / 1000, K, ix->G);
   {
@@ -1187,7 +1203,8 @@ static int do_build(LtVtab *vt, DocSrc *src) {
       uint32_t c0 = ix->cell_start[g], c1 = ix->cell_start[g + 1];
       if (ix->ivf_off) ix->cell_ivf_base[g] = ix->ivf_off[c0];
       if (ix->post_off) ix->cell_post_base[g] = ix->post_off[c0];
-      for (size_t i = (size_t)c0 * dim; i < (size_t)c1 * dim; i++) { uint16_t h = lt_f2h(cd->centroids[i]); rw_write(&w, (const uint8_t *)&h, 2); }
+      uint8_t cbuf[2 + 2 * 4096];
+      for (uint32_t c = c0; c < c1; c++) { cq_encode(ix->cq, cd->centroids + (size_t)c * dim, dim, cbuf); rw_write(&w, cbuf, cq_bytes(ix->cq, dim)); }
       uint8_t b4[4];
       if (ix->layout & LAY_PLAID) for (uint32_t c = c0; c < c1; c++) { lt_put_u32(b4, ix->ivf_cnt[c]); rw_write(&w, b4, 4); }
       if (ix->layout & LAY_WARP) for (uint32_t c = c0; c < c1; c++) { lt_put_u32(b4, ix->post_cnt[c]); rw_write(&w, b4, 4); }

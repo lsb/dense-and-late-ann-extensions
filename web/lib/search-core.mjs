@@ -113,6 +113,20 @@ export function buildSql(ix, k, params) {
   throw new Error(`unknown index kind ${ix.kind}`);
 }
 
+/**
+ * The statement that makes an index load its per-connection static data
+ * (dense: PQ codebook and entry set or IVF centroids; late: centroids, list
+ * lengths and the document table's interior pages; FTS5: the structure
+ * record and the pages a term lookup walks). It returns no rows.
+ */
+export function warmSql(ix) {
+  const t = q(ix.table);
+  if (ix.kind === 'dense') return `SELECT rowid FROM ${t} WHERE embedding MATCH 'warm'`;
+  if (ix.kind === 'late') return `SELECT rowid FROM ${t} WHERE ${t} MATCH 'warm'`;
+  if (ix.kind === 'fts') return `SELECT rowid FROM ${t} WHERE ${t} MATCH '"zzwarmzz"' LIMIT 1`;
+  throw new Error(`unknown index kind ${ix.kind}`);
+}
+
 /** A database opened with wasm/pkg's open(), plus its discovered indexes. */
 export class SearchDb {
   static async open(db) {
@@ -194,6 +208,22 @@ export class SearchDb {
       rows, ext,
       stats: { searchMs: t1 - t0, docsMs, ...total, phases: { search, docs } },
     };
+  }
+
+  /**
+   * Load an index's static data now (see warmSql), so that its first search
+   * does not wait for it. Returns {table, kind, ms, rounds, requests, bytes};
+   * with an extension build that has no 'warm' command, {skipped: reason}.
+   */
+  async warm(table) {
+    const ix = this.indexes.find((i) => i.table === table) || this.resolve(table);
+    const s0 = this.db.stats();
+    const t0 = performance.now();
+    let skipped;
+    try { await this.db.queryRaw(warmSql(ix)); } catch (e) { skipped = String(e.message || e); }
+    const d = delta(s0, this.db.stats());
+    return { table: ix.table, kind: ix.kind, ms: performance.now() - t0, rounds: d.rounds, requests: d.requests,
+             bytes: d.bytes, ...(skipped ? { skipped } : {}) };
   }
 
   close() { return this.db.close(); }

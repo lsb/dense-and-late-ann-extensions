@@ -1,0 +1,28 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>time to first result</title>
+<!-- Harness for web/test/ttfr.mjs: opens a database, starts loading the
+     encoder the system needs, and searches as soon as the index is open.
+     ?db=URL&system=fts|dense|dense_ivf|late&q=TEXT&warm=auto|off -->
+<pre id="out">running…</pre>
+<script type="module">
+import { openIndex } from '../lib/index.mjs';
+
+const p = new URLSearchParams(location.search);
+const system = p.get('system') || 'late';
+const enc = system === 'fts' ? null : system === 'late' ? 'lateon' : 'minilm';
+window.ttfr = (async () => {
+  const marks = { start: performance.now() };
+  const ix = await openIndex(p.get('db'), { preload: enc ? [enc] : [], warm: p.get('warm') === 'off' ? false : 'auto' });
+  marks.open = performance.now();
+  const r = await ix.search(p.get('q') || 'volcanic eruption', { system });
+  marks.result = performance.now();
+  const encoder = enc ? await ix.loadEncoder(enc) : null;
+  const warm = await Promise.all(Object.values(ix.warming));
+  const out = { marks, rows: r.rows.map((x) => x.id), stats: r.stats, ext: r.ext, encoder, warm,
+                variant: ix.variant, open: ix.openStats };
+  document.getElementById('out').textContent = JSON.stringify(out, null, 1);
+  await ix.close();
+  return out;
+})().catch((e) => ({ error: String(e.stack || e) }));
+</script>
