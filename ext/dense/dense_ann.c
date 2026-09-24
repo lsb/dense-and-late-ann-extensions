@@ -47,7 +47,11 @@ SQLITE_EXTENSION_INIT1
 
 enum { VT_NONE = 0, VT_INT8 = 1, VT_F16 = 2, VT_F32 = 3 };
 enum { LAYOUT_COLOCATED = 0, LAYOUT_SEPARATE = 1, LAYOUT_IVF = 2 };
-enum { CENT_F16 = 0, CENT_INT8 = 1, CENT_PQ = 2 };
+enum { CENT_F16 = 0, CENT_INT8 = 1, CENT_PQ = 2, CENT_AUTO = 3 };
+enum { CB_F16 = 0, CB_INT8 = 1 };
+/* Storage format of the index head. 1 (or absent): float16 PQ codebooks.
+** 2: the codebook storage type is in config key "codebook" (CB_*). */
+#define DENSE_FORMAT_MAX 2
 enum { REORDER_AUTO = 0, REORDER_NONE = 1, REORDER_PACK = 2 };
 enum { T_NODES = 0, T_CODES = 1, T_VECS = 2, T_BLOBS = 3, T_LISTS = 4, T_COUNT = 5 };
 static const char *const TABLE_SUFFIX[T_COUNT] = { "nodes", "codes", "vectors", "blobs", "lists" };
@@ -111,6 +115,8 @@ typedef struct DenseCfg {
   int nlist;         /* coarse lists (0 = 4 sqrt(n) at build) */
   int ivf_residual;  /* 1: PQ-encode residuals x - centroid (IVFADC); 0: raw vectors */
   int ivf_cent;      /* CENT_*: storage of the coarse centroids in the cached head */
+  int cb_type;       /* CB_*: storage of the PQ codebooks in the cached head */
+  int format;        /* head format (DENSE_FORMAT_MAX when written by this build) */
   int nprobe_default, rk_default;
 } DenseCfg;
 
@@ -175,6 +181,7 @@ typedef struct DenseVtab {
 
   PageReader pr;
   int pr_state;      /* 0 = untried, 1 = ok, -1 = unavailable */
+  int bad_format;    /* config written by a newer build */
   sqlite3_stmt *st_get[T_COUNT];
 } DenseVtab;
 
@@ -357,6 +364,7 @@ static int save_params(DenseVtab *vt) {
   S("ef_search", c->ef_default); S("beam", c->beam_default); S("verbose", c->verbose);
   S("nlist", c->nlist); S("ivf_residual", c->ivf_residual); S("ivf_centroids", c->ivf_cent);
   S("nprobe", c->nprobe_default); S("rerank_k", c->rk_default);
+  S("codebook", c->cb_type); S("format", c->format);
 #undef S
   if (rc == SQLITE_OK) rc = CFG_DBL(vt, "alpha", c->alpha);
   return rc;
@@ -391,6 +399,7 @@ static int load_config(DenseVtab *vt) {
     G("ef_search", c->ef_default); G("beam", c->beam_default); G("verbose", c->verbose);
     G("nlist", c->nlist); G("ivf_residual", c->ivf_residual); G("ivf_centroids", c->ivf_cent);
     G("nprobe", c->nprobe_default); G("rerank_k", c->rk_default); G("ivf_nlist", vt->nlist);
+    G("codebook", c->cb_type); G("format", c->format);
     G("built", vt->built); G("n_nodes", vt->n_nodes); G("n_deleted", vt->n_deleted);
     G("next_id", vt->next_id); G("hints_valid", vt->hints_valid); G("n_entry", vt->n_entry);
     else if (strcmp(k, "alpha") == 0) c->alpha = sqlite3_column_double(st, 1);
@@ -398,6 +407,10 @@ static int load_config(DenseVtab *vt) {
   }
   sqlite3_finalize(st);
   layout_compute(c, &vt->rl);
+  if (c->format > DENSE_FORMAT_MAX || c->cb_type > CB_INT8) {
+    vt->bad_format = c->format;
+    return SQLITE_ERROR;
+  }
   return SQLITE_OK;
 }
 
@@ -408,7 +421,8 @@ static int parse_args(DenseCfg *c, int argc, const char *const *argv, char **pzE
   c->layout = LAYOUT_COLOCATED; c->n_entry = 1024; c->train_max = 65536; c->iters = 25;
   c->seed = 42; c->alpha = 1.0; c->reorder = REORDER_AUTO; c->nthreads = 4;
   c->ef_default = 64; c->beam_default = 16;
-  c->ivf_residual = 1; c->ivf_cent = CENT_F16; c->nprobe_default = 32; c->rk_default = 64;
+  c->ivf_residual = 1; c->ivf_cent = CENT_AUTO; c->nprobe_default = 32; c->rk_default = 64;
+  c->cb_type = CB_INT8; c->format = DENSE_FORMAT_MAX;
   for (int i = 3; i < argc; i++) {
     char key[64], val[64];
     const char *a = argv[i], *eq = strchr(a, '=');
@@ -443,7 +457,13 @@ static int parse_args(DenseCfg *c, int argc, const char *const *argv, char **pzE
       if (!strcmp(val, "f16")) c->ivf_cent = CENT_F16;
       else if (!strcmp(val, "int8")) c->ivf_cent = CENT_INT8;
       else if (!strcmp(val, "pq")) c->ivf_cent = CENT_PQ;
-      else { *pzErr = sqlite3_mprintf("dense_ann: ivf_centroids must be f16, int8 or pq"); return SQLITE_ERROR; }
+      else if (!strcmp(val, "auto")) c->ivf_cent = CENT_AUTO;
+      else { *pzErr = sqlite3_mprintf("dense_ann: ivf_centroids must be auto, f16, int8 or pq"); return SQLITE_ERROR; }
+    }
+    else if (!strcmp(key, "codebook")) {
+      if (!strcmp(val, "f16")) c->cb_type = CB_F16;
+      else if (!strcmp(val, "int8")) c->cb_type = CB_INT8;
+      else { *pzErr = sqlite3_mprintf("dense_ann: codebook must be f16 or int8"); return SQLITE_ERROR; }
     }
     else if (!strcmp(key, "metric")) {
       if (!strcmp(val, "cosine")) c->metric = METRIC_COSINE;
@@ -683,6 +703,52 @@ static int write_chunks(DenseVtab *vt, int64_t first_id, const uint8_t *data, in
   return rc;
 }
 
+/* ------------------------------------------------ codebook storage */
+
+/* Bytes of a stored PQ codebook of cb_vals values: float16 each, or per
+** sub-quantiser a float32 scale followed by its values as int8. */
+static size_t cb_bytes(int type, int m, size_t cb_vals) {
+  return type == CB_INT8 ? cb_vals + 4 * (size_t)m : 2 * cb_vals;
+}
+
+static void cb_store(int type, int m, const float *cent, size_t cb_vals, uint8_t *out) {
+  if (type != CB_INT8) { for (size_t j = 0; j < cb_vals; j++) dn_wr16(out + 2 * j, dn_f32_to_f16(cent[j])); return; }
+  size_t per = cb_vals / m;
+  for (int s = 0; s < m; s++) {
+    const float *v = cent + (size_t)s * per;
+    float mx = 0;
+    for (size_t j = 0; j < per; j++) { float a = fabsf(v[j]); if (a > mx) mx = a; }
+    float sc = mx / 127.0f;
+    uint8_t *o = out + (size_t)s * (per + 4);
+    memcpy(o, &sc, 4);                        /* little-endian hosts only, as elsewhere */
+    for (size_t j = 0; j < per; j++) {
+      long q = sc > 0 ? lroundf(v[j] / sc) : 0;
+      o[4 + j] = (uint8_t)(int8_t)(q > 127 ? 127 : q < -127 ? -127 : q);
+    }
+  }
+}
+
+static void cb_load(int type, int m, const uint8_t *in, size_t cb_vals, float *cent) {
+  if (type != CB_INT8) { for (size_t j = 0; j < cb_vals; j++) cent[j] = dn_f16_to_f32(dn_rd16(in + 2 * j)); return; }
+  size_t per = cb_vals / m;
+  for (int s = 0; s < m; s++) {
+    const uint8_t *o = in + (size_t)s * (per + 4);
+    float sc; memcpy(&sc, o, 4);
+    for (size_t j = 0; j < per; j++) cent[(size_t)s * per + j] = (float)(int8_t)o[4 + j] * sc;
+  }
+}
+
+/* Round a trained codebook to its stored values (before encoding with it). */
+static void cb_round(int type, PQ *pq) {
+  size_t n = (size_t)pq->m * PQ_KSUB * pq->dsub;
+  if (type != CB_INT8) { dnpq_round_f16(pq); return; }
+  uint8_t *tmp = (uint8_t *)malloc(cb_bytes(type, pq->m, n));
+  if (!tmp) { dnpq_round_f16(pq); return; }
+  cb_store(type, pq->m, pq->cent, n, tmp);
+  cb_load(type, pq->m, tmp, n, pq->cent);
+  free(tmp);
+}
+
 /* Chunked blobs that make up the cached index head, by config key. */
 static const char *const HEAD_LISTS[] = {
   "codebook_chunks", "entry_chunks", "rotation_chunks", "ivf_head_chunks", "ivf_cpq_chunks"
@@ -730,8 +796,8 @@ static int ensure_loaded(DenseVtab *vt, int raw, QStats *st) {
     dnpq_free(&vt->pq);
     if (dnpq_init(&vt->pq, c->dim, c->m)) rc = SQLITE_NOMEM;
   }
-  if (rc == SQLITE_OK && plen[0] != cb_vals * 2) rc = SQLITE_CORRUPT;
-  for (size_t i = 0; rc == SQLITE_OK && i < cb_vals; i++) vt->pq.cent[i] = dn_f16_to_f32(dn_rd16(part[0] + 2 * i));
+  if (rc == SQLITE_OK && plen[0] != cb_bytes(c->cb_type, c->m, cb_vals)) rc = SQLITE_CORRUPT;
+  if (rc == SQLITE_OK) cb_load(c->cb_type, c->m, part[0], cb_vals, vt->pq.cent);
   size_t esz = (size_t)vt->n_entry * (8 + c->m);
   if (rc == SQLITE_OK && plen[1] != esz) rc = SQLITE_CORRUPT;
   if (rc == SQLITE_OK) { free(vt->entries); vt->entries = part[1]; part[1] = NULL; }
@@ -748,8 +814,8 @@ static int ensure_loaded(DenseVtab *vt, int raw, QStats *st) {
     if (rc == SQLITE_OK && c->ivf_cent == CENT_PQ) {
       dnpq_free(&vt->ivf_cpq);
       if (dnpq_init(&vt->ivf_cpq, c->dim, c->m)) rc = SQLITE_NOMEM;
-      else if (plen[4] != cb_vals * 2) rc = SQLITE_CORRUPT;
-      else for (size_t i = 0; i < cb_vals; i++) vt->ivf_cpq.cent[i] = dn_f16_to_f32(dn_rd16(part[4] + 2 * i));
+      else if (plen[4] != cb_bytes(c->cb_type, c->m, cb_vals)) rc = SQLITE_CORRUPT;
+      else cb_load(c->cb_type, c->m, part[4], cb_vals, vt->ivf_cpq.cent);
     }
     if (rc == SQLITE_OK) {
       free(vt->ivf_head); vt->ivf_head = part[3]; part[3] = NULL;
@@ -1167,7 +1233,7 @@ static int do_build(DenseVtab *vt) {
   if (dnpq_train(&pq, X, n, dim, m, c->train_max, c->iters, c->opq, (uint64_t)c->seed, c->nthreads)) {
     free(X); free(rowids); return SQLITE_NOMEM;
   }
-  dnpq_round_f16(&pq);
+  cb_round(c->cb_type, &pq);
   uint8_t *codes = (uint8_t *)malloc((size_t)n * m);
   dnpq_encode_many(&pq, X, n, codes, c->nthreads);
   double t_pq = now_ms();
@@ -1252,12 +1318,12 @@ static int do_build(DenseVtab *vt) {
     free(vb);
   }
 
-  /* 6. Codebook (float16) and entry set, as chunked blobs. */
-  size_t cb_vals = (size_t)m * PQ_KSUB * pq.dsub;
-  uint8_t *cb = (uint8_t *)malloc(cb_vals * 2);
-  for (size_t j = 0; j < cb_vals; j++) dn_wr16(cb + 2 * j, dn_f32_to_f16(pq.cent[j]));
+  /* 6. Codebook (float16 or int8) and entry set, as chunked blobs. */
+  size_t cb_vals = (size_t)m * PQ_KSUB * pq.dsub, cbn = cb_bytes(c->cb_type, m, cb_vals);
+  uint8_t *cb = (uint8_t *)malloc(cbn);
+  cb_store(c->cb_type, m, pq.cent, cb_vals, cb);
   uint8_t *list = NULL; int nlist = 0;
-  if (rc == SQLITE_OK) rc = write_chunks(vt, CHUNK_ID_CODEBOOK, cb, (int64_t)cb_vals * 2, &list, &nlist);
+  if (rc == SQLITE_OK) rc = write_chunks(vt, CHUNK_ID_CODEBOOK, cb, (int64_t)cbn, &list, &nlist);
   if (rc == SQLITE_OK) rc = CFG_BLOB(vt, "codebook_chunks", list, nlist);
   free(list); list = NULL; free(cb);
   if (pq.rot) {
@@ -1814,6 +1880,11 @@ static int build_ivf(DenseVtab *vt, const float *X, const int64_t *rowids, int64
   int nlist = c->nlist > 0 ? c->nlist : (int)(4 * sqrt((double)n));
   if (nlist < 1) nlist = 1;
   if (nlist > n) nlist = (int)n;
+  if (c->ivf_cent == CENT_AUTO) {       /* int8 is lossless in practice; PQ pays off from ~1,000 lists */
+    c->ivf_cent = nlist >= 1024 ? CENT_PQ : CENT_INT8;
+    rc = CFG_INT(vt, "ivf_centroids", c->ivf_cent);
+    if (rc) return rc;
+  }
 
   /* 1. Coarse k-means (10 iterations on a sample of 40 points per list, at least 65,536). */
   float *C = (float *)malloc(sizeof(float) * (size_t)nlist * dim);
@@ -1826,7 +1897,7 @@ static int build_ivf(DenseVtab *vt, const float *X, const int64_t *rowids, int64
   PQ cpq; memset(&cpq, 0, sizeof cpq);
   if (c->ivf_cent == CENT_PQ) {
     dnpq_train(&cpq, C, nlist, dim, m, nlist, 25, 0, (uint64_t)c->seed ^ 0xC0A5, c->nthreads);
-    dnpq_round_f16(&cpq);
+    cb_round(c->cb_type, &cpq);
     dnpq_encode_many(&cpq, C, nlist, head, c->nthreads);   /* codes are contiguous: stride m = cb */
   } else {
     DenseCfg tc = ivf_cent_cfg(c);
@@ -1858,7 +1929,7 @@ static int build_ivf(DenseVtab *vt, const float *X, const int64_t *rowids, int64
   if (dnpq_train(&pq, Rx, n, dim, m, c->train_max, c->iters, c->opq, (uint64_t)c->seed, c->nthreads)) {
     free(assign); free(Rbuf); return SQLITE_NOMEM;
   }
-  dnpq_round_f16(&pq);
+  cb_round(c->cb_type, &pq);
   uint8_t *codes = (uint8_t *)malloc((size_t)n * m);
   dnpq_encode_many(&pq, Rx, n, codes, c->nthreads);
   free(Rbuf);
@@ -1931,17 +2002,17 @@ static int build_ivf(DenseVtab *vt, const float *X, const int64_t *rowids, int64
   sqlite3_finalize(st); st = 0;
 
   /* 7. Head parts: PQ codebook, rotation, centroids + directory, centroid PQ. */
-  size_t cb_vals = (size_t)m * PQ_KSUB * pq.dsub;
+  size_t cb_vals = (size_t)m * PQ_KSUB * pq.dsub, cbn = cb_bytes(c->cb_type, m, cb_vals);
   uint8_t *buf = (uint8_t *)malloc(cb_vals * 2 > (size_t)dim * dim * 2 ? cb_vals * 2 : (size_t)dim * dim * 2);
-  for (size_t j = 0; j < cb_vals; j++) dn_wr16(buf + 2 * j, dn_f32_to_f16(pq.cent[j]));
-  if (rc == SQLITE_OK) rc = write_named_chunks(vt, "codebook_chunks", CHUNK_ID_CODEBOOK, buf, (int64_t)cb_vals * 2);
+  cb_store(c->cb_type, m, pq.cent, cb_vals, buf);
+  if (rc == SQLITE_OK) rc = write_named_chunks(vt, "codebook_chunks", CHUNK_ID_CODEBOOK, buf, (int64_t)cbn);
   if (rc == SQLITE_OK && pq.rot) {
     for (size_t j = 0; j < (size_t)dim * dim; j++) dn_wr16(buf + 2 * j, dn_f32_to_f16(pq.rot[j]));
     rc = write_named_chunks(vt, "rotation_chunks", CHUNK_ID_ROTATION, buf, (int64_t)dim * dim * 2);
   }
   if (rc == SQLITE_OK && c->ivf_cent == CENT_PQ) {
-    for (size_t j = 0; j < cb_vals; j++) dn_wr16(buf + 2 * j, dn_f32_to_f16(vt->ivf_cpq.cent[j]));
-    rc = write_named_chunks(vt, "ivf_cpq_chunks", CHUNK_ID_IVF_CPQ, buf, (int64_t)cb_vals * 2);
+    cb_store(c->cb_type, m, vt->ivf_cpq.cent, cb_vals, buf);
+    rc = write_named_chunks(vt, "ivf_cpq_chunks", CHUNK_ID_IVF_CPQ, buf, (int64_t)cbn);
   }
   free(buf);
   if (rc == SQLITE_OK) rc = write_named_chunks(vt, "ivf_head_chunks", CHUNK_ID_IVF_HEAD, head, ivf_head_len(vt));
@@ -2372,7 +2443,10 @@ static int dense_connect_common(sqlite3 *db, int argc, const char *const *argv, 
     }
   } else {
     rc = load_config(vt);
-    if (rc) *pzErr = sqlite3_mprintf("dense_ann: cannot read config: %s", sqlite3_errmsg(db));
+    if (rc && vt->bad_format)
+      *pzErr = sqlite3_mprintf("dense_ann: index format %d is not supported by this build (it reads formats 1-%d); "
+                               "rebuild the index or upgrade the extension", vt->bad_format, DENSE_FORMAT_MAX);
+    else if (rc) *pzErr = sqlite3_mprintf("dense_ann: cannot read config: %s", sqlite3_errmsg(db));
   }
   if (rc == SQLITE_OK) {
     char *schema = sqlite3_mprintf(
@@ -2536,6 +2610,19 @@ static int dense_filter(sqlite3_vtab_cursor *pCur, int idxNum, const char *idxSt
     if (cur->k > 100000) cur->k = 100000;
     if (cur->ef > 100000) cur->ef = 100000;
 
+    if (sqlite3_value_type(qv) == SQLITE_TEXT && !sqlite3_stricmp((const char *)sqlite3_value_text(qv), "warm")) {
+      /* MATCH 'warm': load the index head (codebook, entry set or IVF
+      ** centroids) now, so that the first real query does not pay for it. */
+      QStats st; memset(&st, 0, sizeof st);
+      double t0 = now_ms();
+      if (vt->built) rc = ensure_loaded(vt, sqlite3_get_autocommit(vt->db), &st);
+      st.ms = now_ms() - t0;
+      char *js = stats_json(&st);
+      cur->stats = sqlite3_mprintf("%s,\"warm\":1}", js);
+      sqlite3_free(js);
+      cur->mode = 1;              /* no rows */
+      return rc;
+    }
     char *err = NULL;
     float *q = parse_vector(qv, vt->cfg.dim, &err);
     if (!q) { sqlite3_free(vt->base.zErrMsg); vt->base.zErrMsg = err; return SQLITE_ERROR; }

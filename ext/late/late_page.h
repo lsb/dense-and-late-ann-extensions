@@ -68,6 +68,12 @@ int lpg_multiget(LpReader *r, const char *zTable, uint32_t root, LpRow *rows, in
 typedef int (*lpg_scan_cb)(void *ctx, int64_t rowid, uint32_t pgno, const uint8_t *data, int len);
 int lpg_scan(LpReader *r, uint32_t root, lpg_scan_cb cb, void *ctx);
 
+/* Read the interior pages of a table b-tree into the interior cache, one
+** level per round, without reading its leaves: a level is read only while
+** it is at most max_pages pages and much smaller (1/16) than the estimated
+** leaf count. Returns the number of pages read, or -1 on error. */
+int lpg_warm_interior(LpReader *r, uint32_t root, int64_t est_leaves, int max_pages);
+
 /* Root page of a table, via sqlite_schema. 0 if absent. */
 uint32_t lpg_root(sqlite3 *db, const char *zDb, const char *zTable);
 

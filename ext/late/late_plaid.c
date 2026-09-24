@@ -59,7 +59,10 @@ SQLITE_EXTENSION_INIT1
 #include "late_page.h"
 
 #define LT_MAGIC 0x3150544cu   /* "LTP1" */
-#define LT_VERSION 2
+#define LT_VERSION 3          /* 3: centroid storage type, varint list lengths */
+#define LT_VERSION_MAX 3
+
+enum { CQ_F16 = 0, CQ_INT8 = 1, CQ_INT4 = 2 };
 
 enum { LAY_PLAID = 1, LAY_WARP = 2 };
 enum { COL_VECTORS = 0, COL_SCORE, COL_K, COL_NPROBE, COL_OPTS, COL_STATS, COL_CMD, NCOL };
@@ -86,6 +89,7 @@ typedef struct LtCfg {
   int order;                   /* renumber centroids so that similar ones are adjacent */
   int refine;                  /* two-level: global Lloyd iterations after the per-cell k-means */
   int fast_assign;             /* flat: assign through sqrt(K) groups of centroids (approximate) */
+  int cq;                      /* CQ_*: storage of the (flat) centroids in the static data */
   int64_t sample_docs, mem_mb, heldout_max, sample_tokens;
   uint64_t seed;
 } LtCfg;
@@ -138,6 +142,12 @@ static int cfg_parse(LtCfg *c, int argc, const char *const *argv, char **pzErr) 
     else if (!strcmp(key, "refine")) c->refine = (int)iv;
     else if (!strcmp(key, "fast_assign")) c->fast_assign = (int)iv;
     else if (!strcmp(key, "input")) c->input_f16 = !strcmp(val, "f16");
+    else if (!strcmp(key, "centroid_type")) {
+      if (!strcmp(val, "f16")) c->cq = CQ_F16;
+      else if (!strcmp(val, "int8")) c->cq = CQ_INT8;
+      else if (!strcmp(val, "int4")) c->cq = CQ_INT4;
+      else { *pzErr = sqlite3_mprintf("late_plaid: centroid_type must be f16, int8 or int4"); return SQLITE_ERROR; }
+    }
     else { *pzErr = sqlite3_mprintf("late_plaid: unknown option '%s'", key); return SQLITE_ERROR; }
   }
   if (c->nbits != 1 && c->nbits != 2 && c->nbits != 4) { *pzErr = sqlite3_mprintf("late_plaid: nbits must be 1, 2 or 4"); return SQLITE_ERROR; }
@@ -151,6 +161,7 @@ typedef struct LtIndex {
   int loaded;
   LtCodec codec;
   int K, dim, nbits, layout, kbits, idbits, chunk, rowid_identity;
+  int cq;                             /* CQ_*: how the flat centroids are stored */
   int64_t N, T, ivf_entries;
   uint32_t *ivf_cnt, *post_cnt;       /* K each (NULL if the layout is absent) */
   uint64_t *ivf_off, *post_off;       /* K+1 byte offsets in the streams */
@@ -159,6 +170,8 @@ typedef struct LtIndex {
   uint32_t root_meta, root_docs, root_ivf, root_post, root_rowids, root_cells;
   int64_t static_bytes;
   int load_rounds;
+  int bad_version;                    /* static data of an unknown format version */
+  int warm_rounds, warm_pages;        /* 'warm': interior pages of the document table */
   /* Two-level centroids (G > 0): only the G coarse centroids are static;
   ** each cell's fine centroids and list lengths form a block of the "cells"
   ** stream, fetched when a query first probes the cell. Fine centroid ids
@@ -226,8 +239,76 @@ static uint64_t cell_block_bytes(const LtIndex *ix, uint32_t kg) {
   return (uint64_t)kg * (2u * ix->dim + ((ix->layout & LAY_PLAID) ? 4 : 0) + ((ix->layout & LAY_WARP) ? 4 : 0));
 }
 
+/* Bytes of one stored centroid of type cq (dimension dim). */
+static size_t cq_bytes(int cq, int dim) {
+  return cq == CQ_INT8 ? 2 + (size_t)dim : cq == CQ_INT4 ? 2 + (size_t)dim / 2 : 2 * (size_t)dim;
+}
+
+/* Quantise one centroid: float16 per-centroid scale, then int8 (-127..127)
+** or int4 (-7..7, two per byte, low nibble first, offset binary). */
+static void cq_encode(int cq, const float *c, int dim, uint8_t *out) {
+  if (cq == CQ_F16) {
+    for (int d = 0; d < dim; d++) { uint16_t h = lt_f2h(c[d]); out[2 * d] = (uint8_t)h; out[2 * d + 1] = (uint8_t)(h >> 8); }
+    return;
+  }
+  int qmax = cq == CQ_INT8 ? 127 : 7;
+  float m = 0;
+  for (int d = 0; d < dim; d++) { float a = fabsf(c[d]); if (a > m) m = a; }
+  uint16_t hs = lt_f2h(m / qmax);
+  float s = lt_h2f(hs);
+  out[0] = (uint8_t)hs; out[1] = (uint8_t)(hs >> 8);
+  for (int d = 0; d < dim; d++) {
+    long v = s > 0 ? lroundf(c[d] / s) : 0;
+    if (v > qmax) v = qmax;
+    if (v < -qmax) v = -qmax;
+    if (cq == CQ_INT8) out[2 + d] = (uint8_t)(int8_t)v;
+    else if (d & 1) out[2 + d / 2] |= (uint8_t)((v + 8) << 4);
+    else out[2 + d / 2] = (uint8_t)(v + 8);
+  }
+}
+
+static void cq_decode(int cq, const uint8_t *in, int dim, float *c) {
+  if (cq == CQ_F16) { for (int d = 0; d < dim; d++) c[d] = lt_h2f((uint16_t)(in[2 * d] | (in[2 * d + 1] << 8))); return; }
+  float s = lt_h2f((uint16_t)(in[0] | (in[1] << 8)));
+  for (int d = 0; d < dim; d++) {
+    int v = cq == CQ_INT8 ? (int)(int8_t)in[2 + d] : (int)((in[2 + d / 2] >> ((d & 1) * 4)) & 15) - 8;
+    c[d] = (float)v * s;
+  }
+}
+
+/* Replace every centroid by its stored (quantised) value, so that residuals
+** are computed against exactly what a query will see. */
+static void cq_round_trip(int cq, float *C, int64_t K, int dim) {
+  if (cq == CQ_F16) return;
+  uint8_t buf[2 + 4096];
+  if (dim > 4096) return;
+  for (int64_t k = 0; k < K; k++) {
+    cq_encode(cq, C + (size_t)k * dim, dim, buf);
+    cq_decode(cq, buf, dim, C + (size_t)k * dim);
+  }
+}
+
+static void buf_varint(LtBuf *b, uint32_t v) {
+  uint8_t t[5]; int n = 0;
+  do { t[n++] = (uint8_t)((v & 0x7f) | (v > 0x7f ? 0x80 : 0)); v >>= 7; } while (v);
+  lt_buf_add(b, t, n);
+}
+
+static int get_varint(const uint8_t **q, const uint8_t *end, uint32_t *v) {
+  uint32_t x = 0;
+  for (int sh = 0; sh < 35; sh += 7) {
+    if (*q >= end) return 0;
+    uint8_t c = *(*q)++;
+    x |= (uint32_t)(c & 0x7f) << sh;
+    if (!(c & 0x80)) { *v = x; return 1; }
+  }
+  return 0;
+}
+
 /* Serialise the static data (see LtIndex). Version 2 appends G and the
-** cells-stream run count to the version 1 header. */
+** cells-stream run count to the version 1 header; version 3 appends the
+** centroid storage type and stores the list lengths of the flat table as
+** LEB128 varints instead of u32 (the two-level cells stream is unchanged). */
 static void ix_serialize(const LtIndex *ix, LtBuf *b) {
   const LtCodec *cd = &ix->codec;
   lt_buf_u32(b, LT_MAGIC); lt_buf_u32(b, LT_VERSION);
@@ -237,10 +318,15 @@ static void ix_serialize(const LtIndex *ix, LtBuf *b) {
   lt_buf_add(b, cd->cutoffs, 64); lt_buf_add(b, cd->weights, 64); lt_buf_add(b, &cd->cluster_threshold, 4);
   lt_buf_u32(b, ix->n_ivf_runs); lt_buf_u32(b, ix->n_post_runs);
   lt_buf_u32(b, ix->G); lt_buf_u32(b, ix->n_cell_runs);
+  lt_buf_u32(b, ix->G ? CQ_F16 : ix->cq);
   if (ix->G == 0) {
-    for (size_t i = 0; i < (size_t)ix->K * ix->dim; i++) { uint16_t h = lt_f2h(cd->centroids[i]); lt_buf_add(b, &h, 2); }
-    if (ix->layout & LAY_PLAID) for (int c = 0; c < ix->K; c++) lt_buf_u32(b, ix->ivf_cnt[c]);
-    if (ix->layout & LAY_WARP) for (int c = 0; c < ix->K; c++) lt_buf_u32(b, ix->post_cnt[c]);
+    size_t cb = cq_bytes(ix->cq, ix->dim);
+    uint8_t *tmp = (uint8_t *)malloc(cb);
+    if (!tmp) { b->oom = 1; return; }
+    for (int c = 0; c < ix->K; c++) { cq_encode(ix->cq, cd->centroids + (size_t)c * ix->dim, ix->dim, tmp); lt_buf_add(b, tmp, cb); }
+    free(tmp);
+    if (ix->layout & LAY_PLAID) for (int c = 0; c < ix->K; c++) buf_varint(b, ix->ivf_cnt[c]);
+    if (ix->layout & LAY_WARP) for (int c = 0; c < ix->K; c++) buf_varint(b, ix->post_cnt[c]);
   } else {
     for (size_t i = 0; i < (size_t)ix->G * ix->dim; i++) { uint16_t h = lt_f2h(ix->coarse[i]); lt_buf_add(b, &h, 2); }
     for (int g = 0; g <= ix->G; g++) lt_buf_u32(b, ix->cell_start[g]);
@@ -264,7 +350,7 @@ static int read_runs(const uint8_t **q, const uint8_t *end, uint32_t **runs, int
 static int ix_deserialize(LtIndex *ix, const uint8_t *p, size_t n) {
   if (n < 160 || lt_get_u32(p) != LT_MAGIC) return SQLITE_CORRUPT;
   int ver = (int)lt_get_u32(p + 4);
-  if (ver != 1 && ver != 2) return SQLITE_CORRUPT;
+  if (ver < 1 || ver > LT_VERSION_MAX) { ix->bad_version = ver; return SQLITE_CORRUPT; }
   const uint8_t *q = p + 8, *end = p + n;
   ix->dim = lt_get_u32(q); ix->nbits = lt_get_u32(q + 4); ix->K = lt_get_u32(q + 8); ix->layout = lt_get_u32(q + 12);
   ix->kbits = lt_get_u32(q + 16); ix->idbits = lt_get_u32(q + 20); ix->chunk = lt_get_u32(q + 24);
@@ -274,6 +360,8 @@ static int ix_deserialize(LtIndex *ix, const uint8_t *p, size_t n) {
   memcpy(cd->cutoffs, q, 64); memcpy(cd->weights, q + 64, 64); memcpy(&cd->cluster_threshold, q + 128, 4); q += 132;
   ix->n_ivf_runs = lt_get_u32(q); ix->n_post_runs = lt_get_u32(q + 4); q += 8;
   if (ver >= 2) { ix->G = lt_get_u32(q); ix->n_cell_runs = lt_get_u32(q + 4); q += 8; }
+  ix->cq = CQ_F16;
+  if (ver >= 3) { ix->cq = (int)lt_get_u32(q); q += 4; if (ix->cq > CQ_INT4) return SQLITE_CORRUPT; }
   cd->dim = ix->dim; cd->nbits = ix->nbits; cd->K = ix->K; cd->rbytes = ix->dim * ix->nbits / 8;
   lc_init_lut(cd);
   int K = ix->K, G = ix->G;
@@ -286,14 +374,20 @@ static int ix_deserialize(LtIndex *ix, const uint8_t *p, size_t n) {
     if (!ix->post_cnt || !ix->post_off) return SQLITE_NOMEM;
   }
   if (G == 0) {
-    size_t need = (size_t)K * ix->dim * 2 + ((ix->layout & LAY_PLAID) ? 4u * K : 0) + ((ix->layout & LAY_WARP) ? 4u * K : 0);
+    size_t cb = cq_bytes(ix->cq, ix->dim);
+    size_t need = (size_t)K * cb + (ver >= 3 ? 0 : ((ix->layout & LAY_PLAID) ? 4u * K : 0) + ((ix->layout & LAY_WARP) ? 4u * K : 0));
     if ((size_t)(end - q) < need) return SQLITE_CORRUPT;
     cd->centroids = (float *)malloc(sizeof(float) * K * ix->dim);
     if (!cd->centroids) return SQLITE_NOMEM;
-    for (size_t i = 0; i < (size_t)K * ix->dim; i++) cd->centroids[i] = lt_h2f((uint16_t)(q[2 * i] | (q[2 * i + 1] << 8)));
-    q += (size_t)K * ix->dim * 2;
-    if (ix->layout & LAY_PLAID) for (int c = 0; c < K; c++, q += 4) ix->ivf_cnt[c] = lt_get_u32(q);
-    if (ix->layout & LAY_WARP) for (int c = 0; c < K; c++, q += 4) ix->post_cnt[c] = lt_get_u32(q);
+    for (int c = 0; c < K; c++) cq_decode(ix->cq, q + (size_t)c * cb, ix->dim, cd->centroids + (size_t)c * ix->dim);
+    q += (size_t)K * cb;
+    if (ver >= 3) {
+      if (ix->layout & LAY_PLAID) for (int c = 0; c < K; c++) if (!get_varint(&q, end, &ix->ivf_cnt[c])) return SQLITE_CORRUPT;
+      if (ix->layout & LAY_WARP) for (int c = 0; c < K; c++) if (!get_varint(&q, end, &ix->post_cnt[c])) return SQLITE_CORRUPT;
+    } else {
+      if (ix->layout & LAY_PLAID) for (int c = 0; c < K; c++, q += 4) ix->ivf_cnt[c] = lt_get_u32(q);
+      if (ix->layout & LAY_WARP) for (int c = 0; c < K; c++, q += 4) ix->post_cnt[c] = lt_get_u32(q);
+    }
     ix_offsets(ix);
   } else {
     size_t need = (size_t)G * ix->dim * 2 + 4u * (G + 1) + ((ix->layout & LAY_PLAID) ? 8u * G : 0) + ((ix->layout & LAY_WARP) ? 8u * G : 0);
@@ -433,6 +527,9 @@ static int ix_load(LtVtab *vt) {
   else if (rc == SQLITE_OK) rc = ix_deserialize(ix, mc.buf.p, mc.buf.n);
   lt_buf_free(&mc.buf);
   if (rc == SQLITE_OK) { ix->loaded = 1; ix->load_rounds = vt->rd.round - r0; }
+  else if (ix->bad_version) set_err(vt, "late_plaid: index format version %d is not supported by this build "
+                                    "(it reads versions 1-%d); rebuild the index or upgrade the extension",
+                                    ix->bad_version, LT_VERSION_MAX);
   else if (!vt->base.zErrMsg) set_err(vt, "late_plaid: cannot load index (%d)", rc);
   return rc;
 }
@@ -932,6 +1029,8 @@ static int do_build(LtVtab *vt, DocSrc *src) {
   cd->K = K;
   free(X); X = NULL;
   if (cfg->order && K > 1) { rc = order_centroids(vt); if (rc) { free(H); goto out; } }
+  ix->cq = ix->G ? CQ_F16 : cfg->cq;       /* two-level cells keep float16 */
+  cq_round_trip(ix->cq, cd->centroids, K, dim);
   vlog(vt, "k-means done in %.1f s (K=%d, G=%d)", (now_ms() - t0) / 1000, K, ix->G);
   {
     uint32_t *hc = (uint32_t *)malloc(sizeof(uint32_t) * nh);
@@ -1977,6 +2076,22 @@ static int xClose(sqlite3_vtab_cursor *p) {
   return SQLITE_OK;
 }
 
+/* Cache the interior pages of the document table (plaid rows, read by
+** rerank and the plaid layout), level by level, stopping above the leaf
+** level: the leaf count is estimated from the index size. */
+static int warm_docs(LtVtab *vt) {
+  LtIndex *ix = &vt->ix;
+  if (!(ix->layout & LAY_PLAID) || !ix->root_docs || reader(vt) <= 0 || ix->warm_pages) return SQLITE_OK;
+  double row = 2.0 + (double)ix->T / (double)(ix->N ? ix->N : 1) * (ix->codec.rbytes + ix->kbits / 8.0) + 8;
+  double per_leaf = (vt->rd.usable - 8) / row;
+  int64_t leaves = (int64_t)((double)ix->N / (per_leaf < 1 ? 1 : per_leaf)) + 1;
+  int r0 = vt->rd.round;
+  int n = lpg_warm_interior(&vt->rd, ix->root_docs, leaves, 1024);
+  if (n < 0) return SQLITE_OK;          /* best effort */
+  ix->warm_pages = n; ix->warm_rounds = vt->rd.round - r0;
+  return SQLITE_OK;
+}
+
 static char *stats_json(Query *q, int total_rounds) {
   LpReader *rd = &q->vt->rd;
   const char *lay = q->o.exact ? "exact" : q->o.layout == LAY_WARP ? "warp" : "plaid";
@@ -2029,6 +2144,20 @@ static int xFilter(sqlite3_vtab_cursor *pc, int idxNum, const char *idxStr, int 
   }
   if (rc) return rc;
   LtIndex *ix = &vt->ix;
+  if (sqlite3_value_type(qv) == SQLITE_TEXT && !sqlite3_stricmp((const char *)sqlite3_value_text(qv), "warm")) {
+    /* MATCH 'warm': load the static data now (done above) and the interior
+    ** pages of the document table, so that a later query pays neither. */
+    rc = warm_docs(vt);
+    q.st.ms_total = now_ms() - t0;
+    if (rc == SQLITE_OK) {
+      cur->stats = sqlite3_mprintf("{\"warm\":1,\"static_bytes\":%lld,\"static_rounds\":%d,\"rounds\":%d,"
+                                   "\"pages\":%d,\"interior_pages\":%d,\"ms\":%.3f}",
+                                   (long long)ix->static_bytes, q.st.static_rounds, vt->rd.round, vt->rd.tn,
+                                   ix->warm_pages, q.st.ms_total);
+      cur->n = 0;
+    }
+    return rc;
+  }
   if (q.o.layout == 0) q.o.layout = (ix->layout & LAY_WARP) ? LAY_WARP : LAY_PLAID;
   if (!(q.o.layout & ix->layout)) { set_err(vt, "late_plaid: layout not built"); return SQLITE_ERROR; }
   int nbytes = sqlite3_value_bytes(qv);
@@ -2126,6 +2255,7 @@ static int cmd(LtVtab *vt, const char *z) {
   if (!strcmp(z, "drop_cache")) {          /* forget interior pages and loaded cells */
     if (vt->rd_state > 0) lpg_drop_cache(&vt->rd);
     LtIndex *ix = &vt->ix;
+    ix->warm_pages = 0;
     if (ix->G && ix->cell_cent) {
       for (int g = 0; g < ix->G; g++) { free(ix->cell_cent[g]); ix->cell_cent[g] = NULL; }
       ix->cells_loaded = 0; ix->cell_bytes_loaded = 0;
