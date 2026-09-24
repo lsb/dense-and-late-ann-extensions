@@ -31,12 +31,19 @@ One configuration per method, all corpora. Latency is the simulated p50 on `4g` 
 | words-10k | warp nprobe 8 + rerank 64 | 38.8 | 0.408 | 0.785 | 2.7 | 290 | 701 | 1,121 | 1,317 | 2,497 |
 | words-10k | late exhaustive (decompressed) | 38.8 | 0.420 | 0.836 | 31.0 | 20,624 | 26,260 | 26,356 | 21,500 | 29,336 |
 | words-1m | FTS5 bm25c (OR) | 214.7 | 0.992 | 0.787 | 4.5 | 19 | 681 | 1,526 | 60 | 2,211 |
+| words-1m | warp nprobe 8 | 1,637.8 | 0.328 | 0.576 | 3.2 | 808 | 1,201 | 2,927 | 4,268 | 6,653 |
 | llm-100 | FTS5 bm25c (OR) | 0.0 | 0.538 | 0.791 | 0.0 | 0 | 0 | 15 | 27 | 1,015 |
 | llm-100 | graph ef 64, W 16 | 0.6 | 0.785 | 0.944 | 0.1 | 1 | 0 | 14 | 384 | 1,710 |
 | llm-100 | IVF nprobe 64, rerank 64 | 0.3 | 0.785 | 0.944 | 0.0 | 0 | 0 | 2 | 227 | 1,222 |
 | llm-100 | warp nprobe 8 | 0.3 | 0.724 | 0.917 | 0.0 | 0 | 1 | 37 | 100 | 763 |
 | llm-100 | warp nprobe 8 + rerank 64 | 0.3 | 0.716 | 0.916 | 0.0 | 0 | 1 | 8 | 191 | 1,182 |
 | llm-100 | late exhaustive (decompressed) | 0.3 | 0.716 | 0.921 | 0.0 | 0 | 2 | 7 | 156 | 985 |
+| llm-10k | FTS5 bm25c (OR) | 1.8 | 0.438 | 0.769 | 0.2 | 1 | 0 | 170 | 55 | 1,523 |
+| llm-10k | graph ef 64, W 16 | 41.4 | 0.583 | 0.863 | 5.9 | 242 | 1,231 | 1,572 | 499 | 2,154 |
+| llm-10k | IVF nprobe 64, rerank 64 | 9.6 | 0.552 | 0.839 | 2.1 | 104 | 428 | 823 | 729 | 1,735 |
+| llm-10k | warp nprobe 8 | 19.1 | 0.430 | 0.802 | 0.3 | 3 | 2 | 187 | 548 | 1,204 |
+| llm-10k | warp nprobe 8 + rerank 64 | 19.1 | 0.431 | 0.792 | 2.9 | 167 | 591 | 1,032 | 825 | 1,980 |
+| llm-10k | late exhaustive (decompressed) | 19.1 | 0.431 | 0.815 | 19.0 | 9,296 | 12,650 | 12,700 | 9,732 | 15,081 |
 
 ## Query encoding time
 
@@ -48,6 +55,7 @@ Native ONNX Runtime, one query at a time, 1 intra-op thread, on the shared 4-cor
 | words-10k | 2.19 | 3.62 | 1.53 | 2.02 |
 | words-1m | 2.18 | 3.44 | 1.54 | 2.08 |
 | llm-100 | 1.54 | 2.65 | 1.23 | 1.73 |
+| llm-10k | 1.74 | 2.98 | 1.28 | 1.95 |
 
 ## words-100
 
@@ -393,33 +401,33 @@ nDCG@10 by query kind:
 | FTS5 (fts-bm25) | warm | slow-4g | 0.1 | 0.1 | 0.1 | 0.1 |
 | FTS5 (fts-bm25) | warm | wifi | 0.1 | 0.1 | 0.1 | 0.1 |
 | FTS5 (fts-bm25) | cold | 4g | 2,538 | 2,538 | 2,538 | 2,538 |
-| FTS5 (fts-bm25) | cold | lte | 1,093 | 1,093 | 1,093 | 1,093 |
+| FTS5 (fts-bm25) | cold | lte | 1,094 | 1,094 | 1,094 | 1,094 |
 | FTS5 (fts-bm25) | cold | slow-4g | 8,781 | 8,781 | 8,781 | 8,781 |
 | FTS5 (fts-bm25) | cold | wifi | 312 | 312 | 312 | 312 |
-| dense IVF (ivf-np64) | warm | 4g | 1,128 | 946 | 471 | 468 |
-| dense IVF (ivf-np64) | warm | lte | 513 | 436 | 236 | 234 |
-| dense IVF (ivf-np64) | warm | slow-4g | 4,145 | 3,531 | 1,917 | 1,899 |
-| dense IVF (ivf-np64) | warm | wifi | 144 | 121 | 64 | 63 |
-| dense IVF (ivf-np64) | cold | 4g | 4,152 | 3,181 | 2,103 | 2,093 |
-| dense IVF (ivf-np64) | cold | lte | 1,976 | 1,641 | 1,172 | 1,166 |
-| dense IVF (ivf-np64) | cold | slow-4g | 16,033 | 13,414 | 9,622 | 9,568 |
-| dense IVF (ivf-np64) | cold | wifi | 540 | 431 | 303 | 301 |
-| dense graph (graph-ef64) | warm | 4g | 2,600 | 2,582 | 1,429 | 1,423 |
-| dense graph (graph-ef64) | warm | lte | 1,176 | 1,168 | 676 | 671 |
-| dense graph (graph-ef64) | warm | slow-4g | 9,503 | 9,426 | 5,477 | 5,440 |
-| dense graph (graph-ef64) | warm | wifi | 328 | 326 | 185 | 184 |
-| dense graph (graph-ef64) | cold | 4g | 3,930 | 3,929 | 2,453 | 2,446 |
-| dense graph (graph-ef64) | cold | lte | 1,826 | 1,825 | 1,202 | 1,197 |
-| dense graph (graph-ef64) | cold | slow-4g | 14,780 | 14,779 | 9,762 | 9,718 |
-| dense graph (graph-ef64) | cold | wifi | 504 | 504 | 325 | 324 |
-| late warp (warp-np8-rr64) | warm | 4g | 2,086 | 1,915 | 628 | 622 |
-| late warp (warp-np8-rr64) | warm | lte | 954 | 923 | 342 | 338 |
-| late warp (warp-np8-rr64) | warm | slow-4g | 7,691 | 7,465 | 2,781 | 2,745 |
-| late warp (warp-np8-rr64) | warm | wifi | 268 | 251 | 92 | 91 |
-| late warp (warp-np8-rr64) | cold | 4g | 5,760 | 5,328 | 3,347 | 3,337 |
-| late warp (warp-np8-rr64) | cold | lte | 2,981 | 2,844 | 1,973 | 1,966 |
-| late warp (warp-np8-rr64) | cold | slow-4g | 24,310 | 23,234 | 16,226 | 16,167 |
-| late warp (warp-np8-rr64) | cold | wifi | 792 | 751 | 502 | 501 |
+| dense IVF (ivf-np64) | warm | 4g | 1,131 | 949 | 479 | 476 |
+| dense IVF (ivf-np64) | warm | lte | 515 | 438 | 241 | 239 |
+| dense IVF (ivf-np64) | warm | slow-4g | 4,159 | 3,542 | 1,962 | 1,945 |
+| dense IVF (ivf-np64) | warm | wifi | 144 | 122 | 65 | 64 |
+| dense IVF (ivf-np64) | cold | 4g | 3,870 | 2,900 | 1,836 | 1,826 |
+| dense IVF (ivf-np64) | cold | lte | 1,787 | 1,458 | 992 | 985 |
+| dense IVF (ivf-np64) | cold | slow-4g | 14,461 | 11,840 | 8,119 | 8,066 |
+| dense IVF (ivf-np64) | cold | wifi | 494 | 390 | 259 | 258 |
+| dense graph (graph-ef64) | warm | 4g | 2,583 | 2,577 | 1,426 | 1,419 |
+| dense graph (graph-ef64) | warm | lte | 1,165 | 1,162 | 673 | 669 |
+| dense graph (graph-ef64) | warm | slow-4g | 9,401 | 9,378 | 5,454 | 5,418 |
+| dense graph (graph-ef64) | warm | wifi | 326 | 325 | 185 | 184 |
+| dense graph (graph-ef64) | cold | 4g | 3,824 | 3,824 | 2,347 | 2,339 |
+| dense graph (graph-ef64) | cold | lte | 1,754 | 1,754 | 1,130 | 1,124 |
+| dense graph (graph-ef64) | cold | slow-4g | 14,187 | 14,187 | 9,168 | 9,125 |
+| dense graph (graph-ef64) | cold | wifi | 487 | 487 | 308 | 307 |
+| late warp (warp-np8-rr64) | warm | 4g | 2,217 | 1,927 | 635 | 628 |
+| late warp (warp-np8-rr64) | warm | lte | 1,002 | 927 | 347 | 343 |
+| late warp (warp-np8-rr64) | warm | slow-4g | 8,058 | 7,465 | 2,808 | 2,769 |
+| late warp (warp-np8-rr64) | warm | wifi | 283 | 253 | 95 | 93 |
+| late warp (warp-np8-rr64) | cold | 4g | 4,909 | 4,493 | 2,507 | 2,497 |
+| late warp (warp-np8-rr64) | cold | lte | 2,410 | 2,270 | 1,408 | 1,401 |
+| late warp (warp-np8-rr64) | cold | slow-4g | 19,511 | 18,375 | 11,473 | 11,417 |
+| late warp (warp-np8-rr64) | cold | wifi | 659 | 615 | 372 | 370 |
 
 **Simulated versus real** (real = wall time through the shaped server; own-trace = the same run's request log simulated; pipeline = the unshaped trace of the same query simulated, which is what the tables above use). Medians over the real-run subset:
 
@@ -436,9 +444,9 @@ nDCG@10 by query kind:
 
 ## words-1m
 
-Measured as separate per-index databases (`build_db.py --split`, to fit the disk; the attribution check in `bench/MATRIX.md` shows this gives the same fetch costs): `words-1m--fts.db`. Sizes are summed over the files.
+Measured as separate per-index databases (`build_db.py --split`, to fit the disk; the attribution check in `bench/MATRIX.md` shows this gives the same fetch costs): `words-1m--fts.db`, `words-1m--late.db`. Sizes are summed over the files.
 
-1,000,000 documents; 500 queries evaluated, the first of each kind out of 2,000 (250 known, 250 word). Database `words-1m--fts.db`: 723.12 MB.
+1,000,000 documents; 500 queries evaluated, the first of each kind out of 2,000 (250 known, 250 word). Database `words-1m--fts.db, words-1m--late.db`: 2360.98 MB.
 
 Encoders: `models/minilm-l6-v2/model_w8.onnx`, `models/lateon-code-edge/model_w8.onnx`.
 
@@ -448,9 +456,10 @@ The top-10 lists returned through WASM are identical to the native ones for 100.
 
 | Part | MB | Share | Index parameters |
 |---|---|---|---|
-| docs | 508.40 | 70.3 % |  |
-| fts | 214.71 | 29.7 % |  |
-| schema | 0.00 | 0.0 % |  |
+| late | 1637.85 | 69.4 % | dim=48 order=1 threads=2 input=f16 layout=warp nbits=2 centroids=65536 fast_assign=1 sample_tokens=2000000 mem_mb=1024 centroid_type=int8 |
+| docs | 508.40 | 21.5 % |  |
+| fts | 214.71 | 9.1 % |  |
+| schema | 0.01 | 0.0 % |  |
 
 **Quality** (k = 10; AUC from k = 100 lists; R@10 vs exact = overlap of the top 10 with the system's own exact search):
 
@@ -460,6 +469,8 @@ The top-10 lists returned through WASM are identical to the native ones for 100.
 | FTS5 bm25 (OR) | 214.71 | 0.507 | 0.996 | 0.998 | 0.992 | 0.787 | 1.000 | 500 |
 | FTS5 bm25c (OR) | 214.71 | 0.507 | 0.996 | 0.998 | 0.992 | 0.787 | 1.000 | 500 |
 | FTS5 unranked (AND) | 214.71 | 0.507 | 0.990 | 0.995 | 0.991 | 0.787 | 0.999 | 500 |
+| warp nprobe 8 | 1637.85 | 0.068 | 0.370 | 0.407 | 0.328 | 0.576 | – | 500 |
+| warp nprobe 32 | 1637.85 | 0.142 | 0.408 | 0.463 | 0.395 | 0.630 | – | 500 |
 
 nDCG@10 by query kind:
 
@@ -469,6 +480,8 @@ nDCG@10 by query kind:
 | FTS5 bm25 (OR) | 1.000 | 0.985 |
 | FTS5 bm25c (OR) | 1.000 | 0.985 |
 | FTS5 unranked (AND) | 1.000 | 0.982 |
+| warp nprobe 8 | 0.087 | 0.570 |
+| warp nprobe 32 | 0.191 | 0.600 |
 
 **Warm session, h1** (HTTP/1.1, 6 connections); p50 / p95 simulated latency in ms from the recorded traces:
 
@@ -478,6 +491,8 @@ nDCG@10 by query kind:
 | FTS5 bm25 (OR) | 789.5 | 789.5 | 4,682 | – | 92 / 133 | 954 / 1,252 | 17,332 / 22,676 | 139,611 / 184,295 | 61,331 / 79,759 | 493,871 / 641,348 | 280,318 / 356,009 | 161,205 / 203,927 |
 | FTS5 bm25c (OR) | 4.5 | 4.5 | 19 | – | 2.3 / 4.0 | 6.3 / 13 | 85 / 189 | 681 / 1,526 | 295 / 659 | 2,365 / 5,271 | 1,304 / 2,888 | 710 / 1,952 |
 | FTS5 unranked (AND) | 4.0 | 4.0 | 17 | – | 0.5 / 1.0 | 3.6 / 10 | 62 / 187 | 508 / 1,522 | 219 / 655 | 1,756 / 5,268 | 962 / 2,885 | 621 / 1,822 |
+| warp nprobe 8 | 3.2 | 35.8 | 808 | 865 | 54 / 106 | 64 / 126 | 262 / 547 | 1,595 / 3,433 | 842 / 1,778 | 6,480 / 13,807 | 4,836 / 10,089 | 3,652 / 7,604 |
+| warp nprobe 32 | 161.5 | 236.4 | 3,798 | 3,449 | 207 / 412 | 354 / 886 | 3,079 / 10,047 | 23,003 / 78,347 | 10,564 / 34,895 | 83,992 / 279,072 | 51,363 / 163,155 | 32,022 / 97,499 |
 
 **Warm session, h2** (HTTP/2-like, 100 concurrent requests); p50 / p95 simulated latency in ms from the recorded traces:
 
@@ -487,6 +502,8 @@ nDCG@10 by query kind:
 | FTS5 bm25 (OR) | 789.5 | 789.5 | 4,682 | – | 92 / 133 | 954 / 1,252 | 17,332 / 22,676 | 139,611 / 184,295 | 61,331 / 79,759 | 493,871 / 641,348 | 280,318 / 356,009 | 161,205 / 203,927 |
 | FTS5 bm25c (OR) | 4.5 | 4.5 | 19 | – | 2.3 / 4.0 | 6.3 / 13 | 85 / 189 | 681 / 1,526 | 295 / 659 | 2,365 / 5,271 | 1,304 / 2,888 | 710 / 1,952 |
 | FTS5 unranked (AND) | 4.0 | 4.0 | 17 | – | 0.5 / 1.0 | 3.6 / 10 | 62 / 187 | 508 / 1,522 | 219 / 655 | 1,756 / 5,268 | 962 / 2,885 | 621 / 1,822 |
+| warp nprobe 8 | 3.2 | 35.8 | 808 | 865 | 54 / 106 | 62 / 125 | 230 / 506 | 1,201 / 2,927 | 746 / 1,679 | 5,764 / 13,049 | 4,690 / 10,070 | 3,569 / 7,365 |
+| warp nprobe 32 | 161.5 | 236.4 | 3,798 | 3,449 | 207 / 412 | 350 / 884 | 2,982 / 10,017 | 21,938 / 77,415 | 10,304 / 34,787 | 81,982 / 277,991 | 51,090 / 162,796 | 31,530 / 97,499 |
 
 **Cold start (new connection per query), h1** (HTTP/1.1, 6 connections); p50 / p95 simulated latency in ms from the recorded traces:
 
@@ -496,6 +513,8 @@ nDCG@10 by query kind:
 | FTS5 bm25 (OR) | 884.0 | 884.0 | 5,329 | – | 105 / 151 | 887 / 1,360 | 15,972 / 24,421 | 128,041 / 197,926 | 56,648 / 85,940 | 456,370 / 691,126 | 262,139 / 384,221 | 154,651 / 218,801 |
 | FTS5 bm25c (OR) | 14.5 | 14.5 | 60 | – | 3.6 / 8.0 | 20 / 27 | 280 / 418 | 2,211 / 3,385 | 958 / 1,459 | 7,637 / 11,710 | 4,193 / 6,414 | 2,493 / 4,534 |
 | FTS5 unranked (AND) | 14.2 | 14.2 | 57 | – | 1.8 / 3.5 | 18 / 23 | 263 / 416 | 2,118 / 3,384 | 914 / 1,458 | 7,329 / 11,708 | 4,018 / 6,413 | 2,432 / 4,455 |
+| warp nprobe 8 | 14.0 | 51.9 | 4,268 | 4,259 | 62 / 118 | 113 / 174 | 1,079 / 1,240 | 7,051 / 7,955 | 4,040 / 4,555 | 32,842 / 36,726 | 26,115 / 29,518 | 19,956 / 23,666 |
+| warp nprobe 32 | 179.5 | 256.7 | 8,000 | 6,876 | 221 / 431 | 433 / 953 | 4,345 / 10,999 | 31,882 / 84,633 | 15,461 / 38,731 | 124,156 / 310,773 | 81,820 / 188,476 | 54,419 / 117,351 |
 
 **Cold start (new connection per query), h2** (HTTP/2-like, 100 concurrent requests); p50 / p95 simulated latency in ms from the recorded traces:
 
@@ -505,6 +524,8 @@ nDCG@10 by query kind:
 | FTS5 bm25 (OR) | 884.0 | 884.0 | 5,329 | – | 105 / 151 | 887 / 1,360 | 15,972 / 24,421 | 128,041 / 197,926 | 56,648 / 85,940 | 456,370 / 691,126 | 262,139 / 384,221 | 154,651 / 218,801 |
 | FTS5 bm25c (OR) | 14.5 | 14.5 | 60 | – | 3.6 / 8.0 | 20 / 27 | 280 / 418 | 2,211 / 3,385 | 958 / 1,459 | 7,637 / 11,710 | 4,193 / 6,414 | 2,493 / 4,534 |
 | FTS5 unranked (AND) | 14.2 | 14.2 | 57 | – | 1.8 / 3.5 | 18 / 23 | 263 / 416 | 2,118 / 3,384 | 914 / 1,458 | 7,329 / 11,708 | 4,018 / 6,413 | 2,432 / 4,455 |
+| warp nprobe 8 | 14.0 | 51.9 | 4,268 | 4,259 | 62 / 118 | 111 / 172 | 1,035 / 1,197 | 6,653 / 7,367 | 3,932 / 4,431 | 32,023 / 35,789 | 25,939 / 29,334 | 19,775 / 23,620 |
+| warp nprobe 32 | 179.5 | 256.7 | 8,000 | 6,876 | 221 / 431 | 428 / 951 | 4,273 / 10,983 | 30,975 / 84,191 | 15,251 / 38,699 | 122,589 / 310,576 | 81,476 / 188,434 | 54,419 / 117,351 |
 
 **Simulated versus real** (real = wall time through the shaped server; own-trace = the same run's request log simulated; pipeline = the unshaped trace of the same query simulated, which is what the tables above use). Medians over the real-run subset:
 
@@ -514,8 +535,10 @@ nDCG@10 by query kind:
 | lte,h1 (fts) | cold | 80 | 1,507 | 1,460 | 86,760 | 83,977 | 1.032 | 1.033 | 48.8 (2.4) | 80 | 3.2 % / 3.8 % |
 | lte,h2 (fts) | warm | 400 | 824 | 801 | 80,111 | 77,778 | 1.030 | 1.033 | 24.9 (2.4) | 398 | 3.2 % / 4.3 % |
 | lte,h2 (fts) | cold | 80 | 1,511 | 1,460 | 86,917 | 83,977 | 1.032 | 1.034 | 47.8 (2.5) | 80 | 3.3 % / 3.7 % |
-| None (fts) | warm | 150 | 82,961 | – | 183,815 | – | 737.982 | – | – (–) | 0 | – / – |
+| None (fts) | warm | 193 | 87,687 | – | 184,353 | – | 745.904 | – | – (–) | 0 | – / – |
 | None (fts) | cold | 20 | 59,952 | – | 117,346 | – | 706.374 | – | – (–) | 0 | – / – |
+| None (late) | warm | 119 | 1,942 | – | 37,780 | – | 29.693 | – | – (–) | 0 | – / – |
+| None (late) | cold | 20 | 6,993 | – | 7,937 | – | 122.547 | – | – (–) | 0 | – / – |
 
 ## llm-100
 
@@ -690,6 +713,217 @@ nDCG@10 by query kind (LLM paraphrase queries also split by whether the model us
 | lte,h1 | cold | 320 | 588 | 567 | 1,852 | 1,797 | 1.038 | 1.041 | 25.3 (4.0) | 320 | 4.0 % / 6.9 % |
 | lte,h2 | warm | 1600 | 0.4 | 0.5 | 23 | 13 | 1.000 | 0.871 | 79.4 (78.6) | 83 | 99.1 % / 99.9 % |
 | lte,h2 | cold | 320 | 590 | 567 | 1,181 | 1,132 | 1.042 | 1.044 | 25.6 (4.1) | 320 | 4.3 % / 7.3 % |
+
+## llm-10k
+
+10,000 documents; 2,000 queries evaluated, the first of each kind out of 20,000 (1,000 llmq, 1,000 word). Database `llm-10k.db`: 75.46 MB.
+
+Encoders: `models/minilm-l6-v2/model_w8.onnx`, `models/lateon-code-edge/model_w8.onnx`.
+
+The top-10 lists returned through WASM are identical to the native ones for 100.0 % (worst configuration) of the queries.
+
+**Database composition** (dbstat, bytes of pages):
+
+| Part | MB | Share | Index parameters |
+|---|---|---|---|
+| dense_graph | 41.38 | 54.8 % | dim=384, layout=colocated, vectors=inline, store_vectors=f16, M=16, ef_construction=200, threads=2, codebook=int8 |
+| late | 19.11 | 25.3 % | dim=48 nbits=2 centroids=0 layout=both order=1 threads=2 input=f16 centroid_type=int8 |
+| dense_ivf | 9.60 | 12.7 % | dim=384, layout=ivf, store_vectors=f16, threads=2, ivf_centroids=auto, codebook=int8 |
+| docs | 3.56 | 4.7 % |  |
+| fts | 1.81 | 2.4 % |  |
+| schema | 0.00 | 0.0 % |  |
+
+**Quality** (k = 10; AUC from k = 100 lists; R@10 vs exact = overlap of the top 10 with the system's own exact search):
+
+| Config | Index MB | Recall@10 | Success@1 | MRR@10 | nDCG@10 | AUC@100 | R@10 vs exact | Queries |
+|---|---|---|---|---|---|---|---|---|
+| FTS5 bm25 (AND) | 1.81 | 0.409 | 0.362 | 0.379 | 0.386 | 0.712 | 1.000 | 2000 |
+| FTS5 bm25 (OR) | 1.81 | 0.474 | 0.400 | 0.425 | 0.437 | 0.770 | 1.000 | 2000 |
+| FTS5 bm25c (OR) | 1.81 | 0.476 | 0.400 | 0.425 | 0.438 | 0.769 | 0.845 | 2000 |
+| FTS5 unranked (AND) | 1.81 | 0.403 | 0.333 | 0.357 | 0.368 | 0.711 | 0.888 | 2000 |
+| graph ef 32, W 16 | 41.38 | 0.635 | 0.519 | 0.562 | 0.580 | 0.863 | 0.965 | 2000 |
+| graph ef 64, W 16 | 41.38 | 0.638 | 0.521 | 0.565 | 0.583 | 0.863 | 0.986 | 2000 |
+| graph ef 128, W 16 | 41.38 | 0.640 | 0.522 | 0.566 | 0.584 | 0.864 | 0.995 | 2000 |
+| graph ef 128, W 64 | 41.38 | 0.641 | 0.522 | 0.566 | 0.585 | 0.864 | 0.997 | 2000 |
+| IVF nprobe 16, rerank 64 | 9.60 | 0.537 | 0.441 | 0.477 | 0.492 | 0.800 | 0.740 | 2000 |
+| IVF nprobe 64, rerank 64 | 9.60 | 0.603 | 0.494 | 0.535 | 0.552 | 0.839 | 0.910 | 2000 |
+| IVF nprobe 128, rerank 128 | 9.60 | 0.627 | 0.513 | 0.556 | 0.573 | 0.854 | 0.964 | 2000 |
+| dense exhaustive (f16 vectors) | 9.60 | 0.644 | 0.524 | 0.569 | 0.587 | 0.865 | 1.000 | 2000 |
+| warp nprobe 8 | 19.11 | 0.489 | 0.372 | 0.411 | 0.430 | 0.802 | 0.391 | 2000 |
+| warp nprobe 32 | 19.11 | 0.502 | 0.371 | 0.416 | 0.437 | 0.813 | 0.444 | 2000 |
+| warp nprobe 8 + rerank 64 | 19.11 | 0.500 | 0.363 | 0.409 | 0.431 | 0.792 | 0.460 | 2000 |
+| warp nprobe 16 + rerank 64 | 19.11 | 0.500 | 0.363 | 0.409 | 0.431 | 0.798 | 0.466 | 2000 |
+| plaid approx=ivf nprobe 8, ndocs 64 | 19.11 | 0.429 | 0.338 | 0.370 | 0.384 | 0.731 | 0.383 | 2000 |
+| late exhaustive (decompressed) | 19.11 | 0.500 | 0.363 | 0.409 | 0.431 | 0.815 | 0.467 | 2000 |
+| *float exact MiniLM (numpy)* | – | 0.644 | 0.524 | 0.569 | 0.587 | 0.865 | 1.000 | 2000 |
+| *float exact MaxSim LateOn (numpy)* | – | 0.591 | 0.465 | 0.507 | 0.527 | 0.838 | 1.000 | 2000 |
+
+nDCG@10 by query kind (LLM paraphrase queries also split by whether the model used the target word, `contains_word`):
+
+| Config | llmq (n=1000) | word (n=1000) | llmq, word absent (n=793) | llmq, word used (n=207) |
+|---|---|---|---|---|
+| FTS5 bm25 (AND) | 0.028 | 0.745 | 0.016 | 0.073 |
+| FTS5 bm25 (OR) | 0.130 | 0.745 | 0.051 | 0.432 |
+| FTS5 bm25c (OR) | 0.128 | 0.747 | 0.047 | 0.440 |
+| FTS5 unranked (AND) | 0.023 | 0.713 | 0.011 | 0.069 |
+| graph ef 32, W 16 | 0.298 | 0.863 | 0.150 | 0.864 |
+| graph ef 64, W 16 | 0.300 | 0.866 | 0.150 | 0.874 |
+| graph ef 128, W 16 | 0.301 | 0.867 | 0.150 | 0.880 |
+| graph ef 128, W 64 | 0.301 | 0.869 | 0.150 | 0.880 |
+| IVF nprobe 16, rerank 64 | 0.258 | 0.725 | 0.131 | 0.747 |
+| IVF nprobe 64, rerank 64 | 0.290 | 0.814 | 0.146 | 0.842 |
+| IVF nprobe 128, rerank 128 | 0.297 | 0.850 | 0.148 | 0.870 |
+| dense exhaustive (f16 vectors) | 0.302 | 0.873 | 0.150 | 0.888 |
+| warp nprobe 8 | 0.147 | 0.712 | 0.056 | 0.499 |
+| warp nprobe 32 | 0.157 | 0.716 | 0.059 | 0.532 |
+| warp nprobe 8 + rerank 64 | 0.147 | 0.715 | 0.059 | 0.483 |
+| warp nprobe 16 + rerank 64 | 0.145 | 0.717 | 0.058 | 0.479 |
+| plaid approx=ivf nprobe 8, ndocs 64 | 0.131 | 0.638 | 0.049 | 0.441 |
+| late exhaustive (decompressed) | 0.145 | 0.717 | 0.057 | 0.479 |
+| float exact MiniLM (numpy) | 0.302 | 0.873 | 0.150 | 0.888 |
+| float exact MaxSim LateOn (numpy) | 0.215 | 0.839 | 0.088 | 0.705 |
+
+**Warm session, h1** (HTTP/1.1, 6 connections); p50 / p95 simulated latency in ms from the recorded traces:
+
+| Config | Rounds | Requests | KB | Ext. KB | none | lan | wifi | 4g | lte | slow-4g | 3g | lte-poor |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| FTS5 bm25 (AND) | 0.2 | 0.2 | 1 | – | 0.1 / 1.5 | 0.1 / 3.0 | 0.1 / 21 | 0.1 / 170 | 0.1 / 73 | 0.1 / 586 | 0.1 / 321 | 0.1 / 198 |
+| FTS5 bm25 (OR) | 0.2 | 0.2 | 1 | – | 0.3 / 58 | 0.5 / 59 | 0.5 / 65 | 0.5 / 170 | 0.5 / 78 | 0.5 / 586 | 0.5 / 322 | 0.5 / 197 |
+| FTS5 bm25c (OR) | 0.2 | 0.2 | 1 | – | 0.2 / 25 | 0.2 / 26 | 0.2 / 35 | 0.2 / 170 | 0.2 / 73 | 0.2 / 586 | 0.2 / 321 | 0.2 / 188 |
+| FTS5 unranked (AND) | 0.2 | 0.2 | 1 | – | 0.0 / 0.4 | 0.0 / 1.3 | 0.0 / 21 | 0.0 / 169 | 0.0 / 73 | 0.0 / 586 | 0.0 / 321 | 0.0 / 193 |
+| graph ef 32, W 16 | 4.4 | 37.6 | 150 | 197 | 1.0 / 1.8 | 11 / 14 | 188 / 251 | 1,487 / 2,002 | 673 / 897 | 5,434 / 7,235 | 3,241 / 4,243 | 2,085 / 3,482 |
+| graph ef 64, W 16 | 5.9 | 60.5 | 242 | 299 | 1.3 / 2.4 | 16 / 20 | 303 / 367 | 2,405 / 2,925 | 1,086 / 1,312 | 8,770 / 10,594 | 5,212 / 6,235 | 3,245 / 4,856 |
+| graph ef 128, W 16 | 9.5 | 110.2 | 441 | 529 | 1.9 / 3.8 | 30 / 33 | 556 / 619 | 4,419 / 4,927 | 1,990 / 2,209 | 16,073 / 17,829 | 9,516 / 10,522 | 5,747 / 7,822 |
+| graph ef 128, W 64 | 6.3 | 142.7 | 573 | 741 | 1.8 / 3.7 | 34 / 42 | 646 / 793 | 5,118 / 6,302 | 2,317 / 2,841 | 18,719 / 22,940 | 11,230 / 13,584 | 5,968 / 7,872 |
+| IVF nprobe 16, rerank 64 | 2.2 | 14.5 | 89 | 231 | 0.6 / 1.1 | 5.0 / 7.6 | 79 / 136 | 607 / 1,082 | 286 / 483 | 2,314 / 3,888 | 1,413 / 2,268 | 830 / 1,868 |
+| IVF nprobe 64, rerank 64 | 2.1 | 20.1 | 104 | 434 | 0.8 / 1.7 | 6.3 / 9.8 | 97 / 175 | 761 / 1,408 | 348 / 620 | 2,815 / 4,989 | 1,709 / 2,854 | 1,027 / 2,065 |
+| IVF nprobe 128, rerank 128 | 3.8 | 38.8 | 205 | 817 | 1.4 / 3.1 | 11 / 19 | 201 / 338 | 1,607 / 2,697 | 713 / 1,200 | 5,742 / 9,679 | 3,314 / 5,565 | 1,982 / 3,475 |
+| dense exhaustive (f16 vectors) | 2029.0 | 2029.0 | 8,116 | 0 | 216 / 237 | 2,311 / 2,332 | 42,125 / 42,147 | 343,209 / 343,230 | 147,786 / 147,807 | 1,187,699 / 1,187,720 | 650,470 / 650,491 | 357,352 / 369,647 |
+| warp nprobe 8 | 0.3 | 0.7 | 3 | 114 | 2.0 / 4.2 | 2.1 / 5.3 | 2.1 / 27 | 2.1 / 187 | 2.1 / 86 | 2.1 / 659 | 2.1 / 387 | 2.1 / 306 |
+| warp nprobe 32 | 0.7 | 2.4 | 12 | 328 | 5.1 / 10 | 5.9 / 13 | 25 / 61 | 174 / 395 | 78 / 187 | 590 / 1,435 | 325 / 880 | 132 / 902 |
+| warp nprobe 8 + rerank 64 | 2.9 | 40.0 | 167 | 367 | 3.2 / 6.3 | 13 / 19 | 193 / 279 | 1,505 / 2,198 | 686 / 989 | 5,527 / 7,960 | 3,325 / 4,689 | 1,823 / 3,009 |
+| warp nprobe 16 + rerank 64 | 2.9 | 43.3 | 183 | 449 | 4.2 / 8.0 | 15 / 22 | 213 / 306 | 1,667 / 2,390 | 754 / 1,078 | 6,067 / 8,663 | 3,605 / 5,116 | 1,932 / 3,322 |
+| plaid approx=ivf nprobe 8, ndocs 64 | 2.5 | 33.9 | 138 | 307 | 2.9 / 5.1 | 12 / 16 | 183 / 237 | 1,448 / 1,852 | 648 / 837 | 5,208 / 6,744 | 3,038 / 4,007 | 1,585 / 2,678 |
+| late exhaustive (decompressed) | 19.0 | 19.0 | 9,296 | 9,112 | 113 / 164 | 208 / 259 | 2,016 / 2,067 | 12,650 / 12,700 | 7,789 / 7,840 | 63,685 / 63,735 | 53,409 / 53,459 | 41,498 / 44,297 |
+
+**Warm session, h2** (HTTP/2-like, 100 concurrent requests); p50 / p95 simulated latency in ms from the recorded traces:
+
+| Config | Rounds | Requests | KB | Ext. KB | none | lan | wifi | 4g | lte | slow-4g | 3g | lte-poor |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| FTS5 bm25 (AND) | 0.2 | 0.2 | 1 | – | 0.1 / 1.5 | 0.1 / 3.0 | 0.1 / 21 | 0.1 / 170 | 0.1 / 73 | 0.1 / 586 | 0.1 / 321 | 0.1 / 198 |
+| FTS5 bm25 (OR) | 0.2 | 0.2 | 1 | – | 0.3 / 58 | 0.5 / 59 | 0.5 / 65 | 0.5 / 170 | 0.5 / 78 | 0.5 / 586 | 0.5 / 322 | 0.5 / 197 |
+| FTS5 bm25c (OR) | 0.2 | 0.2 | 1 | – | 0.2 / 25 | 0.2 / 26 | 0.2 / 35 | 0.2 / 170 | 0.2 / 73 | 0.2 / 586 | 0.2 / 321 | 0.2 / 188 |
+| FTS5 unranked (AND) | 0.2 | 0.2 | 1 | – | 0.0 / 0.4 | 0.0 / 1.3 | 0.0 / 21 | 0.0 / 169 | 0.0 / 73 | 0.0 / 586 | 0.0 / 321 | 0.0 / 193 |
+| graph ef 32, W 16 | 4.4 | 37.6 | 150 | 197 | 1.0 / 1.8 | 6.4 / 9.0 | 108 / 150 | 827 / 1,169 | 393 / 541 | 3,184 / 4,377 | 2,041 / 2,702 | 1,812 / 3,164 |
+| graph ef 64, W 16 | 5.9 | 60.5 | 242 | 299 | 1.3 / 2.4 | 9.3 / 12 | 160 / 202 | 1,231 / 1,572 | 583 / 731 | 4,719 / 5,912 | 3,011 / 3,673 | 2,638 / 4,274 |
+| graph ef 128, W 16 | 9.5 | 110.2 | 441 | 529 | 1.9 / 3.8 | 15 / 18 | 262 / 304 | 1,984 / 2,323 | 962 / 1,111 | 7,818 / 9,011 | 5,139 / 5,822 | 4,627 / 6,601 |
+| graph ef 128, W 64 | 6.3 | 142.7 | 573 | 741 | 1.8 / 3.7 | 12 / 20 | 205 / 338 | 1,474 / 2,573 | 778 / 1,242 | 6,364 / 10,077 | 4,649 / 6,634 | 3,728 / 5,278 |
+| IVF nprobe 16, rerank 64 | 2.2 | 14.5 | 89 | 231 | 0.6 / 1.1 | 3.4 / 5.9 | 56 / 99 | 424 / 774 | 203 / 357 | 1,649 / 2,888 | 1,072 / 1,795 | 699 / 1,663 |
+| IVF nprobe 64, rerank 64 | 2.1 | 20.1 | 104 | 434 | 0.8 / 1.7 | 3.7 / 6.8 | 57 / 107 | 428 / 823 | 206 / 390 | 1,672 / 3,162 | 1,092 / 1,993 | 768 / 1,684 |
+| IVF nprobe 128, rerank 128 | 3.8 | 38.8 | 205 | 817 | 1.4 / 3.1 | 6.5 / 13 | 100 / 224 | 735 / 1,746 | 370 / 806 | 3,009 / 6,520 | 2,048 / 4,012 | 1,456 / 2,740 |
+| dense exhaustive (f16 vectors) | 2029.0 | 2029.0 | 8,116 | 0 | 216 / 237 | 2,311 / 2,332 | 42,125 / 42,147 | 343,209 / 343,230 | 147,786 / 147,807 | 1,187,699 / 1,187,720 | 650,470 / 650,491 | 357,352 / 369,647 |
+| warp nprobe 8 | 0.3 | 0.7 | 3 | 114 | 2.0 / 4.2 | 2.1 / 5.2 | 2.1 / 27 | 2.1 / 187 | 2.1 / 86 | 2.1 / 659 | 2.1 / 387 | 2.1 / 299 |
+| warp nprobe 32 | 0.7 | 2.4 | 12 | 328 | 5.1 / 10 | 5.8 / 12 | 25 / 43 | 174 / 249 | 78 / 129 | 590 / 1,002 | 325 / 678 | 132 / 672 |
+| warp nprobe 8 + rerank 64 | 2.9 | 40.0 | 167 | 367 | 3.2 / 6.3 | 7.4 / 12 | 82 / 138 | 591 / 1,032 | 296 / 493 | 2,382 / 3,976 | 1,630 / 2,569 | 1,352 / 2,317 |
+| warp nprobe 16 + rerank 64 | 2.9 | 43.3 | 183 | 449 | 4.2 / 8.0 | 8.5 / 14 | 89 / 147 | 641 / 1,075 | 318 / 523 | 2,556 / 4,199 | 1,744 / 2,767 | 1,410 / 2,514 |
+| plaid approx=ivf nprobe 8, ndocs 64 | 2.5 | 33.9 | 138 | 307 | 2.9 / 5.1 | 6.5 / 10 | 70 / 127 | 498 / 974 | 254 / 452 | 2,060 / 3,635 | 1,422 / 2,282 | 1,173 / 1,932 |
+| late exhaustive (decompressed) | 19.0 | 19.0 | 9,296 | 9,112 | 113 / 164 | 208 / 259 | 2,016 / 2,067 | 12,650 / 12,700 | 7,789 / 7,840 | 63,685 / 63,735 | 53,409 / 53,459 | 41,498 / 44,297 |
+
+**Cold start (new connection per query), h1** (HTTP/1.1, 6 connections); p50 / p95 simulated latency in ms from the recorded traces:
+
+| Config | Rounds | Requests | KB | Ext. KB | none | lan | wifi | 4g | lte | slow-4g | 3g | lte-poor |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| FTS5 bm25 (AND) | 14.0 | 14.0 | 67 | – | 2.2 / 8.0 | 15 / 36 | 250 / 522 | 2,030 / 3,943 | 874 / 1,707 | 7,025 / 13,717 | 3,847 / 7,581 | 2,089 / 5,043 |
+| FTS5 bm25 (OR) | 16.7 | 16.7 | 132 | – | 2.1 / 50 | 19 / 79 | 333 / 763 | 2,687 / 5,961 | 1,178 / 2,627 | 9,487 / 20,957 | 5,444 / 11,852 | 2,879 / 6,816 |
+| FTS5 bm25c (OR) | 11.8 | 11.8 | 55 | – | 1.6 / 42 | 11 / 68 | 188 / 607 | 1,523 / 4,661 | 656 / 2,042 | 5,269 / 16,164 | 2,886 / 8,983 | 1,546 / 4,853 |
+| FTS5 unranked (AND) | 11.5 | 11.5 | 47 | – | 1.2 / 2.3 | 11 / 25 | 187 / 457 | 1,523 / 3,722 | 656 / 1,603 | 5,269 / 12,879 | 2,886 / 7,054 | 1,533 / 4,504 |
+| graph ef 32, W 16 | 8.4 | 53.4 | 398 | 198 | 1.7 / 2.9 | 19 / 22 | 347 / 393 | 2,716 / 3,071 | 1,255 / 1,412 | 10,152 / 11,414 | 6,250 / 6,973 | 4,091 / 5,843 |
+| graph ef 64, W 16 | 10.0 | 78.7 | 499 | 299 | 2.1 / 2.9 | 25 / 27 | 463 / 505 | 3,639 / 3,977 | 1,671 / 1,817 | 13,511 / 14,683 | 8,242 / 8,884 | 5,377 / 6,965 |
+| graph ef 128, W 16 | 13.3 | 136.1 | 729 | 529 | 2.8 / 6.8 | 38 / 42 | 703 / 745 | 5,528 / 5,872 | 2,532 / 2,684 | 20,477 / 21,673 | 12,449 / 13,112 | 8,176 / 10,120 |
+| graph ef 128, W 64 | 8.4 | 188.3 | 941 | 741 | 2.8 / 6.1 | 47 / 53 | 881 / 942 | 6,896 / 7,421 | 3,167 / 3,396 | 25,603 / 27,463 | 15,619 / 16,673 | 8,518 / 10,077 |
+| IVF nprobe 16, rerank 64 | 6.0 | 39.6 | 526 | 234 | 1.8 / 3.2 | 16 / 18 | 294 / 315 | 2,263 / 2,437 | 1,073 / 1,149 | 8,701 / 9,315 | 5,570 / 5,915 | 3,740 / 5,053 |
+| IVF nprobe 64, rerank 64 | 6.0 | 80.1 | 729 | 437 | 2.1 / 5.4 | 24 / 28 | 442 / 489 | 3,457 / 3,836 | 1,594 / 1,762 | 12,884 / 14,256 | 7,979 / 8,833 | 5,181 / 6,395 |
+| IVF nprobe 128, rerank 128 | 6.0 | 119.9 | 1,115 | 823 | 2.6 / 6.8 | 32 / 37 | 588 / 659 | 4,608 / 5,182 | 2,121 / 2,377 | 17,151 / 19,210 | 10,550 / 11,693 | 6,990 / 8,323 |
+| dense exhaustive (f16 vectors) | 2362.0 | 2362.0 | 9,448 | 0 | 247 / 273 | 2,687 / 2,713 | 49,035 / 49,061 | 399,533 / 399,559 | 172,037 / 172,063 | 1,382,621 / 1,382,647 | 757,221 / 757,247 | 416,144 / 429,671 |
+| warp nprobe 8 | 4.0 | 21.3 | 548 | 544 | 3.7 / 8.5 | 14 / 22 | 206 / 279 | 1,504 / 2,045 | 769 / 1,011 | 6,246 / 8,191 | 4,384 / 5,516 | 3,202 / 4,253 |
+| warp nprobe 32 | 4.0 | 41.8 | 768 | 764 | 7.2 / 15 | 22 / 33 | 287 / 415 | 2,108 / 3,116 | 1,053 / 1,487 | 8,531 / 12,021 | 5,875 / 7,860 | 4,188 / 5,923 |
+| warp nprobe 8 + rerank 64 | 7.0 | 87.8 | 825 | 821 | 5.1 / 9.8 | 31 / 37 | 511 / 583 | 3,919 / 4,465 | 1,861 / 2,106 | 15,069 / 17,024 | 9,644 / 10,785 | 5,886 / 7,372 |
+| warp nprobe 16 + rerank 64 | 7.0 | 96.9 | 910 | 906 | 6.8 / 13 | 34 / 43 | 541 / 636 | 4,131 / 4,883 | 1,964 / 2,303 | 15,894 / 18,633 | 10,180 / 11,794 | 6,408 / 7,893 |
+| plaid approx=ivf nprobe 8, ndocs 64 | 7.0 | 76.8 | 764 | 760 | 4.4 / 8.0 | 28 / 32 | 468 / 512 | 3,572 / 3,917 | 1,709 / 1,860 | 13,854 / 15,059 | 8,963 / 9,635 | 5,579 / 6,986 |
+| late exhaustive (decompressed) | 31.0 | 34.0 | 9,732 | 9,564 | 124 / 191 | 235 / 301 | 2,338 / 2,405 | 15,081 / 15,148 | 8,938 / 9,004 | 72,926 / 72,992 | 59,252 / 59,318 | 45,558 / 48,191 |
+
+**Cold start (new connection per query), h2** (HTTP/2-like, 100 concurrent requests); p50 / p95 simulated latency in ms from the recorded traces:
+
+| Config | Rounds | Requests | KB | Ext. KB | none | lan | wifi | 4g | lte | slow-4g | 3g | lte-poor |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| FTS5 bm25 (AND) | 14.0 | 14.0 | 67 | – | 2.2 / 8.0 | 15 / 36 | 250 / 522 | 2,030 / 3,943 | 874 / 1,707 | 7,025 / 13,717 | 3,847 / 7,581 | 2,089 / 5,043 |
+| FTS5 bm25 (OR) | 16.7 | 16.7 | 132 | – | 2.1 / 50 | 19 / 79 | 333 / 763 | 2,687 / 5,961 | 1,178 / 2,627 | 9,487 / 20,957 | 5,444 / 11,852 | 2,879 / 6,816 |
+| FTS5 bm25c (OR) | 11.8 | 11.8 | 55 | – | 1.6 / 42 | 11 / 68 | 188 / 607 | 1,523 / 4,661 | 656 / 2,042 | 5,269 / 16,164 | 2,886 / 8,983 | 1,546 / 4,853 |
+| FTS5 unranked (AND) | 11.5 | 11.5 | 47 | – | 1.2 / 2.3 | 11 / 25 | 187 / 457 | 1,523 / 3,722 | 656 / 1,603 | 5,269 / 12,879 | 2,886 / 7,054 | 1,533 / 4,504 |
+| graph ef 32, W 16 | 8.4 | 53.4 | 398 | 198 | 1.7 / 2.9 | 13 / 16 | 228 / 267 | 1,729 / 2,056 | 836 / 975 | 6,789 / 7,902 | 4,460 / 5,050 | 3,546 / 5,315 |
+| graph ef 64, W 16 | 10.0 | 78.7 | 499 | 299 | 2.1 / 2.9 | 16 / 18 | 283 / 325 | 2,154 / 2,492 | 1,041 / 1,187 | 8,449 / 9,621 | 5,542 / 6,184 | 4,596 / 6,359 |
+| graph ef 128, W 16 | 13.3 | 136.1 | 729 | 529 | 2.8 / 6.8 | 22 / 26 | 383 / 410 | 2,888 / 3,077 | 1,412 / 1,499 | 11,479 / 12,160 | 7,650 / 8,058 | 6,680 / 8,680 |
+| graph ef 128, W 64 | 8.4 | 188.3 | 941 | 741 | 2.8 / 6.1 | 19 / 23 | 318 / 360 | 2,278 / 2,620 | 1,208 / 1,356 | 9,873 / 11,069 | 7,236 / 7,900 | 5,344 / 6,577 |
+| IVF nprobe 16, rerank 64 | 6.0 | 39.6 | 526 | 234 | 1.8 / 3.2 | 12 / 14 | 208 / 213 | 1,526 / 1,554 | 782 / 801 | 6,380 / 6,540 | 4,505 / 4,648 | 3,344 / 4,569 |
+| IVF nprobe 64, rerank 64 | 6.0 | 80.1 | 729 | 437 | 2.1 / 5.4 | 14 / 17 | 243 / 248 | 1,735 / 1,766 | 924 / 944 | 7,544 / 7,724 | 5,553 / 5,715 | 4,055 / 5,064 |
+| IVF nprobe 128, rerank 128 | 6.0 | 119.9 | 1,115 | 823 | 2.6 / 6.8 | 18 / 22 | 307 / 317 | 2,123 / 2,187 | 1,186 / 1,229 | 9,738 / 10,092 | 7,527 / 7,846 | 5,295 / 6,444 |
+| dense exhaustive (f16 vectors) | 2362.0 | 2362.0 | 9,448 | 0 | 247 / 273 | 2,687 / 2,713 | 49,035 / 49,061 | 399,533 / 399,559 | 172,037 / 172,063 | 1,382,621 / 1,382,647 | 757,221 / 757,247 | 416,144 / 429,671 |
+| warp nprobe 8 | 4.0 | 21.3 | 548 | 544 | 3.7 / 8.5 | 12 / 18 | 171 / 192 | 1,204 / 1,318 | 649 / 728 | 5,282 / 5,903 | 3,929 / 4,488 | 3,007 / 4,016 |
+| warp nprobe 32 | 4.0 | 41.8 | 768 | 764 | 7.2 / 15 | 17 / 27 | 208 / 256 | 1,410 / 1,667 | 788 / 963 | 6,443 / 7,868 | 4,974 / 6,257 | 3,634 / 4,978 |
+| warp nprobe 8 + rerank 64 | 7.0 | 87.8 | 825 | 821 | 5.1 / 9.8 | 19 / 24 | 278 / 300 | 1,980 / 2,095 | 1,049 / 1,128 | 8,552 / 9,182 | 6,253 / 6,821 | 4,693 / 5,890 |
+| warp nprobe 16 + rerank 64 | 7.0 | 96.9 | 910 | 906 | 6.8 / 13 | 21 / 27 | 293 / 324 | 2,062 / 2,235 | 1,106 / 1,222 | 8,999 / 9,959 | 6,656 / 7,521 | 5,007 / 6,306 |
+| plaid approx=ivf nprobe 8, ndocs 64 | 7.0 | 76.8 | 764 | 760 | 4.4 / 8.0 | 18 / 21 | 269 / 280 | 1,927 / 1,983 | 1,012 / 1,051 | 8,265 / 8,565 | 5,995 / 6,265 | 4,366 / 5,696 |
+| late exhaustive (decompressed) | 31.0 | 34.0 | 9,732 | 9,564 | 124 / 191 | 235 / 301 | 2,338 / 2,405 | 15,081 / 15,148 | 8,938 / 9,004 | 72,926 / 72,992 | 59,252 / 59,318 | 45,558 / 48,191 |
+
+**HTTP/1.1 with the request budget** (`bench/coalesce_eval.py`: the recorded traces re-simulated with the VFS's per-round request planner; *coalesce* merges nearby ranges into at most six requests, over-fetching the gaps; *multi-range* sends at most six requests with several ranges each). p50 simulated latency in ms, one configuration per system:
+
+| System (config) | Regime | Profile | h1 | h1 + coalesce | h1 + multi-range | h2 |
+|---|---|---|---|---|---|---|
+| FTS5 (fts-bm25-or) | warm | 4g | 0.2 | 0.2 | 0.2 | 0.2 |
+| FTS5 (fts-bm25-or) | warm | lte | 0.2 | 0.2 | 0.2 | 0.2 |
+| FTS5 (fts-bm25-or) | warm | slow-4g | 0.2 | 0.2 | 0.2 | 0.2 |
+| FTS5 (fts-bm25-or) | warm | wifi | 0.2 | 0.2 | 0.2 | 0.2 |
+| FTS5 (fts-bm25-or) | cold | 4g | 2,687 | 2,687 | 2,687 | 2,687 |
+| FTS5 (fts-bm25-or) | cold | lte | 1,178 | 1,178 | 1,178 | 1,178 |
+| FTS5 (fts-bm25-or) | cold | slow-4g | 9,487 | 9,487 | 9,487 | 9,487 |
+| FTS5 (fts-bm25-or) | cold | wifi | 333 | 333 | 333 | 333 |
+| dense IVF (ivf-np128) | warm | 4g | 1,643 | 1,344 | 753 | 749 |
+| dense IVF (ivf-np128) | warm | lte | 737 | 624 | 381 | 378 |
+| dense IVF (ivf-np128) | warm | slow-4g | 5,943 | 5,041 | 3,095 | 3,066 |
+| dense IVF (ivf-np128) | warm | wifi | 207 | 172 | 103 | 102 |
+| dense IVF (ivf-np128) | cold | 4g | 4,608 | 3,233 | 2,135 | 2,123 |
+| dense IVF (ivf-np128) | cold | lte | 2,121 | 1,737 | 1,194 | 1,186 |
+| dense IVF (ivf-np128) | cold | slow-4g | 17,151 | 14,180 | 9,803 | 9,738 |
+| dense IVF (ivf-np128) | cold | wifi | 588 | 456 | 308 | 307 |
+| dense graph (graph-ef64) | warm | 4g | 2,407 | 2,401 | 1,248 | 1,242 |
+| dense graph (graph-ef64) | warm | lte | 1,088 | 1,085 | 595 | 590 |
+| dense graph (graph-ef64) | warm | slow-4g | 8,780 | 8,770 | 4,821 | 4,787 |
+| dense graph (graph-ef64) | warm | wifi | 304 | 303 | 163 | 162 |
+| dense graph (graph-ef64) | cold | 4g | 3,639 | 3,639 | 2,161 | 2,154 |
+| dense graph (graph-ef64) | cold | lte | 1,671 | 1,671 | 1,046 | 1,041 |
+| dense graph (graph-ef64) | cold | slow-4g | 13,511 | 13,511 | 8,492 | 8,449 |
+| dense graph (graph-ef64) | cold | wifi | 463 | 463 | 285 | 283 |
+| late warp (warp-np8) | warm | 4g | 1.9 | 1.9 | 1.9 | 1.9 |
+| late warp (warp-np8) | warm | lte | 1.9 | 1.9 | 1.9 | 1.9 |
+| late warp (warp-np8) | warm | slow-4g | 1.9 | 1.9 | 1.9 | 1.9 |
+| late warp (warp-np8) | warm | wifi | 1.9 | 1.9 | 1.9 | 1.9 |
+| late warp (warp-np8) | cold | 4g | 1,504 | 1,366 | 1,205 | 1,204 |
+| late warp (warp-np8) | cold | lte | 769 | 723 | 650 | 649 |
+| late warp (warp-np8) | cold | slow-4g | 6,246 | 5,904 | 5,291 | 5,282 |
+| late warp (warp-np8) | cold | wifi | 206 | 192 | 171 | 171 |
+
+**Simulated versus real** (real = wall time through the shaped server; own-trace = the same run's request log simulated; pipeline = the unshaped trace of the same query simulated, which is what the tables above use). Medians over the real-run subset:
+
+| Profile | Regime | Queries | Real p50 | Pipeline p50 | Real p95 | Pipeline p95 | Median real / own-trace | Median real / pipeline | Median real − pipeline, ms (per round) | Queries ≥ 20 ms | Abs. rel. error there, median / p90 |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| 4g,h1 | warm | 1600 | 1,092 | 1,076 | 4,857 | 4,798 | 1.013 | 1.014 | 13.8 (4.9) | 1482 | 1.3 % / 2.0 % |
+| 4g,h1 | cold | 320 | 3,392 | 3,344 | 6,936 | 6,873 | 1.012 | 1.012 | 37.5 (4.6) | 320 | 1.2 % / 1.7 % |
+| 4g,h2 | warm | 1600 | 485 | 479 | 2,013 | 1,985 | 1.013 | 1.015 | 7.3 (3.1) | 1482 | 1.5 % / 2.1 % |
+| 4g,h2 | cold | 320 | 1,936 | 1,917 | 3,097 | 3,049 | 1.012 | 1.012 | 22.6 (3.0) | 320 | 1.2 % / 1.6 % |
+| lte,h1 | warm | 1600 | 493 | 478 | 2,207 | 2,163 | 1.024 | 1.027 | 11.1 (4.0) | 1482 | 2.6 % / 4.1 % |
+| lte,h1 | cold | 320 | 1,569 | 1,541 | 3,151 | 3,150 | 1.022 | 1.022 | 28.5 (3.6) | 320 | 2.2 % / 3.3 % |
+| lte,h2 | warm | 1600 | 245 | 238 | 987 | 960 | 1.027 | 1.030 | 7.1 (2.9) | 1482 | 2.9 % / 4.3 % |
+| lte,h2 | cold | 320 | 994 | 971 | 1,513 | 1,477 | 1.020 | 1.021 | 19.9 (2.6) | 320 | 2.1 % / 3.4 % |
 
 ## How to reproduce
 

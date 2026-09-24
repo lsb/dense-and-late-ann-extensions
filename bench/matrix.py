@@ -128,6 +128,20 @@ def all_queries(cfg, meta):
     return interleave_kinds(meta, kind_cap(cfg, meta))
 
 
+def session_prefix(cfg, meta, per_kind, exhaustive=False):
+    """The first `per_kind` queries of each kind in the order the trace session ran
+    them, so a real run sees the same cache history as the recorded traces."""
+    order = interleave_kinds(meta, cfg["run"]["exhaustive_max_queries"] // 2) if exhaustive \
+        else all_queries(cfg, meta)
+    seen, out = {}, []
+    for q in order:
+        k = meta["kinds"][q]
+        if seen.get(k, 0) < per_kind:
+            seen[k] = seen.get(k, 0) + 1
+            out.append(q)
+    return out
+
+
 def query_set(cfg, meta, c):
     if c.get("exhaustive"):
         return interleave_kinds(meta, cfg["run"]["exhaustive_max_queries"] // 2)
@@ -536,10 +550,11 @@ def step_real(cfg, corpus, args):
         for c in confs:
             if c.get("exhaustive") and p not in fast:
                 continue
-            qs = interleave_kinds(meta, 5 if c.get("exhaustive") else per_kind)
-            warm_up = [all_queries(cfg, meta)[-1]]
+            exh = bool(c.get("exhaustive"))
+            qs = session_prefix(cfg, meta, 5 if exh else per_kind, exh)
+            warm_up = [query_set(cfg, meta, c)[-1]]      # as in the trace session
             runs.append(node_run(c, k, "warm", qs, warm_up))
-            runs.append(node_run(c, k, "cold", interleave_kinds(meta, 2 if c.get("exhaustive") else max(2, per_kind // 5)), []))
+            runs.append(node_run(c, k, "cold", session_prefix(cfg, meta, 2 if exh else max(2, per_kind // 5), exh), []))
         jobs.append((spec, runs))
 
     def one(job):
